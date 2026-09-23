@@ -8,7 +8,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.3.1"
+VERSION="2.3.2"
 BIN="/usr/local/bin/brokennode"
 CFG_DIR="/etc/brokennode"
 TPL="/etc/systemd/system/brokennode@.service"
@@ -175,35 +175,50 @@ transport_family(){
 }
 
 pick_transport(){
+  # Numbers 1-7 are exactly what 2.2.0 and earlier used. Operators pick these by
+  # habit on both servers, so renumbering them (2.3.0 inserted the new ones in
+  # the middle) silently put the two ends on different transports and the
+  # tunnel never connected. New transports only ever get appended.
   echo >&2
   echo -e "${C_B}  Select transport:${C_N}" >&2
   echo -e "  ${C_D}── proxy (users connect to a port) ───────────${C_N}" >&2
   echo -e "   1) tcp       Plain TCP + smux         ${C_G}(stable baseline)${C_N}" >&2
   echo -e "   2) mtcp      Multi-link TCP           ${C_G}(beats throttling, best for Iran)${C_N}" >&2
-  echo -e "   3) mptcp     Multipath TCP (kernel)   ${C_G}(link aggregation, needs kernel >= 5.6)${C_N}" >&2
-  echo    "   4) ws        WebSocket/HTTP + smux    (HTTP mimicry)" >&2
-  echo    "   5) tcpnomux  TCP pool, no HoL         (heavy single-flow)" >&2
-  echo -e "   6) kcp       KCP/UDP + FEC            ${C_Y}(only if UDP works)${C_N}" >&2
-  echo -e "   7) quic      QUIC/UDP, built-in TLS   ${C_Y}(only if UDP works)${C_N}" >&2
-  echo -e "   8) sctp      Multi-stream + multihome ${C_Y}(needs kernel sctp)${C_N}" >&2
-  echo -e "  ${C_D}── kernel tunnels (point-to-point, highest throughput) ─${C_N}" >&2
-  echo    "   9) gre       GRE, L3, offload" >&2
-  echo    "  10) gretap    GRETAP, L2/ethernet" >&2
-  echo    "  11) ipip      IP-in-IP, lowest overhead" >&2
-  echo    "  12) sit       6in4 (IPv6 over IPv4)" >&2
-  echo    "  13) l2tp      L2TPv3 tunnel+session" >&2
+  echo    "   3) ws        WebSocket/HTTP + smux    (HTTP mimicry)" >&2
+  echo    "   4) tcpnomux  TCP pool, no HoL         (heavy single-flow)" >&2
+  echo -e "   5) kcp       KCP/UDP + FEC            ${C_Y}(only if UDP works)${C_N}" >&2
+  echo -e "   6) quic      QUIC/UDP, built-in TLS   ${C_R}(slow on lossy paths — prefer kcp)${C_N}" >&2
+  echo -e "   7) ip-spoofing  Spoofed-IP TUN        ${C_M}(blackout / national whitelist)${C_N}" >&2
+  echo -e "   8) mptcp     Multipath TCP (kernel)   ${C_G}(link aggregation, kernel >= 5.6)${C_N}" >&2
+  echo -e "   9) sctp      Multi-stream + multihome ${C_Y}(needs kernel sctp module)${C_N}" >&2
+  echo -e "  ${C_D}── kernel tunnels (point-to-point, root on both ends) ──${C_N}" >&2
+  echo    "  10) gre       GRE, L3, offload" >&2
+  echo    "  11) gretap    GRETAP, L2/ethernet" >&2
+  echo    "  12) ipip      IP-in-IP, lowest overhead" >&2
+  echo    "  13) sit       6in4 (IPv6 over IPv4)" >&2
+  echo    "  14) l2tp      L2TPv3 tunnel+session" >&2
   echo -e "  ${C_D}── raw carriers (TUN over a protocol) ────────${C_N}" >&2
-  echo    "  14) udp       TUN over UDP" >&2
-  echo    "  15) icmp      TUN over ICMP echo" >&2
-  echo -e "  16) ip-spoofing  Spoofed-IP TUN        ${C_M}(blackout / national whitelist)${C_N}" >&2
+  echo    "  15) udp       TUN over UDP" >&2
+  echo    "  16) icmp      TUN over ICMP echo" >&2
   echo -e "  ${C_D}──────────────────────────────────────────────${C_N}" >&2
-  local n; n=$(ask "Choice [1-16]" "1")
-  case "$n" in
-    1) echo tcp ;; 2) echo mtcp ;; 3) echo mptcp ;; 4) echo ws ;; 5) echo tcpnomux ;;
-    6) echo kcp ;; 7) echo quic ;; 8) echo sctp ;;
-    9) echo gre ;; 10) echo gretap ;; 11) echo ipip ;; 12) echo sit ;; 13) echo l2tp ;;
-    14) echo udp ;; 15) echo icmp ;; 16) echo spoof ;; *) echo tcp ;;
-  esac
+  echo -e "  ${C_D}Type a number or a name (e.g. mtcp). 0 = cancel.${C_N}" >&2
+  local n
+  while :; do
+    n=$(ask "Choice [1-16]" "1")
+    case "$n" in
+      0) echo ""; return ;;
+      1|tcp) echo tcp; return ;;        2|mtcp) echo mtcp; return ;;
+      3|ws) echo ws; return ;;          4|tcpnomux) echo tcpnomux; return ;;
+      5|kcp) echo kcp; return ;;        6|quic) echo quic; return ;;
+      7|spoof|ip-spoofing) echo spoof; return ;;
+      8|mptcp) echo mptcp; return ;;    9|sctp) echo sctp; return ;;
+      10|gre) echo gre; return ;;       11|gretap) echo gretap; return ;;
+      12|ipip) echo ipip; return ;;     13|sit) echo sit; return ;;
+      14|l2tp) echo l2tp; return ;;     15|udp) echo udp; return ;;
+      16|icmp) echo icmp; return ;;
+      *) err "'$n' is not one of the choices." ;;
+    esac
+  done
 }
 
 # pick_encryption asks whether the chosen transport should be encrypted. quic
@@ -582,6 +597,7 @@ create_tunnel(){
   name=$(ask "Instance name" "main"); name="$(echo "$name" | tr -cd 'A-Za-z0-9_-')"; [ -z "$name" ] && name=main
   if [ -f "$CFG_DIR/$name.json" ]; then local o; o=$(ask "'$name' exists. Overwrite? y/N" "N"); case "$o" in y|Y) :;; *) warn "Cancelled."; return;; esac; fi
   tr=$(pick_transport)
+  [ -z "$tr" ] && { warn "Cancelled."; return; }
   enc=$(pick_encryption "$tr")
 
   if [ "$tr" = spoof ]; then
@@ -975,9 +991,41 @@ toggle_udp_duplicate(){
 # change_transport swaps a tunnel's transport in place, keeping token, ports and
 # addresses. It also clears settings that belong to the OLD transport so a
 # leftover field cannot confuse the new one.
+# is_udp_transport: carried over UDP, so the relay's firewall must allow UDP.
+is_udp_transport(){ case "$1" in kcp|quic) return 0 ;; *) return 1 ;; esac; }
+
+# service_check restarts a tunnel and reports whether it actually came up,
+# with the reason from its log when it did not. "restarted" alone told the
+# operator nothing: a config the core rejects exits at once, and the menu used
+# to report success anyway.
+service_check(){
+  local n="$1"
+  systemctl restart "brokennode@$n" >/dev/null 2>&1
+  sleep 2
+  if [ "$(systemctl is-active "brokennode@$n" 2>/dev/null)" = active ]; then
+    info "'$n' is ${C_G}running${C_N}."
+    return 0
+  fi
+  err "'$n' did not start. Recent log:"
+  journalctl -u "brokennode@$n" -n 12 --no-pager 2>/dev/null | sed 's/^/    /'
+  return 1
+}
+
+# change_transport swaps a tunnel's transport in place, keeping token, ports and
+# addresses. It also clears settings that belong to the OLD transport so a
+# leftover field cannot confuse the new one.
 change_transport(){
   local n="$1" cfg="$CFG_DIR/$n.json"
-  local cur curenc; cur="$(jget "$cfg" transport)"; curenc="$(jget "$cfg" encryption)"
+  local cur curenc mode; cur="$(jget "$cfg" transport)"; curenc="$(jget "$cfg" encryption)"; mode="$(jget "$cfg" mode)"
+  # A config written by an older build may still carry a retired combined name.
+  # The core reads "tcpobf" as tcp+obfs; show and compare it the same way, or
+  # the menu reports the wrong encryption and "nothing to do" checks misfire.
+  case "$cur" in
+    tcpobf)  cur=tcp;  [ -z "$curenc" ] && curenc=obfs ;;
+    mtcpobf) cur=mtcp; [ -z "$curenc" ] && curenc=obfs ;;
+    wsobf)   cur=ws;   [ -z "$curenc" ] && curenc=obfs ;;
+    rawmux)  cur=kcp;  [ -z "$curenc" ] && curenc=obfs ;;
+  esac
   [ -z "$curenc" ] && curenc=none
   echo; echo -e "${C_B}  Change transport for '$n'${C_N}  ${C_D}(current: $cur, encryption: $curenc)${C_N}"
   local new; new=$(pick_transport)
@@ -997,15 +1045,19 @@ change_transport(){
   jset "$cfg" encryption "$newenc"
   # Drop transport-specific leftovers.
   case "$new" in
-    kcp)      jset "$cfg" pool_size "" del; jset "$cfg" links "" del ;;
     tcpnomux) jset "$cfg" links "" del ;;
     mtcp)     jset "$cfg" pool_size "" del ;;
     *)        jset "$cfg" pool_size "" del; jset "$cfg" links "" del ;;
   esac
+  [ "$new" != sctp ] && { jset "$cfg" sctp_streams "" del; jset "$cfg" sctp_multihoming "" del; }
   info "transport: $cur/$curenc -> $new/$newenc"
-  warn "The OTHER side of this tunnel must use '$new' with encryption '$newenc' too, or it will not connect."
-  systemctl restart "brokennode@$n" >/dev/null 2>&1
-  info "restarted '$n'"
+  if [ "$mode" = server ] && is_udp_transport "$new" && ! is_udp_transport "$cur"; then
+    local port; port="$(jget "$cfg" bind_addr)"; port="${port##*:}"
+    warn "$new runs over UDP: the relay firewall must allow ${C_Y}UDP $port${C_N} (TCP alone is not enough)."
+    warn "e.g.  ufw allow $port/udp   or   iptables -I INPUT -p udp --dport $port -j ACCEPT"
+  fi
+  warn "Do the SAME on the other server: '$new' with encryption '$newenc', or they will not connect."
+  service_check "$n"
   read -t 30 -rp "  ▶ press ENTER to continue... " _
 }
 

@@ -4,7 +4,7 @@
 
 **Multi-protocol reverse tunnel — compiled and ready to run.**
 
-`v2.3.1`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
+`v2.3.2`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
 
 **[English](#english)**  ·  **[فارسی](#فارسی)**
 
@@ -102,11 +102,11 @@ encryption layer decides what they look like on the way.
 |---|---|---|
 | `tcp` | TCP + smux. The stable baseline | — |
 | `mtcp` | Several TCP links bonded; survives per-connection throttling | — |
-| `mptcp` | Kernel Multipath TCP: one connection across every path | Linux ≥ 5.6, `net.mptcp.enabled=1` |
+| `mptcp` | *Experimental.* Kernel Multipath TCP: one connection across every path. Prefer `mtcp` | Linux ≥ 5.6, `net.mptcp.enabled=1` on both |
 | `ws` | WebSocket, looks like HTTP | — |
 | `tcpnomux` | One pooled TCP connection per user | — |
 | `kcp` | KCP over UDP with FEC | usable UDP |
-| `quic` | QUIC, TLS 1.3 built in | usable UDP |
+| `quic` | QUIC, TLS 1.3 built in. **Collapses to ~1 Mbit/s on a lossy path** — use `kcp` or `mtcp` there | clean UDP, near-zero loss |
 | `sctp` | Multi-stream, multihomed across several source IPs | kernel `sctp` module |
 | `gre` / `gretap` | Kernel GRE (L3 / L2). Highest throughput | `ip_gre` module, root |
 | `ipip` | Kernel IP-in-IP. Lowest overhead, IPv4 only | `ipip` module, root |
@@ -121,7 +121,7 @@ should be encrypted.
 | Situation | Use |
 |---|---|
 | Maximum bandwidth | `mtcp` + `aead` |
-| Gaming, low and stable ping | `kcp` or `quic` |
+| Gaming, low and stable ping | `kcp` |
 | One heavy stream (backup, large file) | `tcpnomux` |
 | Deep packet inspection blocking everything | `ws` + `aead`, or `spoof` |
 
@@ -372,11 +372,11 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 |---|---|---|
 | `tcp` | TCP + smux؛ پایهٔ پایدار | — |
 | `mtcp` | چند لینک TCP موازی؛ در برابر محدودسازی هر اتصال مقاوم | — |
-| `mptcp` | Multipath TCP کرنل: یک اتصال روی همهٔ مسیرها | لینوکس ≥ 5.6 و `net.mptcp.enabled=1` |
+| `mptcp` | *آزمایشی.* Multipath TCP کرنل: یک اتصال روی همهٔ مسیرها. `mtcp` بهتر است | لینوکس ≥ 5.6 و `net.mptcp.enabled=1` روی هر دو سرور |
 | `ws` | وب‌سوکت، شبیه HTTP | — |
 | `tcpnomux` | برای هر کاربر یک اتصال TCP از استخر | — |
 | `kcp` | KCP روی UDP با FEC | UDP سالم |
-| `quic` | QUIC با TLS 1.3 داخلی | UDP سالم |
+| `quic` | QUIC با TLS 1.3 داخلی. **روی مسیر پر از loss به حدود ۱ مگابیت سقوط می‌کند** — آنجا `kcp` یا `mtcp` بزن | UDP تمیز، تقریباً بدون loss |
 | `sctp` | چندجریانی، multihome روی چند IP مبدأ | ماژول `sctp` کرنل |
 | `gre` / `gretap` | GRE کرنلی (L3 / L2)؛ بیشترین سرعت | ماژول `ip_gre`، روت |
 | `ipip` | IP-in-IP کرنلی؛ کمترین سربار، فقط IPv4 | ماژول `ipip`، روت |
@@ -391,7 +391,7 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 | وضعیت | انتخاب |
 |---|---|
 | بیشترین پهنای باند | `mtcp` + `aead` |
-| بازی، پینگ پایین و پایدار | `kcp` یا `quic` |
+| بازی، پینگ پایین و پایدار | `kcp` |
 | یک جریان سنگین (بکاپ، فایل بزرگ) | `tcpnomux` |
 | DPI که همه‌چیز را می‌بندد | `ws` + `aead` یا `spoof` |
 
