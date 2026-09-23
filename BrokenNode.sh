@@ -8,7 +8,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.3.2"
+VERSION="2.3.3"
 BIN="/usr/local/bin/brokennode"
 CFG_DIR="/etc/brokennode"
 TPL="/etc/systemd/system/brokennode@.service"
@@ -497,6 +497,18 @@ write_tunnel_cfg(){
   echo
   echo -e "  ${C_D}$tr is a point-to-point tunnel. Give the two servers' real IPs and${C_N}"
   echo -e "  ${C_D}the private addresses to use on the tunnel (any unused /30 works).${C_N}"
+  echo
+  # The most common reason these "connect" and then carry almost nothing: the
+  # foreign IP is filtered in Iran. A point-to-point tunnel needs the relay to
+  # send straight to that IP, so it cannot work; the proxy transports (mtcp,
+  # tcp, ws, kcp) have the FOREIGN server dial in, which often still does.
+  warn "$tr needs the two servers to reach each other DIRECTLY, in both directions."
+  echo -e "  ${C_D}If the foreign server's IP is filtered in Iran, $tr will not work (it may${C_N}"
+  echo -e "  ${C_D}come up and then carry almost nothing). Check first, from the Iran server:${C_N}"
+  echo -e "  ${C_D}    ping -c 5 <foreign-ip>     — 100% loss means filtered.${C_N}"
+  echo -e "  ${C_D}In that case use ${C_N}mtcp${C_D} instead: the foreign server dials in to Iran.${C_N}"
+  local go_on; go_on=$(ask "Continue with $tr? Y/n" "Y")
+  case "$go_on" in n|N) warn "Cancelled."; return ;; esac
   local lip rip tl trr
   lip=$(ask "This server's real (public) IP" "$(detect_ip)")
   rip=$(ask "The OTHER server's real IP" "")
@@ -829,6 +841,46 @@ doctor(){
     # service state
     local st; st="$(systemctl is-active "brokennode@$n" 2>/dev/null)"
     [ "$st" = active ] && okln "  service: active" || { badln "  service: $st"; warns=$((warns+1)); }
+
+    # Point-to-point tunnels (gre, ipip, udp, icmp ...) have no bind/remote
+    # address to check. What decides whether they work is whether the two real
+    # IPs reach each other at all — the case that fails silently when the
+    # foreign IP is filtered in Iran — and then whether the peer answers on the
+    # tunnel itself. Test both, and say which one broke.
+    if is_tunnel_transport "$trans"; then
+      local rip tr_ip dev
+      rip="$(jget "$cf" remote_ip)"; tr_ip="$(jget "$cf" tun_remote)"
+      dev="$(jget "$cf" tun_name)"; [ -z "$dev" ] && dev="bn-$trans"
+      case "$trans" in udp|icmp) [ -z "$(jget "$cf" tun_name)" ] && dev="spoof0" ;; esac
+      if ip link show "$dev" >/dev/null 2>&1; then okln "  interface $dev: up"
+      else badln "  interface $dev: missing (tunnel not running?)"; warns=$((warns+1)); fi
+      if ! command -v ping >/dev/null 2>&1; then
+        # Without ping there is no measurement. Reporting that as "100% loss"
+        # would tell the operator their peer is filtered when nothing was tested.
+        warnln "  ping is not installed — cannot test the peer (apt install iputils-ping)"
+        warns=$((warns+1)); continue
+      fi
+      local l1 l2
+      l1="$(ping -c 10 -i 0.2 -W 2 "$rip" 2>/dev/null | sed -n 's/.*, \([0-9.]*\)% packet loss.*/\1/p')"
+      l2="$(ping -c 10 -i 0.2 -W 2 "$tr_ip" 2>/dev/null | sed -n 's/.*, \([0-9.]*\)% packet loss.*/\1/p')"
+      if [ -z "$l1" ]; then
+        warnln "  peer $rip: ping failed to run (no route to it?)"; warns=$((warns+1))
+      elif [ "$l1" = 100 ]; then
+        badln "  peer $rip: NOT reachable directly (100% loss)"
+        echo -e "  ${C_Y}    The other server's IP does not answer at all — most often it is filtered.${C_N}"
+        echo -e "  ${C_Y}    $trans cannot work like that. Use mtcp instead (the foreign server dials in).${C_N}"
+        warns=$((warns+1))
+      elif awk "BEGIN{exit !(${l1:-0} > 3)}"; then
+        warnln "  peer $rip: ${l1}% loss directly (high)"; warns=$((warns+1))
+      else okln "  peer $rip: reachable directly (${l1}% loss)"; fi
+      if [ -z "$l2" ]; then
+        warnln "  tunnel peer $tr_ip: ping failed to run (no route to it?)"; warns=$((warns+1))
+      elif [ "$l2" = 100 ]; then
+        badln "  tunnel peer $tr_ip: no answer through the tunnel"; warns=$((warns+1))
+        [ -n "$l1" ] && [ "$l1" != 100 ] && echo -e "  ${C_Y}    The IP answers but the tunnel does not: is the other side running, with the addresses swapped?${C_N}"
+      else okln "  tunnel peer $tr_ip: answers through the tunnel (${l2}% loss)"; fi
+      continue
+    fi
 
     if [ "$mode" = server ]; then
       local port; port="${bind##*:}"
