@@ -8,7 +8,10 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.3.3"
+VERSION="2.3.4"
+# Bump when the sysctl tuning changes: hosts tuned by an older release pick
+# the new values up automatically (see auto_tune_once).
+TUNE_VERSION=2
 BIN="/usr/local/bin/brokennode"
 CFG_DIR="/etc/brokennode"
 TPL="/etc/systemd/system/brokennode@.service"
@@ -1337,7 +1340,15 @@ restart_all_tunnels(){
 # an operator who deliberately changed sysctl afterwards.
 auto_tune_once(){
   [ "$(id -u)" -eq 0 ] || return 0
-  local stamp="$CFG_DIR/.tuned"
+  local stamp="$CFG_DIR/.tuned" conf=/etc/sysctl.d/99-brokennode.conf
+  # A host tuned by an older release keeps the profile it chose and gets the
+  # current values for it. Without this, the tuning was written once and never
+  # again, so every improvement to it skipped every existing server.
+  if [ -f "$conf" ] && ! grep -q "^# tune-version: $TUNE_VERSION\$" "$conf"; then
+    if grep -q "GAMING profile" "$conf"; then apply_sysctl_gaming >/dev/null 2>&1
+    else apply_sysctl_throughput >/dev/null 2>&1; fi
+    info "Network tuning updated to version $TUNE_VERSION (profile kept)."
+  fi
   [ -f "$stamp" ] && return 0
   local cc; cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
   if [ "$cc" != bbr ]; then
@@ -1407,20 +1418,44 @@ uninstall_all(){
 apply_sysctl_throughput(){
   modprobe tcp_bbr 2>/dev/null || true
   grep -q '^tcp_bbr' /etc/modules-load.d/bbr.conf 2>/dev/null || echo tcp_bbr > /etc/modules-load.d/bbr.conf
-  cat > /etc/sysctl.d/99-brokennode.conf <<'EOF'
+  cat > /etc/sysctl.d/99-brokennode.conf <<EOF
 # BrokenNode network tuning — THROUGHPUT profile
+# tune-version: $TUNE_VERSION
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
+# Buffers sized for multi-gigabit on a long path: 1 Gbit/s x 150 ms is ~19 MB
+# in flight per flow. Autotuning only grows a socket this far when it needs to.
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
-net.ipv4.tcp_rmem = 4096 87380 33554432
-net.ipv4.tcp_wmem = 4096 65536 33554432
+net.ipv4.tcp_rmem = 4096 131072 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_fastopen = 3
-net.core.netdev_max_backlog = 16384
 net.ipv4.tcp_slow_start_after_idle = 0
+$(sysctl_common)
 EOF
   sysctl --system >/dev/null 2>&1
+}
+
+# sysctl_common is the part of the tuning both profiles need: it is about how
+# many packets and connections the host can take, not about latency.
+#   - netdev_budget(_usecs): packets handled per softirq pass. At gigabit rates
+#     the default 300 ends passes early and leaves packets waiting in the ring.
+#   - netdev_max_backlog: the per-CPU queue RPS feeds; drops here are silent.
+#   - somaxconn / tcp_max_syn_backlog: a burst of users arriving at once must
+#     not overflow the accept queue — overflow looks like "sometimes it just
+#     does not connect".
+#   - ip_local_port_range: one outbound socket per user (to the service, and
+#     for mtcp links); the default 28k ports is a ceiling on concurrent users.
+sysctl_common(){
+  cat <<'EOC'
+net.core.netdev_budget = 600
+net.core.netdev_budget_usecs = 8000
+net.core.netdev_max_backlog = 16384
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.ip_local_port_range = 1024 65535
+EOC
 }
 
 apply_sysctl_gaming(){
@@ -1435,6 +1470,7 @@ apply_sysctl_gaming(){
   if modprobe sch_cake 2>/dev/null; then qd=cake; fi
   cat > /etc/sysctl.d/99-brokennode.conf <<EOF
 # BrokenNode network tuning — GAMING profile
+# tune-version: $TUNE_VERSION
 #
 # Buffers are deliberately far smaller than the throughput profile's. A 64MB
 # socket buffer is depth for a game packet to wait behind, and waiting is the
@@ -1447,11 +1483,11 @@ net.ipv4.tcp_rmem = 4096 87380 4194304
 net.ipv4.tcp_wmem = 4096 65536 4194304
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_fastopen = 3
-net.core.netdev_max_backlog = 4096
 net.ipv4.tcp_slow_start_after_idle = 0
 # Keep unsent data in the socket small so a bulk sender cannot build a queue
 # the kernel then has to drain before anything interactive gets out.
 net.ipv4.tcp_notsent_lowat = 16384
+$(sysctl_common)
 EOF
   sysctl --system >/dev/null 2>&1
   echo "$qd"
