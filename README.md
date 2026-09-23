@@ -4,7 +4,7 @@
 
 **Multi-protocol reverse tunnel — compiled and ready to run.**
 
-`v2.2.0`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
+`v2.3.1`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
 
 **[English](#english)**  ·  **[فارسی](#فارسی)**
 
@@ -89,10 +89,31 @@ encryption layer and the token.
 Two independent choices. The transport decides how the bytes travel; the
 encryption layer decides what they look like on the way.
 
-**Transports:** `tcp` · `mtcp` · `ws` · `tcpnomux` · `kcp` · `quic` · `spoof`
+**Stream transports** (relay listens, foreign server dials in):
+`tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `quic` · `sctp`
+
+**Point-to-point tunnels** (both servers' real IPs + a private address pair):
+`gre` · `gretap` · `ipip` · `sit` · `l2tp` (kernel) · `udp` · `icmp` (TUN) · `spoof`
 
 **Encryption:** `none` · `obfs` (AES-CTR keystream) · `aead`
 (ChaCha20-Poly1305, authenticated — recommended)
+
+| Transport | What it is | Needs |
+|---|---|---|
+| `tcp` | TCP + smux. The stable baseline | — |
+| `mtcp` | Several TCP links bonded; survives per-connection throttling | — |
+| `mptcp` | Kernel Multipath TCP: one connection across every path | Linux ≥ 5.6, `net.mptcp.enabled=1` |
+| `ws` | WebSocket, looks like HTTP | — |
+| `tcpnomux` | One pooled TCP connection per user | — |
+| `kcp` | KCP over UDP with FEC | usable UDP |
+| `quic` | QUIC, TLS 1.3 built in | usable UDP |
+| `sctp` | Multi-stream, multihomed across several source IPs | kernel `sctp` module |
+| `gre` / `gretap` | Kernel GRE (L3 / L2). Highest throughput | `ip_gre` module, root |
+| `ipip` | Kernel IP-in-IP. Lowest overhead, IPv4 only | `ipip` module, root |
+| `sit` | Kernel 6in4: IPv6 over IPv4. Tunnel addresses are **IPv6** | `sit` module, root |
+| `l2tp` | Kernel L2TPv3 over UDP or IP | `l2tp_eth`/`l2tp_netlink`, root |
+| `udp` / `icmp` | TUN over plain UDP / ICMP echo, real source IP by default | root |
+| `spoof` | TUN with a forged whitelisted source IP, for a blackout | spoof-friendly datacenters |
 
 The manager asks for them separately: pick a transport, then answer whether it
 should be encrypted.
@@ -104,9 +125,14 @@ should be encrypted.
 | One heavy stream (backup, large file) | `tcpnomux` |
 | Deep packet inspection blocking everything | `ws` + `aead`, or `spoof` |
 
-`quic` takes no encryption layer — it already uses TLS 1.3 internally.
+`quic` takes no encryption layer — it already uses TLS 1.3 internally. The
+kernel tunnels (`gre`, `gretap`, `ipip`, `sit`, `l2tp`) take none either: the
+kernel moves the packets, so encrypt at the service (TLS) if you need it.
 
-`spoof` is a packet carrier: it seals each datagram on its own
+A point-to-point tunnel cannot be switched to a stream transport in place (or
+back) — they are configured with different fields. Create a new tunnel instead.
+
+`spoof`, `udp` and `icmp` are packet carriers: it seals each datagram on its own
 (XChaCha20-Poly1305, random per-packet nonce) and accepts `aead` or `none`, but
 not `obfs`. Encrypt it — the transport accepts any packet carrying the expected
 forged source IP, which anyone on the path can send, so without a tag there is
@@ -212,7 +238,15 @@ Client: `remote_addr`, `target_host`
 
 Per-transport: `pool_size`, `pool_min_idle`, `links`, `links_max`,
 `links_per_link`, `kcp_mode`, `kcp_data`, `kcp_parity`, `kcp_mtu`, `kcp_sndwnd`,
-`kcp_rcvwnd`, `smux_recv_mb`, `smux_stream_mb`, `server_name`, `alpn`
+`kcp_rcvwnd`, `smux_recv_mb`, `smux_stream_mb`, `server_name`, `alpn`,
+`sctp_streams`, `sctp_multihoming`
+
+Point-to-point tunnels: `local_ip`, `remote_ip` (the two servers' real IPv4
+addresses), `tun_local`, `tun_remote` (the pair on the tunnel — IPv6 for `sit`),
+`tun_name`, `mtu`, `tun_ttl`, `gre_key`, `l2tp_tunnel_id`, `l2tp_session_id`,
+`l2tp_encap` (`udp`|`ip`), `l2tp_port`; `spoof_src`/`spoof_dst` to forge on
+`udp`/`icmp`. The server's `ports` are NATed across the tunnel; the client's
+`target_host` is where they land.
 
 Both ends must agree on the transport, the encryption layer and the
 transport-level settings.
@@ -325,10 +359,31 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 این دو انتخاب **مستقل** از هم هستند. ترنسپورت تعیین می‌کند بایت‌ها چطور منتقل
 شوند؛ لایهٔ رمزنگاری تعیین می‌کند در مسیر چه شکلی داشته باشند.
 
-**ترنسپورت‌ها:** `tcp` · `mtcp` · `ws` · `tcpnomux` · `kcp` · `quic` · `spoof`
+**ترنسپورت‌های جریانی** (سرور ایران گوش می‌دهد، سرور خارج وصل می‌شود):
+`tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `quic` · `sctp`
+
+**تونل‌های نقطه‌به‌نقطه** (IP واقعی هر دو سرور + یک جفت آدرس خصوصی):
+`gre` · `gretap` · `ipip` · `sit` · `l2tp` (کرنلی) · `udp` · `icmp` (TUN) · `spoof`
 
 **رمزنگاری:** `none` · `obfs` (کی‌استریم AES-CTR) · `aead`
 (ChaCha20-Poly1305 با احراز اصالت — پیشنهادی)
+
+| ترنسپورت | چیست | پیش‌نیاز |
+|---|---|---|
+| `tcp` | TCP + smux؛ پایهٔ پایدار | — |
+| `mtcp` | چند لینک TCP موازی؛ در برابر محدودسازی هر اتصال مقاوم | — |
+| `mptcp` | Multipath TCP کرنل: یک اتصال روی همهٔ مسیرها | لینوکس ≥ 5.6 و `net.mptcp.enabled=1` |
+| `ws` | وب‌سوکت، شبیه HTTP | — |
+| `tcpnomux` | برای هر کاربر یک اتصال TCP از استخر | — |
+| `kcp` | KCP روی UDP با FEC | UDP سالم |
+| `quic` | QUIC با TLS 1.3 داخلی | UDP سالم |
+| `sctp` | چندجریانی، multihome روی چند IP مبدأ | ماژول `sctp` کرنل |
+| `gre` / `gretap` | GRE کرنلی (L3 / L2)؛ بیشترین سرعت | ماژول `ip_gre`، روت |
+| `ipip` | IP-in-IP کرنلی؛ کمترین سربار، فقط IPv4 | ماژول `ipip`، روت |
+| `sit` | 6in4 کرنلی: IPv6 روی IPv4؛ آدرس‌های تونل **IPv6** هستند | ماژول `sit`، روت |
+| `l2tp` | L2TPv3 کرنلی روی UDP یا IP | `l2tp_eth`/`l2tp_netlink`، روت |
+| `udp` / `icmp` | TUN روی UDP ساده / ICMP echo؛ پیش‌فرض با IP واقعی | روت |
+| `spoof` | TUN با IP مبدأ جعلیِ سفید، برای قطعی سراسری | دیتاسنترهای اجازه‌دهنده به جعل |
 
 منو این دو را جدا از هم می‌پرسد: اول ترنسپورت را انتخاب می‌کنی، بعد می‌پرسد
 رمزگذاری شود یا نه.
@@ -341,8 +396,13 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 | DPI که همه‌چیز را می‌بندد | `ws` + `aead` یا `spoof` |
 
 ترنسپورت `quic` لایهٔ رمزنگاری نمی‌گیرد — خودش از TLS 1.3 استفاده می‌کند.
+تونل‌های کرنلی (`gre`، `gretap`، `ipip`، `sit`، `l2tp`) هم نمی‌گیرند: بسته‌ها را
+خود کرنل جابه‌جا می‌کند، پس اگر رمزنگاری لازم است آن را در سرویس (TLS) انجام بده.
 
-ترنسپورت `spoof` حامل بسته است: هر دیتاگرام را جداگانه مهر و موم می‌کند
+تونل نقطه‌به‌نقطه را نمی‌شود درجا به ترنسپورت جریانی تبدیل کرد (و برعکس) —
+فیلدهای کانفیگشان فرق دارد. به‌جایش یک تونل جدید بساز.
+
+ترنسپورت‌های `spoof`، `udp` و `icmp` حامل بسته‌اند: هر دیتاگرام را جداگانه مهر و موم می‌کند
 (XChaCha20-Poly1305 با nonce تصادفی برای هر بسته) و `aead` یا `none` می‌پذیرد،
 ولی `obfs` را نه. حتماً رمزگذاری کن — این ترنسپورت هر بسته‌ای را که IP مبدأ جعلی
 مورد انتظار را داشته باشد قبول می‌کند، و هر کسی در مسیر می‌تواند چنین بسته‌ای
@@ -462,7 +522,14 @@ brokennode version
 مخصوص هر ترنسپورت: `pool_size`، `pool_min_idle`، `links`، `links_max`،
 `links_per_link`، `kcp_mode`، `kcp_data`، `kcp_parity`، `kcp_mtu`،
 `kcp_sndwnd`، `kcp_rcvwnd`، `smux_recv_mb`، `smux_stream_mb`، `server_name`،
-`alpn`
+`alpn`، `sctp_streams`، `sctp_multihoming`
+
+تونل‌های نقطه‌به‌نقطه: `local_ip`، `remote_ip` (IPv4 واقعی دو سرور)،
+`tun_local`، `tun_remote` (جفت آدرس روی تونل — برای `sit` از نوع IPv6)،
+`tun_name`، `mtu`، `tun_ttl`، `gre_key`، `l2tp_tunnel_id`، `l2tp_session_id`،
+`l2tp_encap` (`udp`|`ip`)، `l2tp_port`؛ و `spoof_src`/`spoof_dst` برای جعل روی
+`udp`/`icmp`. پورت‌های `ports` سرور از روی تونل NAT می‌شوند و `target_host`
+کلاینت مقصد نهایی آن‌هاست.
 
 دو طرف تونل باید روی ترنسپورت، لایهٔ رمزنگاری و تنظیمات سطح ترنسپورت توافق
 داشته باشند.

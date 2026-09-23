@@ -8,7 +8,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.2.0"
+VERSION="2.3.1"
 BIN="/usr/local/bin/brokennode"
 CFG_DIR="/etc/brokennode"
 TPL="/etc/systemd/system/brokennode@.service"
@@ -154,22 +154,55 @@ harden_cfg_dir(){
 # those pairs are the same transport with a layer on top. Encryption is now a
 # separate question — see pick_encryption — which keeps this list short and lets
 # every transport be combined with every layer.
+# is_tunnel_transport is true for the point-to-point tunnels that need address
+# fields rather than a bind port: the kernel tunnels and the raw udp/icmp carriers.
+is_tunnel_transport(){
+  case "$1" in gre|gretap|ipip|sit|l2tp|udp|icmp) return 0 ;; *) return 1 ;; esac
+}
+
+# transport_family groups transports by the config fields they need, which is
+# what decides whether one can replace another in place:
+#   stream  bind_addr / remote_addr         tcp mtcp mptcp ws tcpnomux kcp quic sctp
+#   p2p4    local_ip / remote_ip / tun_* v4 gre gretap ipip l2tp udp icmp
+#   sit     the same fields, but an IPv6 tunnel pair
+#   spoof   spoof_* fields
+transport_family(){
+  case "$1" in
+    sit) echo sit ;;
+    spoof) echo spoof ;;
+    *) if is_tunnel_transport "$1"; then echo p2p4; else echo stream; fi ;;
+  esac
+}
+
 pick_transport(){
   echo >&2
   echo -e "${C_B}  Select transport:${C_N}" >&2
-  echo -e "  ${C_D}──────────────────────────────────────────────${C_N}" >&2
+  echo -e "  ${C_D}── proxy (users connect to a port) ───────────${C_N}" >&2
   echo -e "   1) tcp       Plain TCP + smux         ${C_G}(stable baseline)${C_N}" >&2
   echo -e "   2) mtcp      Multi-link TCP           ${C_G}(beats throttling, best for Iran)${C_N}" >&2
-  echo    "   3) ws        WebSocket/HTTP + smux    (HTTP mimicry)" >&2
-  echo    "   4) tcpnomux  TCP pool, no HoL         (heavy single-flow)" >&2
-  echo -e "   5) kcp       KCP/UDP + FEC            ${C_Y}(only if UDP works)${C_N}" >&2
-  echo -e "   6) quic      QUIC/UDP, built-in TLS   ${C_Y}(only if UDP works)${C_N}" >&2
-  echo -e "   7) ip-spoofing  Spoofed-IP TUN        ${C_M}(blackout / national whitelist)${C_N}" >&2
+  echo -e "   3) mptcp     Multipath TCP (kernel)   ${C_G}(link aggregation, needs kernel >= 5.6)${C_N}" >&2
+  echo    "   4) ws        WebSocket/HTTP + smux    (HTTP mimicry)" >&2
+  echo    "   5) tcpnomux  TCP pool, no HoL         (heavy single-flow)" >&2
+  echo -e "   6) kcp       KCP/UDP + FEC            ${C_Y}(only if UDP works)${C_N}" >&2
+  echo -e "   7) quic      QUIC/UDP, built-in TLS   ${C_Y}(only if UDP works)${C_N}" >&2
+  echo -e "   8) sctp      Multi-stream + multihome ${C_Y}(needs kernel sctp)${C_N}" >&2
+  echo -e "  ${C_D}── kernel tunnels (point-to-point, highest throughput) ─${C_N}" >&2
+  echo    "   9) gre       GRE, L3, offload" >&2
+  echo    "  10) gretap    GRETAP, L2/ethernet" >&2
+  echo    "  11) ipip      IP-in-IP, lowest overhead" >&2
+  echo    "  12) sit       6in4 (IPv6 over IPv4)" >&2
+  echo    "  13) l2tp      L2TPv3 tunnel+session" >&2
+  echo -e "  ${C_D}── raw carriers (TUN over a protocol) ────────${C_N}" >&2
+  echo    "  14) udp       TUN over UDP" >&2
+  echo    "  15) icmp      TUN over ICMP echo" >&2
+  echo -e "  16) ip-spoofing  Spoofed-IP TUN        ${C_M}(blackout / national whitelist)${C_N}" >&2
   echo -e "  ${C_D}──────────────────────────────────────────────${C_N}" >&2
-  local n; n=$(ask "Choice [1-7]" "1")
+  local n; n=$(ask "Choice [1-16]" "1")
   case "$n" in
-    1) echo tcp ;; 2) echo mtcp ;; 3) echo ws ;; 4) echo tcpnomux ;;
-    5) echo kcp ;; 6) echo quic ;; 7) echo spoof ;; *) echo tcp ;;
+    1) echo tcp ;; 2) echo mtcp ;; 3) echo mptcp ;; 4) echo ws ;; 5) echo tcpnomux ;;
+    6) echo kcp ;; 7) echo quic ;; 8) echo sctp ;;
+    9) echo gre ;; 10) echo gretap ;; 11) echo ipip ;; 12) echo sit ;; 13) echo l2tp ;;
+    14) echo udp ;; 15) echo icmp ;; 16) echo spoof ;; *) echo tcp ;;
   esac
 }
 
@@ -178,9 +211,21 @@ pick_transport(){
 # layer and neither is asked.
 pick_encryption(){
   local tr="$1"
-  # quic already encrypts and authenticates with TLS 1.3, so it is not asked.
+  # quic (TLS 1.3) and the kernel tunnels (encrypt at the service) take no
+  # encryption layer, so they are not asked.
   case "$tr" in
-    quic) echo none; return ;;
+    quic|gre|gretap|ipip|sit|l2tp) echo none; return ;;
+  esac
+  # udp/icmp seal each datagram, exactly like spoof: offer aead/none.
+  case "$tr" in
+    udp|icmp)
+      echo >&2
+      echo -e "${C_B}  Encrypt this '$tr' tunnel?${C_N}" >&2
+      echo -e "   1) aead   ChaCha20-Poly1305   ${C_G}(encrypted + tamper-proof, Recommended)${C_N}" >&2
+      echo    "   2) none   No encryption" >&2
+      local nn; nn=$(ask "Choice [1-2]" "1")
+      case "$nn" in 2) echo none ;; *) echo aead ;; esac
+      return ;;
   esac
   echo >&2
   echo -e "${C_B}  Encrypt this '$tr' tunnel?${C_N}" >&2
@@ -244,6 +289,12 @@ build_extra(){ local role="$1" tr="$2"; EXTRA=""; TLSJSON=""
       local w; w=$(ask 'KCP window (send/recv, empty=1024)' '')
       [ -n "$w" ] && EXTRA="\"kcp_sndwnd\":$w,\"kcp_rcvwnd\":$w," ;;
     mtcp) [ "$role" = client ] && EXTRA="\"links\":$(ask 'Parallel links (0 = AUTO, scales with load — recommended)' '0'),";;
+    sctp)
+      local mh; mh=$(ask 'Extra local IPs for multihoming (comma-separated, blank = none)' '')
+      local st; st=$(ask 'Outbound streams' '8')
+      EXTRA="\"sctp_streams\":${st:-8},"
+      [ -n "$mh" ] && EXTRA="$EXTRA\"sctp_multihoming\":\"$mh\","
+      ;;
   esac
 }
 
@@ -351,6 +402,179 @@ EOF
   fi
 }
 
+# check_bind warns when bind_addr names an address this machine does not have.
+#
+# This is the mistake operators actually make: bind_addr reads like "the address
+# of my relay", so the server's PUBLIC ip goes in — and on a NAT'd VPS, which is
+# most of them, that address lives on the provider's gateway and not here. The
+# tunnel then dies at startup with the kernel's "cannot assign requested
+# address", which says what failed and nothing about what to change.
+#
+# Returns the address to actually use: the operator's, or 0.0.0.0 when they take
+# the offer. Never blocks — the operator may know something we do not, such as
+# an address that appears later.
+check_bind(){
+  local addr="$1" host port
+  host="${addr%:*}"; port="${addr##*:}"
+  case "$host" in
+    ""|"0.0.0.0"|"::"|"[::]"|"*") echo "$addr"; return ;;
+  esac
+  command -v ip >/dev/null 2>&1 || { echo "$addr"; return; }
+  if ip -o addr show 2>/dev/null | grep -qw "$host"; then
+    echo "$addr"; return
+  fi
+  {
+    echo
+    warn "This machine has no interface holding $host."
+    echo -e "  ${C_D}bind_addr is where the relay LISTENS, so it must be an address this${C_N}"
+    echo -e "  ${C_D}server actually has. On a VPS behind NAT the public ip lives on the${C_N}"
+    echo -e "  ${C_D}provider's gateway, not here, and the tunnel will fail to start.${C_N}"
+    echo -e "  ${C_D}The public ip belongs in the OTHER end's remote_addr.${C_N}"
+    echo
+    echo -e "  ${C_D}addresses this machine does have:${C_N}"
+    ip -o -4 addr show 2>/dev/null | awk '{print "    " $2 "  " $4}'
+  } >&2
+  local c; c=$(ask "Use 0.0.0.0:$port instead? Y/n" "Y") 
+  case "$c" in n|N) echo "$addr" ;; *) echo "0.0.0.0:$port" ;; esac
+}
+
+# server_summary spells out which port is which after a relay is created.
+#
+# The two ports do completely different jobs and nothing on screen used to say
+# so. An operator who reads bind_addr as "my relay's address" puts users on it,
+# and nothing works — the tunnel is up, the service is up, and the traffic never
+# meets either. That is a support cycle this prints away.
+server_summary(){
+  local bind="$1" portspec="$2" ip
+  ip="$(detect_ip)"; ip="${ip:-YOUR-RELAY-IP}"
+  local bport="${bind##*:}"
+  echo
+  echo -e "  ${C_B}These two ports do different jobs — do not mix them up.${C_N}"
+  echo
+  echo -e "  ${C_G}Users / client configs connect to:${C_N}"
+  local spec p
+  # portspec is the JSON array body: "443/both","8443=443/udp"
+  # printf with a trailing newline, and the '|| [ -n ]' guard: without both, the
+  # LAST mapping is silently dropped, because read returns non-zero on a final
+  # line that has no newline after it. A summary that quietly omits a port is
+  # worse than no summary.
+  printf '%s\n' "$portspec" | tr ',' '\n' | while read -r spec || [ -n "$spec" ]; do
+    spec="${spec//\"/}"
+    p="${spec%%=*}"; p="${p%%/*}"
+    [ -n "$p" ] && echo -e "      ${C_Y}$ip:$p${C_N}"
+  done
+  echo
+  echo -e "  ${C_D}The FOREIGN server connects to ${C_N}$ip:$bport${C_D} — that is its remote_addr.${C_N}"
+  echo -e "  ${C_D}Never point a user config at $bport: it is the tunnel itself, not your service.${C_N}"
+  echo
+  echo -e "  ${C_D}And on the FOREIGN server, your real service (xray, v2ray, ...) must be${C_N}"
+  echo -e "  ${C_D}listening on the port each mapping delivers to — the right-hand side of${C_N}"
+  echo -e "  ${C_D}\"8443=443\", or the same number when there is no \"=\".${C_N}"
+}
+
+# write_tunnel_cfg writes the config for a point-to-point tunnel: the kernel
+# tunnels (gre/gretap/ipip/sit/l2tp) and the raw carriers (udp/icmp). These do
+# not bind a listen port like tcp — they need the two servers' real addresses
+# and the addresses on the tunnel itself. The server also maps user ports across
+# the tunnel; the client names the local backend.
+write_tunnel_cfg(){
+  local role="$1" name="$2" tr="$3" enc="$4" cfg="$CFG_DIR/$name.json"
+  echo
+  echo -e "  ${C_D}$tr is a point-to-point tunnel. Give the two servers' real IPs and${C_N}"
+  echo -e "  ${C_D}the private addresses to use on the tunnel (any unused /30 works).${C_N}"
+  local lip rip tl trr
+  lip=$(ask "This server's real (public) IP" "$(detect_ip)")
+  rip=$(ask "The OTHER server's real IP" "")
+  # sit carries IPv6, so its tunnel addresses are IPv6 (a ULA pair); every
+  # other point-to-point tunnel here uses an IPv4 pair.
+  local a1=10.10.30.1 a2=10.10.30.2
+  if [ "$tr" = sit ]; then
+    a1=fd00:10:30::1 a2=fd00:10:30::2
+    echo -e "  ${C_D}sit carries IPv6: the tunnel addresses below must be IPv6.${C_N}"
+  fi
+  tl=$(ask "This end's tunnel address" "$([ "$role" = server ] && echo $a1 || echo $a2)")
+  trr=$(ask "The OTHER end's tunnel address" "$([ "$role" = server ] && echo $a2 || echo $a1)")
+  local mtu; mtu=$(ask "MTU (blank = auto)" "")
+  case "$mtu" in ""|*[!0-9]*) mtu=0 ;; esac
+
+  # transport-specific extras
+  local extra=""
+  case "$tr" in
+    gre|gretap)
+      local k; k=$(ask "GRE key (0 = none)" "0"); case "$k" in *[!0-9]*) k=0 ;; esac
+      [ "$k" != 0 ] && extra="\"gre_key\": $k,"
+      ;;
+    l2tp)
+      local tid sid en; tid=$(ask "Tunnel id (same on both ends)" "1000")
+      sid=$(ask "Session id (same on both ends)" "1000")
+      en=$(ask "Encap  1)udp 2)ip" "1"); [ "$en" = 2 ] && en=ip || en=udp
+      extra="\"l2tp_tunnel_id\": ${tid:-1000}, \"l2tp_session_id\": ${sid:-1000}, \"l2tp_encap\": \"$en\","
+      ;;
+    udp|icmp)
+      echo -e "  ${C_D}By default the real source IP is used (no forging). To forge a${C_N}"
+      echo -e "  ${C_D}whitelisted source for a blackout, answer the next two; blank = no forging.${C_N}"
+      local ssrc sdst; ssrc=$(ask "Forge source IP (blank = real)" "")
+      sdst=$(ask "Expected peer source IP (blank = real)" "")
+      [ -n "$ssrc" ] && extra="$extra\"spoof_src\": \"$ssrc\","
+      [ -n "$sdst" ] && extra="$extra\"spoof_dst\": \"$sdst\","
+      ;;
+  esac
+
+  local tokline=""; local token
+  token=$(ask "Shared token (same on both ends)" "$(gen_token)")
+  tokline="\"token\": \"$token\","
+
+  local portsjson=""
+  if [ "$role" = server ]; then portsjson=$(build_ports); fi
+
+  new_cfg_file "$cfg"
+  if [ "$role" = server ]; then
+    cat > "$cfg" <<EOF
+{
+  "mode": "server",
+  "transport": "$tr",
+  "encryption": "$enc",
+  $tokline
+  "local_ip": "$lip",
+  "remote_ip": "$rip",
+  "tun_local": "$tl",
+  "tun_remote": "$trr",
+  "mtu": $mtu,
+  $extra
+  "ports": [$portsjson],
+  "log_level": "info"
+}
+EOF
+    info "Saved $cfg"; warn "Token for the client: ${C_Y}$token${C_N}"
+    warn "On the OTHER server, swap the two IPs and the two tunnel addresses."
+  else
+    local target tdef=127.0.0.1
+    # sit delivers IPv6 straight to this host; the service must listen on [::].
+    [ "$tr" = sit ] && tdef=::1
+    target=$(ask "Local backend host" "$tdef")
+    cat > "$cfg" <<EOF
+{
+  "mode": "client",
+  "transport": "$tr",
+  "encryption": "$enc",
+  $tokline
+  "local_ip": "$lip",
+  "remote_ip": "$rip",
+  "tun_local": "$tl",
+  "tun_remote": "$trr",
+  "target_host": "$target",
+  "mtu": $mtu,
+  $extra
+  "log_level": "info"
+}
+EOF
+    info "Saved $cfg"
+  fi
+  systemctl enable "brokennode@$name" >/dev/null 2>&1; systemctl restart "brokennode@$name"; sleep 1.5
+  if [ "$(systemctl is-active "brokennode@$name" 2>/dev/null)" = active ]; then info "Tunnel '$name' is ${C_G}active${C_N}."
+  else err "Tunnel '$name' failed to start. Recent log:"; journalctl -u "brokennode@$name" -n 10 --no-pager 2>/dev/null | sed 's/^/    /'; fi
+}
+
 create_tunnel(){
   need_root; ensure_core || return; mkdir -p "$CFG_DIR"; harden_cfg_dir; write_template
   local role="$1" name tr enc ka kmode kdata kparity
@@ -362,12 +586,16 @@ create_tunnel(){
 
   if [ "$tr" = spoof ]; then
     write_spoof_cfg "$role" "$name" "$enc"
+  elif is_tunnel_transport "$tr"; then
+    write_tunnel_cfg "$role" "$name" "$tr" "$enc"
   else
     read -r ka kmode kdata kparity <<< "$(pick_preset)"; build_extra "$role" "$tr"
     local cfg="$CFG_DIR/$name.json"
     if [ "$role" = server ]; then
       local bind ports token qtotal qup qdown
-      bind=$(ask "Tunnel listen address (host:port)" "0.0.0.0:8443"); ports=$(build_ports)
+      bind=$(ask "Tunnel listen address (host:port)" "0.0.0.0:8443")
+      bind="$(check_bind "$bind")"
+      ports=$(build_ports)
       token=$(ask "Shared token" "$(gen_token)")
       echo -e "  ${C_D}Traffic quota (optional) — leave blank for unlimited. Once reached, the${C_N}"
       echo -e "  ${C_D}tunnel refuses new connections and drops active ones until you raise it.${C_N}"
@@ -396,6 +624,7 @@ create_tunnel(){
 }
 EOF
       info "Saved $cfg"; warn "Token for the client: ${C_Y}$token${C_N}"
+      server_summary "$bind" "$ports"
     else
       local remote token target
       remote=$(ask "Tunnel server address (Iran relay IP:port)" "1.2.3.4:8443")
@@ -753,6 +982,15 @@ change_transport(){
   echo; echo -e "${C_B}  Change transport for '$n'${C_N}  ${C_D}(current: $cur, encryption: $curenc)${C_N}"
   local new; new=$(pick_transport)
   [ -z "$new" ] && { warn "cancelled"; return; }
+  # A transport from another family needs different fields entirely (a relay
+  # address vs. two real IPs and a tunnel pair). Swapping the name in place
+  # left a config the new transport could not start from.
+  local curfam newfam; curfam=$(transport_family "$cur"); newfam=$(transport_family "$new")
+  if [ "$curfam" != "$newfam" ]; then
+    err "'$cur' and '$new' are configured differently ($curfam vs $newfam) — they cannot be swapped in place."
+    warn "Create a new tunnel with '$new' instead, then delete '$n'."
+    read -t 30 -rp "  ▶ press ENTER to continue... " _; return
+  fi
   local newenc; newenc=$(pick_encryption "$new")
   if [ "$new" = "$cur" ] && [ "$newenc" = "$curenc" ]; then info "already $cur/$curenc — nothing to do"; return; fi
   jset "$cfg" transport "$new"
@@ -802,6 +1040,33 @@ tune_tunnel(){
   echo -e "  ${C_D}──────────────────────────────────────────────${C_N}"
 
   local v cur
+  local fam; fam=$(transport_family "$tr")
+  if [ "$fam" != stream ]; then
+    # Point-to-point tunnels have no smux, bind port or keepalive; what can be
+    # tuned is the MTU and the addresses, which live in the config itself.
+    cur="$(jget "$cfg" mtu)"
+    v=$(ask "  mtu (0 = default) [${cur:-0}]" ""); [ -n "$v" ] && jset "$cfg" mtu "$v" int
+    if [ "$tr" = gre ] || [ "$tr" = gretap ] || [ "$tr" = ipip ] || [ "$tr" = sit ]; then
+      cur="$(jget "$cfg" tun_ttl)"
+      v=$(ask "  tun_ttl (outer TTL, 0 = kernel default) [${cur:-0}]" ""); [ -n "$v" ] && jset "$cfg" tun_ttl "$v" int
+    fi
+    if [ "$mode" = client ]; then
+      cur="$(jget "$cfg" target_host)"
+      v=$(ask "  target_host (where traffic is delivered locally) [$cur]" ""); [ -n "$v" ] && jset "$cfg" target_host "$v"
+    fi
+    cur="$(jget "$cfg" log_level)"
+    v=$(ask "  log_level (info/debug/error) [$cur]" ""); [ -n "$v" ] && jset "$cfg" log_level "$v"
+    if ! python3 -c "import json,sys; json.load(open('$cfg'))" 2>/dev/null; then
+      err "Config is not valid JSON after editing — NOT restarting. Fix it with 'Edit config'."
+      read -t 30 -rp "  ▶ press ENTER to continue... " _; return
+    fi
+    systemctl restart "brokennode@$n" >/dev/null 2>&1
+    info "settings saved, '$n' restarted"
+    warn "mtu should match on both ends."
+    read -t 30 -rp "  ▶ press ENTER to continue... " _
+    return
+  fi
+
   cur="$(jget "$cfg" keepalive)"
   v=$(ask "  keepalive seconds (lower = faster dead-peer detection) [$cur]" ""); [ -n "$v" ] && jset "$cfg" keepalive "$v" int
 
@@ -837,6 +1102,14 @@ tune_tunnel(){
       echo -e "  ${C_D}pool_size: 0 = auto-scale with load (recommended)${C_N}"
       v=$(ask "  pool_size [${cur:-0}]" ""); [ -n "$v" ] && jset "$cfg" pool_size "$v" int
       ;;
+    sctp)
+      cur="$(jget "$cfg" sctp_streams)"
+      v=$(ask "  sctp_streams (1-65535) [${cur:-8}]" ""); [ -n "$v" ] && jset "$cfg" sctp_streams "$v" int
+      cur="$(jget "$cfg" sctp_multihoming)"
+      echo -e "  ${C_D}Extra local IPs for multihoming, comma-separated (blank keeps; '-' clears).${C_N}"
+      v=$(ask "  sctp_multihoming [${cur:-none}]" "")
+      if [ "$v" = "-" ]; then jset "$cfg" sctp_multihoming "" del; elif [ -n "$v" ]; then jset "$cfg" sctp_multihoming "$v"; fi
+      ;;
   esac
 
   cur="$(jget "$cfg" smux_recv_mb)"
@@ -846,7 +1119,8 @@ tune_tunnel(){
 
   if [ "$mode" = server ]; then
     cur="$(jget "$cfg" bind_addr)"
-    v=$(ask "  bind_addr (listen host:port) [$cur]" ""); [ -n "$v" ] && jset "$cfg" bind_addr "$v"
+    v=$(ask "  bind_addr (listen host:port) [$cur]" "")
+    [ -n "$v" ] && jset "$cfg" bind_addr "$(check_bind "$v")"
     cur="$(jget "$cfg" quota_total_gb)"
     v=$(ask "  quota_total_gb (0 = unlimited) [${cur:-0}]" ""); [ -n "$v" ] && jset "$cfg" quota_total_gb "$v" float
     cur="$(jget "$cfg" quota_up_gb)"
