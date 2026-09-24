@@ -8,7 +8,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.3.4"
+VERSION="2.3.5"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=2
@@ -175,6 +175,104 @@ transport_family(){
     spoof) echo spoof ;;
     *) if is_tunnel_transport "$1"; then echo p2p4; else echo stream; fi ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# Several tunnels on one server
+#
+# One Iran relay commonly serves several foreign servers, one tunnel each.
+# Anything two tunnels share by accident breaks one of them: the same tunnel
+# addresses (routes collide), the same l2tp id or udp carrier port, or the same
+# user port on the relay. These helpers read the OTHER tunnels' configs so a new
+# one is offered free values and warned about clashes.
+# ---------------------------------------------------------------------------
+
+# cfg_scan MODE EXCLUDE [KEY]
+#   values KEY : every value of KEY in the other configs, one per line
+#   ports      : every port the other configs listen on (user ports + bind port)
+#   carriers   : udp carrier ports in use (6262 when a udp tunnel leaves it unset)
+cfg_scan(){
+  python3 - "$CFG_DIR" "$1" "$2" "${3:-}" <<'PYEOF2'
+import json, os, sys, glob
+d, mode, excl, key = sys.argv[1:5]
+for f in sorted(glob.glob(os.path.join(d, "*.json"))):
+    if os.path.basename(f)[:-5] == excl:
+        continue
+    try:
+        c = json.load(open(f))
+    except Exception:
+        continue
+    if mode == "values":
+        v = c.get(key)
+        if v not in (None, ""):
+            print(v)
+    elif mode == "ports":
+        # "port/proto" lines: a tcp and a udp listener on one number coexist.
+        for spec in c.get("ports") or []:
+            spec = str(spec).strip()
+            port = spec.split("=")[0].split("/")[0].strip()
+            proto = spec.rsplit("/", 1)[1] if "/" in spec else "tcp"
+            for pr in (("tcp", "udp") if proto == "both" else (proto,)):
+                print(port + "/" + pr)
+        b = c.get("bind_addr") or ""
+        if ":" in b:
+            pr = "udp" if c.get("transport") in ("kcp", "quic") else "tcp"
+            print(b.rsplit(":", 1)[1] + "/" + pr)
+    elif mode == "carriers":
+        if c.get("transport") in ("udp", "spoof") and c.get("carrier_proto", "udp") in ("", "udp"):
+            print(c.get("carrier_port") or 6262)
+PYEOF2
+}
+
+# next_free_int KEY START EXCLUDE — smallest integer >= START no other tunnel uses for KEY.
+next_free_int(){
+  local key="$1" v="$2" used
+  used=" $( { if [ "$key" = carrier_port ]; then cfg_scan carriers "$3"; else cfg_scan values "$3" "$key"; fi; } | tr '\n' ' ') "
+  while [[ "$used" == *" $v "* ]]; do v=$((v+1)); done
+  echo "$v"
+}
+
+# next_free_net EXCLUDE — N such that 10.10.N.x is not used by another tunnel.
+next_free_net(){
+  local used n; used=" $( { cfg_scan values "$1" tun_local; cfg_scan values "$1" tun_remote; } | tr '\n' ' ') "
+  for n in $(seq "${2:-30}" 254); do
+    [[ "$used" == *" 10.10.$n."* || "$used" == *" fd00:10:$n::"* ]] || { echo "$n"; return; }
+  done
+  echo 30
+}
+
+# warn_port_clash "PORTSJSON" EXCLUDE [BINDPORT] — tell the operator when a
+# port this tunnel will listen on is already taken by another tunnel. Two
+# tunnels on one user port cannot both work: only one listener (or DNAT rule)
+# can ever receive the traffic.
+warn_port_clash(){
+  local specs="$1" excl="$2" bport="${3:-}" bproto="${4:-tcp}" used spec p pr clash=""
+  used=" $(cfg_scan ports "$excl" | tr '\n' ' ') "
+  local want=()
+  for spec in $(printf '%s' "$specs" | tr -d '"' | tr ',' ' '); do
+    p="${spec%%=*}"; p="${p%%/*}"
+    case "$spec" in */both) want+=("$p/tcp" "$p/udp") ;; */udp) want+=("$p/udp") ;; *) want+=("$p/tcp") ;; esac
+  done
+  [ -n "$bport" ] && want+=("$bport/$bproto")
+  for pr in "${want[@]}"; do
+    [[ "$used" == *" $pr "* ]] && clash="$clash $pr"
+  done
+  if [ -n "$clash" ]; then
+    warn "Port(s)${C_Y}$clash${C_N} already belong to another tunnel on this server."
+    echo -e "  ${C_D}Only one tunnel can receive a given port. Use a different port for this one.${C_N}"
+  fi
+}
+
+# print_peer_values tells the operator exactly what to type on the foreign
+# server, whose wizard cannot know which free values this relay picked.
+print_peer_values(){
+  echo
+  echo -e "  ${C_B}Enter these on the OTHER (foreign) server:${C_N}"
+  echo -e "    this server's real IP      ${C_Y}$1${C_N}   (the other server's own IP: $2)"
+  echo -e "    this end's tunnel address  ${C_Y}$3${C_N}"
+  echo -e "    other end's tunnel address ${C_Y}$4${C_N}"
+  [ -n "$5" ] && echo -e "    token                      ${C_Y}$5${C_N}"
+  [ -n "$PEER_HINT" ] && printf "$PEER_HINT" | sed "s/^/  /"
 }
 
 pick_transport(){
@@ -356,20 +454,34 @@ write_spoof_cfg(){
   fi
   w1=$(ask "White IP #1 — the one IRAN sends as source" "")
   w2=$(ask "White IP #2 — the one FOREIGN sends as source" "")
-  local cport mtu jit jjson; cport=$(ask "Carrier port (udp/tcp)" "6262"); mtu=$(ask "MTU" "1320")
+  # The relay offers a carrier port and tunnel subnet no other tunnel here
+  # uses; the foreign side offers the base values and must match the relay.
+  local dcp=6262 nn=20
+  if [ "$role" = server ]; then dcp=$(next_free_int carrier_port 6262 "$name"); nn=$(next_free_net "$name" 20); fi
+  local cport mtu jit jjson; cport=$(ask "Carrier port (udp/tcp, same on both ends)" "$dcp"); mtu=$(ask "MTU" "1320")
+  # These go into the JSON unquoted: anything but a number in range would
+  # leave a config the core cannot parse, so fall back to the default.
+  case "$cport" in ''|*[!0-9]*) cport=$dcp ;; esac
+  if [ "$cport" -lt 1 ] || [ "$cport" -gt 65535 ]; then warn "Carrier port must be 1-65535; using $dcp"; cport=$dcp; fi
+  case "$mtu" in ''|*[!0-9]*) mtu=1320 ;; esac
+  if [ "$mtu" -lt 576 ] || [ "$mtu" -gt 9000 ]; then warn "MTU must be 576-9000; using 1320"; mtu=1320; fi
+  local dnn=$nn
+  nn=$(ask "Tunnel subnet: 10.10.N.x — N (same on both ends)" "$nn"); case "$nn" in ''|*[!0-9]*) nn=$dnn ;; esac
+  if [ "$nn" -gt 255 ]; then warn "N must be 0-255; using $dnn"; nn=$dnn; fi
   jit=$(ask "TTL jitter? (anti-fingerprint) y/N" "N")
   local jline jtail; case "$jit" in y|Y) jline='
   "ttl_jitter": true,'; jtail=',
   "ttl_jitter": true';; *) jline=''; jtail='';; esac
   local lip pip ssrc sdst tl trr
   if [ "$role" = server ]; then
-    lip="$iran"; pip="$foreign"; ssrc="$w1"; sdst="$w2"; tl=10.10.20.1; trr=10.10.20.2
+    lip="$iran"; pip="$foreign"; ssrc="$w1"; sdst="$w2"; tl=10.10.$nn.1; trr=10.10.$nn.2
   else
-    lip="$foreign"; pip="$iran"; ssrc="$w2"; sdst="$w1"; tl=10.10.20.2; trr=10.10.20.1
+    lip="$foreign"; pip="$iran"; ssrc="$w2"; sdst="$w1"; tl=10.10.$nn.2; trr=10.10.$nn.1
   fi
   local portsjson=""
   if [ "$role" = server ]; then
     portsjson=$(build_ports)
+    warn_port_clash "$portsjson" "$name"
   fi
   if [ "$role" = server ]; then
     new_cfg_file "$cfg"
@@ -385,7 +497,6 @@ write_spoof_cfg(){
   "spoof_dst": "$sdst",
   "carrier_proto": "$cproto",
   "carrier_port": $cport,
-  "tun_name": "spoof0",
   "tun_local": "$tl",
   "tun_remote": "$trr",
   "mtu": $mtu,$jline
@@ -406,7 +517,6 @@ EOF
   "spoof_dst": "$sdst",
   "carrier_proto": "$cproto",
   "carrier_port": $cport,
-  "tun_name": "spoof0",
   "tun_local": "$tl",
   "tun_remote": "$trr",
   "mtu": $mtu$jtail
@@ -415,8 +525,14 @@ EOF
   fi
   info "Saved $cfg"
   echo -e "  ${C_D}  proto=$cproto  spoof_src=$ssrc  spoof_dst=$sdst  encryption=$enc${C_N}"
-  if [ "$enc" != none ] && [ "$role" = server ]; then
-    warn "Token for the other side: ${C_Y}$token${C_N}"
+  if [ "$role" = server ]; then
+    # The foreign wizard offers the base carrier port and subnet; this relay
+    # may have picked others to stay clear of its other tunnels.
+    echo
+    echo -e "  ${C_B}Enter these on the OTHER (foreign) server:${C_N}"
+    echo -e "    carrier port   ${C_Y}$cport${C_N}"
+    echo -e "    subnet N       ${C_Y}$nn${C_N}   (10.10.$nn.x)"
+    [ "$enc" != none ] && echo -e "    token          ${C_Y}$token${C_N}"
   fi
 }
 
@@ -496,7 +612,11 @@ server_summary(){
 # and the addresses on the tunnel itself. The server also maps user ports across
 # the tunnel; the client names the local backend.
 write_tunnel_cfg(){
-  local role="$1" name="$2" tr="$3" enc="$4" cfg="$CFG_DIR/$name.json"
+  # Two statements: in one 'local', $name would expand before it is assigned
+  # (see write_spoof_cfg). It only worked because the caller has its own $name.
+  local role="$1" name="$2" tr="$3" enc="$4"
+  local cfg="$CFG_DIR/$name.json"
+  PEER_HINT=""
   echo
   echo -e "  ${C_D}$tr is a point-to-point tunnel. Give the two servers' real IPs and${C_N}"
   echo -e "  ${C_D}the private addresses to use on the tunnel (any unused /30 works).${C_N}"
@@ -517,9 +637,15 @@ write_tunnel_cfg(){
   rip=$(ask "The OTHER server's real IP" "")
   # sit carries IPv6, so its tunnel addresses are IPv6 (a ULA pair); every
   # other point-to-point tunnel here uses an IPv4 pair.
-  local a1=10.10.30.1 a2=10.10.30.2
+  # A free pair: every tunnel on this server needs its own tunnel addresses,
+  # or their routes collide and one tunnel takes the other's traffic.
+  # Only the relay picks free values: it is the side that carries several
+  # tunnels. The foreign server usually has one and cannot know what the relay
+  # picked, so it offers the base values; the relay prints what to enter.
+  local nn=30; [ "$role" = server ] && nn="$(next_free_net "$name")"
+  local a1=10.10.$nn.1 a2=10.10.$nn.2
   if [ "$tr" = sit ]; then
-    a1=fd00:10:30::1 a2=fd00:10:30::2
+    a1=fd00:10:$nn::1 a2=fd00:10:$nn::2
     echo -e "  ${C_D}sit carries IPv6: the tunnel addresses below must be IPv6.${C_N}"
   fi
   tl=$(ask "This end's tunnel address" "$([ "$role" = server ] && echo $a1 || echo $a2)")
@@ -535,8 +661,12 @@ write_tunnel_cfg(){
       [ "$k" != 0 ] && extra="\"gre_key\": $k,"
       ;;
     l2tp)
-      local tid sid en; tid=$(ask "Tunnel id (same on both ends)" "1000")
-      sid=$(ask "Session id (same on both ends)" "1000")
+      local tid sid en
+      local dt=1000 ds=1000
+      [ "$role" = server ] && { dt=$(next_free_int l2tp_tunnel_id 1000 "$name"); ds=$(next_free_int l2tp_session_id 1000 "$name"); }
+      tid=$(ask "Tunnel id (same on both ends)" "$dt")
+      sid=$(ask "Session id (same on both ends)" "$ds")
+      PEER_HINT="$PEER_HINT  l2tp tunnel id $tid, session id $sid\n"
       en=$(ask "Encap  1)udp 2)ip" "1"); [ "$en" = 2 ] && en=ip || en=udp
       extra="\"l2tp_tunnel_id\": ${tid:-1000}, \"l2tp_session_id\": ${sid:-1000}, \"l2tp_encap\": \"$en\","
       ;;
@@ -547,6 +677,15 @@ write_tunnel_cfg(){
       sdst=$(ask "Expected peer source IP (blank = real)" "")
       [ -n "$ssrc" ] && extra="$extra\"spoof_src\": \"$ssrc\","
       [ -n "$sdst" ] && extra="$extra\"spoof_dst\": \"$sdst\","
+      if [ "$tr" = udp ]; then
+        # Each udp tunnel on this server needs its own carrier port: a second
+        # tunnel on a taken one cannot bind and will not start.
+        local dcp=6262; [ "$role" = server ] && dcp=$(next_free_int carrier_port 6262 "$name")
+        local cport; cport=$(ask "Carrier UDP port (same on both ends)" "$dcp")
+        case "$cport" in ''|*[!0-9]*) cport=6262 ;; esac
+        extra="$extra\"carrier_port\": $cport,"
+        PEER_HINT="$PEER_HINT  carrier port $cport\n"
+      fi
       ;;
   esac
 
@@ -555,7 +694,7 @@ write_tunnel_cfg(){
   tokline="\"token\": \"$token\","
 
   local portsjson=""
-  if [ "$role" = server ]; then portsjson=$(build_ports); fi
+  if [ "$role" = server ]; then portsjson=$(build_ports); warn_port_clash "$portsjson" "$name"; fi
 
   new_cfg_file "$cfg"
   if [ "$role" = server ]; then
@@ -576,7 +715,7 @@ write_tunnel_cfg(){
 }
 EOF
     info "Saved $cfg"; warn "Token for the client: ${C_Y}$token${C_N}"
-    warn "On the OTHER server, swap the two IPs and the two tunnel addresses."
+    print_peer_values "$rip" "$lip" "$trr" "$tl" "$token"
   else
     local target tdef=127.0.0.1
     # sit delivers IPv6 straight to this host; the service must listen on [::].
@@ -627,6 +766,8 @@ create_tunnel(){
       bind=$(ask "Tunnel listen address (host:port)" "0.0.0.0:8443")
       bind="$(check_bind "$bind")"
       ports=$(build_ports)
+      local bproto=tcp; case "$tr" in kcp|quic) bproto=udp ;; esac
+      warn_port_clash "$ports" "$name" "${bind##*:}" "$bproto"
       token=$(ask "Shared token" "$(gen_token)")
       echo -e "  ${C_D}Traffic quota (optional) — leave blank for unlimited. Once reached, the${C_N}"
       echo -e "  ${C_D}tunnel refuses new connections and drops active ones until you raise it.${C_N}"
@@ -853,8 +994,18 @@ doctor(){
     if is_tunnel_transport "$trans"; then
       local rip tr_ip dev
       rip="$(jget "$cf" remote_ip)"; tr_ip="$(jget "$cf" tun_remote)"
-      dev="$(jget "$cf" tun_name)"; [ -z "$dev" ] && dev="bn-$trans"
-      case "$trans" in udp|icmp) [ -z "$(jget "$cf" tun_name)" ] && dev="spoof0" ;; esac
+      # The running core records the device it created; read that rather than
+      # re-deriving the name (per-tunnel, hashed when long). Without a record
+      # (an older core, or /run wiped) find the interface holding this
+      # tunnel's own address; if none does, the tunnel is not running.
+      dev="$(cat "/run/brokennode/$n.dev" 2>/dev/null)"
+      [ -z "$dev" ] && dev="$(jget "$cf" tun_name)"
+      if [ -z "$dev" ]; then
+        local tl; tl="$(jget "$cf" tun_local)"
+        [ -n "$tl" ] && dev="$(ip -o addr show 2>/dev/null | awk -v a="$tl/" 'index($4,a)==1{print $2; exit}')"
+        dev="${dev%%@*}"
+      fi
+      [ -z "$dev" ] && dev="(not running)"
       if ip link show "$dev" >/dev/null 2>&1; then okln "  interface $dev: up"
       else badln "  interface $dev: missing (tunnel not running?)"; warns=$((warns+1)); fi
       if ! command -v ping >/dev/null 2>&1; then
@@ -1013,7 +1164,7 @@ udp_dup_state(){
 # bandwidth of the UDP it applies to. For a game that is a few hundred kbit and
 # well worth it; for a bulk UDP flow it is not.
 toggle_udp_duplicate(){
-  local n="$1" cfg="$CFG_DIR/$n.json" cur
+  local n="$1"; local cfg="$CFG_DIR/$n.json" cur
   cur="$(udp_dup_state "$n")"
   echo
   echo -e "${C_B}  Duplicate UDP packets  ${C_D}— currently $cur${C_N}"
@@ -1070,7 +1221,7 @@ service_check(){
 # addresses. It also clears settings that belong to the OLD transport so a
 # leftover field cannot confuse the new one.
 change_transport(){
-  local n="$1" cfg="$CFG_DIR/$n.json"
+  local n="$1"; local cfg="$CFG_DIR/$n.json"
   local cur curenc mode; cur="$(jget "$cfg" transport)"; curenc="$(jget "$cfg" encryption)"; mode="$(jget "$cfg" mode)"
   # A config written by an older build may still carry a retired combined name.
   # The core reads "tcpobf" as tcp+obfs; show and compare it the same way, or
@@ -1119,7 +1270,7 @@ change_transport(){
 # change_relay_ip updates where a CLIENT tunnel dials, keeping the port. This is
 # the operation needed every time the Iran relay's IP changes.
 change_relay_ip(){
-  local n="$1" cfg="$CFG_DIR/$n.json"
+  local n="$1"; local cfg="$CFG_DIR/$n.json"
   local mode; mode="$(jget "$cfg" mode)"
   if [ "$mode" != client ]; then
     warn "'$n' is a SERVER tunnel — it listens rather than dials, so it has no relay IP."
@@ -1141,7 +1292,7 @@ change_relay_ip(){
 # tune_tunnel exposes the per-tunnel network knobs. Blank input keeps the current
 # value, so it doubles as a way to review settings without changing them.
 tune_tunnel(){
-  local n="$1" cfg="$CFG_DIR/$n.json"
+  local n="$1"; local cfg="$CFG_DIR/$n.json"
   local tr mode; tr="$(jget "$cfg" transport)"; mode="$(jget "$cfg" mode)"
   echo; echo -e "${C_B}  Tune '$n'${C_N}  ${C_D}($mode/$tr) — blank keeps the current value${C_N}"
   echo -e "  ${C_D}──────────────────────────────────────────────${C_N}"
