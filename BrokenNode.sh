@@ -8,7 +8,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.3.6"
+VERSION="2.3.7"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=2
@@ -25,12 +25,18 @@ REPO_DIR="$(cd "$SRC_DIR/.." && pwd)"
 # this is run as "scripts/BrokenNode.sh" from a checkout or as "BrokenNode.sh"
 # from a release directory.
 SELF="${BASH_SOURCE[0]}"
+INSTALL_URL="https://raw.githubusercontent.com/BrokenCodeee/BrokenNode/main/install.sh"
 
 C_R='\033[0;31m'; C_G='\033[0;32m'; C_Y='\033[1;33m'; C_B='\033[0;36m'; C_M='\033[0;35m'; C_D='\033[0;90m'; C_N='\033[0m'
 info(){ echo -e "${C_G}  [+]${C_N} $*"; }
 warn(){ echo -e "${C_Y}  [!]${C_N} $*"; }
 err(){ echo -e "${C_R}  [x]${C_N} $*" >&2; }
 ask(){ local p="$1" d="${2:-}" a; if [ -n "$d" ]; then read -rp "$(echo -e "${C_B}  ?${C_N} $p [${C_D}$d${C_N}]: ")" a; echo "${a:-$d}"; else read -rp "$(echo -e "${C_B}  ?${C_N} $p: ")" a; echo "$a"; fi; }
+# menu_ask PROMPT — a menu choice; "__eof__" once input has ended. The menus
+# loop until a choice exits them, and ask() cannot tell end of input from an
+# empty answer, so a closed stdin (a script feeding the menu, a dropped SSH
+# session) spun them forever printing "Invalid.".
+menu_ask(){ local a; if read -rp "$(echo -e "${C_B}  ?${C_N} $1: ")" a; then echo "$a"; else echo "__eof__"; fi; }
 need_root(){ [ "$(id -u)" -eq 0 ] || { err "Run as root: sudo bash $SELF"; exit 1; }; }
 detect_ip(){ ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1 || true; }
 default_iface(){ ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1; }
@@ -94,9 +100,32 @@ detect_bin(){
     [ -f "$c" ] && { echo "$c"; return; }
   done
 }
+# core_version BINARY — "2.3.7" from "BrokenNode Tunnel v2.3.7"; empty if the
+# binary does not run.
+core_version(){ "$1" version 2>/dev/null | sed -n 's/.* v\{0,1\}\([0-9][0-9.]*\)$/\1/p' | head -n 1; }
+
+# version_lt A B — true when version A is older than B.
+version_lt(){ [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$1" ]; }
+
+# bundled_is_older SRC — the core in this folder is OLDER than the one already
+# installed. Installing it would be a downgrade: that is what happened when an
+# update landed in a second, nested BrokenNode folder and the old folder, opened
+# later, put its old core back ("updated, and then it is 2.3.5 again").
+bundled_is_older(){
+  [ -x "$BIN" ] || return 1
+  local have new; have="$(core_version "$BIN")"; new="$(core_version "$1")"
+  [ -n "$have" ] && [ -n "$new" ] && version_lt "$new" "$have"
+}
+
+warn_old_folder(){
+  warn "This folder ($SRC_DIR) holds an OLDER BrokenNode (core v$(core_version "$1")) than the one installed (v$(core_version "$BIN")) — not downgrading."
+  echo -e "  ${C_D}Update this folder: menu option 5, or  cd \"$SRC_DIR\" && bash <(curl -fsSL $INSTALL_URL)${C_N}"
+}
+
 ensure_core(){
   local src; src="$(detect_bin)"
   if [ -n "$src" ] && [ -f "$src" ]; then
+    if bundled_is_older "$src"; then warn_old_folder "$src"; return 0; fi
     { [ ! -x "$BIN" ] || ! cmp -s "$src" "$BIN"; } && { install -m0755 "$src" "$BIN"; info "Core updated: $("$BIN" version)"; }
     return 0
   fi
@@ -228,7 +257,8 @@ ask_hostport(){
 # cfg_scan MODE EXCLUDE [KEY]
 #   values KEY : every value of KEY in the other configs, one per line
 #   ports      : every port the other configs listen on (user ports + bind port)
-#   carriers   : udp carrier ports in use (6262 when a udp tunnel leaves it unset)
+#   carriers [P]: carrier ports in use for protocol P (udp by default; icmp's is
+#                its echo identifier), 6262 when a tunnel leaves it unset
 cfg_scan(){
   python3 - "$CFG_DIR" "$1" "$2" "${3:-}" <<'PYEOF2'
 import json, os, sys, glob
@@ -265,7 +295,17 @@ for f in sorted(glob.glob(os.path.join(d, "*.json"))):
             pr = "udp" if c.get("transport") in ("kcp", "quic") else "tcp"
             print(b.rsplit(":", 1)[1] + "/" + pr)
     elif mode == "carriers":
-        if c.get("transport") in ("udp", "spoof") and c.get("carrier_proto", "udp") in ("", "udp"):
+        # key = carrier protocol (udp, icmp, tcp). A carrier port — the echo
+        # identifier for icmp — has to be unique per protocol on a server.
+        t = c.get("transport")
+        key = key or "udp"
+        # A udp carrier and an l2tp-over-udp tunnel bind in the same UDP port
+        # space on this server, so for either one both kinds are taken.
+        if key in ("udp", "l2tp") and t == "l2tp" and (c.get("l2tp_encap") or "udp") == "udp":
+            print(c.get("l2tp_port") or 1701)
+            continue
+        cp = t if t in ("udp", "icmp") else (c.get("carrier_proto") or "udp") if t == "spoof" else None
+        if cp == key or (key == "l2tp" and cp == "udp"):
             print(c.get("carrier_port") or 6262)
 PYEOF2
 }
@@ -273,7 +313,11 @@ PYEOF2
 # next_free_int KEY START EXCLUDE — smallest integer >= START no other tunnel uses for KEY.
 next_free_int(){
   local key="$1" v="$2" used
-  used=" $( { if [ "$key" = carrier_port ]; then cfg_scan carriers "$3"; else cfg_scan values "$3" "$key"; fi; } | tr '\n' ' ') "
+  used=" $( { case "$key" in
+      carrier_port)        cfg_scan carriers "$3" udp ;;
+      carrier_port:*)      cfg_scan carriers "$3" "${key#carrier_port:}" ;;
+      *)                   cfg_scan values "$3" "$key" ;;
+    esac; } | tr '\n' ' ') "
   while [[ "$used" == *" $v "* ]]; do v=$((v+1)); done
   echo "$v"
 }
@@ -286,6 +330,50 @@ next_free_net(){
   done
   echo 30
 }
+
+# peer_tunnels TRANSPORTS RIP EXCLUDE — for every other tunnel on this server
+# whose transport is in TRANSPORTS (comma-separated) and whose peer is RIP, one
+# line: its gre_key (0 = none; meaningful for gre/gretap only).
+peer_tunnels(){
+  python3 - "$CFG_DIR" "$1" "$2" "$3" <<'PYEOF'
+import json, os, sys, glob
+d, trs, rip, excl = sys.argv[1:5]
+for f in sorted(glob.glob(os.path.join(d, "*.json"))):
+    if os.path.basename(f)[:-5] == excl:
+        continue
+    try:
+        c = json.load(open(f))
+    except Exception:
+        continue
+    if c.get("transport") in trs.split(",") and c.get("remote_ip") == rip:
+        print(int(c.get("gre_key") or 0))
+PYEOF
+}
+
+# gre_carrier_peers PEER EXCLUDE — other tunnels here that exchange GRE packets
+# with PEER: kernel gre/gretap, or spoof over a gre carrier. One line each.
+gre_carrier_peers(){
+  python3 - "$CFG_DIR" "$1" "$2" <<'PYEOF'
+import json, os, sys, glob
+d, peer, excl = sys.argv[1:4]
+for f in sorted(glob.glob(os.path.join(d, "*.json"))):
+    if os.path.basename(f)[:-5] == excl:
+        continue
+    try:
+        c = json.load(open(f))
+    except Exception:
+        continue
+    t = c.get("transport")
+    if (t in ("gre", "gretap") and c.get("remote_ip") == peer) or \
+       (t == "spoof" and c.get("carrier_proto") == "gre" and c.get("spoof_peer_ip") == peer):
+        print(os.path.basename(f)[:-5])
+PYEOF
+}
+
+# gre_peer_keys TR RIP EXCLUDE — the gre_key (0 = none) of every other tunnel
+# of transport TR (gre or gretap: the kernel keeps the two apart) on this
+# server to the peer RIP, one per line.
+gre_peer_keys(){ peer_tunnels "$1" "$2" "$3"; }
 
 # next_free_port START PROTO EXCLUDE — the first port >= START that no other
 # tunnel on this server listens on for PROTO. A foreign server in direct mode
@@ -524,7 +612,7 @@ write_spoof_cfg(){
   # The relay offers a carrier port and tunnel subnet no other tunnel here
   # uses; the foreign side offers the base values and must match the relay.
   local dcp=6262 nn=20
-  if [ "$role" = server ]; then dcp=$(next_free_int carrier_port 6262 "$name"); nn=$(next_free_net "$name" 20); fi
+  if [ "$role" = server ]; then dcp=$(next_free_int "carrier_port:$cproto" 6262 "$name"); nn=$(next_free_net "$name" 20); fi
   local cport mtu jit jjson; cport=$(ask "Carrier port (udp/tcp, same on both ends)" "$dcp"); mtu=$(ask "MTU" "1320")
   # These go into the JSON unquoted: anything but a number in range would
   # leave a config the core cannot parse, so fall back to the default.
@@ -544,6 +632,14 @@ write_spoof_cfg(){
     lip="$iran"; pip="$foreign"; ssrc="$w1"; sdst="$w2"; tl=10.10.$nn.1; trr=10.10.$nn.2
   else
     lip="$foreign"; pip="$iran"; ssrc="$w2"; sdst="$w1"; tl=10.10.$nn.2; trr=10.10.$nn.1
+  fi
+  # A gre carrier has no port or identifier: this tunnel receives every GRE
+  # packet the peer sends here — another spoof-gre tunnel's, or a kernel gre
+  # tunnel's to the same server. With aead those fail authentication and are
+  # dropped; without, they would land in this tunnel.
+  if [ "$cproto" = gre ] && [ -n "$(gre_carrier_peers "$pip" "$name")" ]; then
+    warn "This server already has a GRE-based tunnel to $pip. A spoof tunnel over gre cannot be told apart from it:"
+    echo -e "  ${C_D}only one GRE-carried tunnel per pair of servers — use the udp, tcp or icmp carrier for this one.${C_N}"
   fi
   local portsjson=""
   if [ "$role" = server ]; then
@@ -721,6 +817,15 @@ write_tunnel_cfg(){
   local lip rip tl trr
   lip=$(ask "This server's real (public) IP" "$(detect_ip)")
   rip=$(ask "The OTHER server's real IP" "")
+  # ipip and sit carry nothing that tells two tunnels between the same two
+  # servers apart, so the kernel allows one of each per pair of IPs; a second
+  # fails to start ("File exists"). Say so now rather than after the fact.
+  case "$tr" in ipip|sit)
+    if [ -n "$(peer_tunnels "$tr" "$rip" "$name")" ]; then
+      warn "This server already has a $tr tunnel to $rip — the kernel allows only one."
+      echo -e "  ${C_D}For another tunnel to the same server use gre (each with its own key), l2tp or udp.${C_N}"
+    fi ;;
+  esac
   # sit carries IPv6, so its tunnel addresses are IPv6 (a ULA pair); every
   # other point-to-point tunnel here uses an IPv4 pair.
   # A free pair: every tunnel on this server needs its own tunnel addresses,
@@ -743,8 +848,22 @@ write_tunnel_cfg(){
   local extra=""
   case "$tr" in
     gre|gretap)
-      local k; k=$(ask "GRE key (0 = none)" "0"); case "$k" in *[!0-9]*) k=0 ;; esac
-      [ "$k" != 0 ] && extra="\"gre_key\": $k,"
+      # The kernel tells gre tunnels between the same two IPs apart only by
+      # their key: a second keyless one fails with "File exists". When this
+      # server already has a gre/gretap tunnel to the same peer, offer a key
+      # no other one uses (the other end must enter the same).
+      local dk=0 k keys; keys=" $(gre_peer_keys "$tr" "$rip" "$name" | tr '\n' ' ') "
+      if [ "$keys" != "  " ]; then
+        dk=1; while [[ "$keys" == *" $dk "* ]]; do dk=$((dk+1)); done
+        echo -e "  ${C_D}Another $tr tunnel to $rip exists here: this one needs its own key.${C_N}"
+      fi
+      k=$(ask "GRE key (0 = none, same on both ends)" "$dk"); case "$k" in ''|*[!0-9]*) k=$dk ;; esac
+      if [ "$k" != 0 ]; then
+        extra="\"gre_key\": $k,"
+        PEER_HINT="$PEER_HINT  gre key $k\n"
+      elif [[ "$keys" == *" 0 "* ]]; then
+        warn "Another keyless $tr tunnel to $rip exists — this one will not start without a key."
+      fi
       ;;
     l2tp)
       local tid sid en
@@ -755,6 +874,15 @@ write_tunnel_cfg(){
       PEER_HINT="$PEER_HINT  l2tp tunnel id $tid, session id $sid\n"
       en=$(ask "Encap  1)udp 2)ip" "1"); [ "$en" = 2 ] && en=ip || en=udp
       extra="\"l2tp_tunnel_id\": ${tid:-1000}, \"l2tp_session_id\": ${sid:-1000}, \"l2tp_encap\": \"$en\","
+      if [ "$en" = udp ]; then
+        # Over udp each l2tp tunnel on a server binds its own port: a second
+        # one on a taken port fails with "Address already in use".
+        local dlp=1701 lp; [ "$role" = server ] && dlp=$(next_free_int "carrier_port:l2tp" 1701 "$name")
+        lp=$(ask "L2TP UDP port (same on both ends)" "$dlp"); case "$lp" in ''|*[!0-9]*) lp=$dlp ;; esac
+        if [ "$lp" -lt 1 ] || [ "$lp" -gt 65535 ]; then warn "Port must be 1-65535; using $dlp"; lp=$dlp; fi
+        extra="$extra \"l2tp_port\": $lp,"
+        PEER_HINT="$PEER_HINT  l2tp udp port $lp\n"
+      fi
       ;;
     udp|icmp)
       echo -e "  ${C_D}By default the real source IP is used (no forging). To forge a${C_N}"
@@ -763,15 +891,16 @@ write_tunnel_cfg(){
       sdst=$(ask "Expected peer source IP (blank = real)" "")
       [ -n "$ssrc" ] && extra="$extra\"spoof_src\": \"$ssrc\","
       [ -n "$sdst" ] && extra="$extra\"spoof_dst\": \"$sdst\","
-      if [ "$tr" = udp ]; then
-        # Each udp tunnel on this server needs its own carrier port: a second
-        # tunnel on a taken one cannot bind and will not start.
-        local dcp=6262; [ "$role" = server ] && dcp=$(next_free_int carrier_port 6262 "$name")
-        local cport; cport=$(ask "Carrier UDP port (same on both ends)" "$dcp")
-        case "$cport" in ''|*[!0-9]*) cport=6262 ;; esac
-        extra="$extra\"carrier_port\": $cport,"
-        PEER_HINT="$PEER_HINT  carrier port $cport\n"
-      fi
+      # Each tunnel on this server needs its own carrier port: a second udp
+      # tunnel on a taken one cannot bind and will not start, and two icmp
+      # tunnels with one identifier would receive each other's packets.
+      local dcp=6262; [ "$role" = server ] && dcp=$(next_free_int "carrier_port:$tr" 6262 "$name")
+      local cport what="Carrier UDP port"; [ "$tr" = icmp ] && what="ICMP tunnel id"
+      cport=$(ask "$what (same on both ends)" "$dcp")
+      case "$cport" in ''|*[!0-9]*) cport=$dcp ;; esac
+      if [ "$cport" -lt 1 ] || [ "$cport" -gt 65535 ]; then warn "$what must be 1-65535; using $dcp"; cport=$dcp; fi
+      extra="$extra\"carrier_port\": $cport,"
+      PEER_HINT="$PEER_HINT  ${what,,} $cport\n"
       ;;
   esac
 
@@ -1175,7 +1304,7 @@ doctor(){
       # re-deriving the name (per-tunnel, hashed when long). Without a record
       # (an older core, or /run wiped) find the interface holding this
       # tunnel's own address; if none does, the tunnel is not running.
-      dev="$(cat "/run/brokennode/$n.dev" 2>/dev/null)"
+      dev="$(head -n 1 "/run/brokennode/$n.dev" 2>/dev/null)"  # device, then PID
       [ -z "$dev" ] && dev="$(jget "$cf" tun_name)"
       if [ -z "$dev" ]; then
         local tl; tl="$(jget "$cf" tun_local)"
@@ -1693,7 +1822,7 @@ manage_tunnels(){
       echo -e "   ${C_G}9) Change transport${C_N}   ${C_G}10) Change peer IP${C_N}   ${C_G}11) Tune settings (MTU/FEC/window...)${C_N}"
       echo -e "   ${C_G}12) Duplicate UDP packets${C_N}  ${C_D}[$(udp_dup_state "$n")]${C_N}   ${C_G}13) Change direction${C_N}  ${C_D}[$(tunnel_direction "$CFG_DIR/$n.json")]${C_N}"
       echo "   0) Back"
-      case "$(ask 'Choice' '')" in
+      case "$(menu_ask 'Choice')" in
         1) systemctl enable --now "brokennode@$n" >/dev/null 2>&1; systemctl start "brokennode@$n"; info "started";;
         2) systemctl stop "brokennode@$n"; info "stopped";;
         3) systemctl restart "brokennode@$n"; info "restarted";;
@@ -1708,6 +1837,7 @@ manage_tunnels(){
         11) tune_tunnel "$n";;
         12) toggle_udp_duplicate "$n";;
         13) change_direction "$n";;
+        __eof__) return;;
         0) break;;
         *) warn "Invalid.";;
       esac
@@ -1732,10 +1862,6 @@ restart_all_tunnels(){
   [ "$any" = 0 ] && warn "No tunnels configured yet."
 }
 
-# auto_apply_bundled: run at startup. If the binary shipped next to the script
-# differs from what's installed, install it and restart tunnels automatically —
-# so customers never have to pick an "update" menu item. No-op when already
-# up to date, or when not root.
 # auto_tune_once applies the network tuning (BBR + fq + buffers) the first time
 # this host runs the manager. The manual menu entry is gone, so tuning has to
 # happen on its own — but only ONCE, tracked by a stamp file, so we never fight
@@ -1766,11 +1892,21 @@ auto_tune_once(){
   mkdir -p "$CFG_DIR" 2>/dev/null; : > "$stamp"
 }
 
+# auto_apply_bundled: run at startup. If the binary shipped next to the script
+# differs from what's installed, install it and restart tunnels automatically —
+# so customers never have to pick an "update" menu item. No-op when already
+# up to date, or when not root. Never a downgrade: a folder older than the
+# installed core only says so (see bundled_is_older).
 auto_apply_bundled(){
   [ "$(id -u)" -eq 0 ] || return 0
   auto_tune_once
   local src; src="$(detect_bin)"
   [ -n "$src" ] && [ -f "$src" ] || return 0
+  if bundled_is_older "$src"; then
+    warn_old_folder "$src"
+    read -t 15 -rp "  ▶ Press ENTER to continue (auto-continuing in 15s)... " _ 2>/dev/null || true
+    return 0
+  fi
   if [ ! -x "$BIN" ] || ! cmp -s "$src" "$BIN"; then
     warn "New core bundled with this package — applying automatically..."
     install -m0755 "$src" "$BIN"; info "Core: $("$BIN" version)"
@@ -1778,6 +1914,21 @@ auto_apply_bundled(){
     info "Auto-update done — configs untouched."
     read -t 15 -rp "  ▶ Press ENTER to continue (auto-continuing in 15s)... " _ 2>/dev/null || true
   fi
+}
+
+# update_self downloads the latest release into THIS folder — the one the
+# operator opens with "cd BrokenNode && bash BrokenNode.sh" — and restarts the
+# menu from it, which then applies the new core and restarts the tunnels.
+# Updating in place is the point: the installer run from somewhere else makes a
+# second folder, and the old one kept offering (and installing) its old core.
+update_self(){
+  need_root
+  local tmp; tmp="$(mktemp)"
+  if command -v curl >/dev/null 2>&1; then curl -fsSL --retry 3 -o "$tmp" "$INSTALL_URL"
+  else wget -q --tries=3 -O "$tmp" "$INSTALL_URL"; fi || { err "Could not download the installer ($INSTALL_URL)."; rm -f "$tmp"; return; }
+  info "Updating $SRC_DIR ..."
+  cd "$(dirname "$SRC_DIR")" || return
+  BROKENNODE_DIR="$(basename "$SRC_DIR")" exec bash "$tmp"
 }
 
 # uninstall_all: remove EVERYTHING — tunnels, core, configs, units.
@@ -1989,15 +2140,17 @@ main_menu(){
     echo "   2) Create CLIENT tunnel   (foreign server)"
     echo "   3) Manage tunnels         (edit / transport / IP / logs / stats)"
     echo "   4) Health check           (doctor: BBR / ports / loss / IP)"
+    echo "   5) Update BrokenNode      (download the latest into this folder)"
     echo "   0) Exit"
     echo -e "  ${C_D}(the core in this folder is applied automatically on start)${C_N}"
     echo
-    case "$(ask 'Choice' '')" in
+    case "$(menu_ask 'Choice')" in
       1) create_tunnel server; read -t 30 -rp "  ▶ press ENTER to continue... " _ ;;
       2) create_tunnel client; read -t 30 -rp "  ▶ press ENTER to continue... " _ ;;
       3) manage_tunnels ;;
       4) doctor; read -t 30 -rp "  ▶ press ENTER to continue... " _ ;;
-      0) exit 0 ;;
+      5) update_self ;;
+      0|__eof__) echo; exit 0 ;;
       *) warn "Invalid." ;;
     esac
   done
@@ -2020,6 +2173,7 @@ case "${1:-}" in
     systemctl "$action" $units && echo "done." ;;
   uninstall|purge) uninstall_all ;;
   version) echo "BrokenNode manager v$VERSION" ;;
+  update) update_self ;;
   ""|menu) main_menu ;;
-  *) echo "usage: sudo bash $SELF [server|client|manage|transports|tune|restart-all|start-all|stop-all|doctor|uninstall|version]"; exit 1 ;;
+  *) echo "usage: sudo bash $SELF [server|client|manage|transports|tune|restart-all|start-all|stop-all|doctor|update|uninstall|version]"; exit 1 ;;
 esac
