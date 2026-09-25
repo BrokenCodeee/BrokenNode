@@ -8,7 +8,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.3.5"
+VERSION="2.3.6"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=2
@@ -177,6 +177,44 @@ transport_family(){
   esac
 }
 
+# Direction (stream transports only). "reverse": the foreign server dials the
+# Iran relay. "direct": the Iran relay dials the foreign server, which listens.
+# Both servers must use the same one. The config keeps both addresses when a
+# tunnel is flipped, so flipping back needs no re-entry; which one is used
+# follows from the mode and the direction.
+tunnel_direction(){ # CFG -> reverse|direct
+  local d; d="$(jget "$1" direction | tr -d ' ' | tr 'A-Z' 'a-z')"
+  [ "$d" = direct ] && [ "$(transport_family "$(jget "$1" transport)")" = stream ] && echo direct || echo reverse
+}
+
+# tunnel_listens CFG: this end waits for the other (relay in reverse mode,
+# foreign server in direct mode). The other case dials.
+tunnel_listens(){
+  local m d; m="$(jget "$1" mode)"; d="$(tunnel_direction "$1")"
+  { [ "$m" = server ] && [ "$d" = reverse ]; } || { [ "$m" = client ] && [ "$d" = direct ]; }
+}
+
+pick_direction(){
+  echo -e "${C_B}  Connection direction:${C_N}" >&2
+  echo -e "   1) reverse  the FOREIGN server connects to the Iran server  ${C_D}(classic)${C_N}" >&2
+  echo -e "   2) direct   the IRAN server connects to the foreign server" >&2
+  echo -e "  ${C_D}Pick direct when connections INTO the Iran server are being cut.${C_N}" >&2
+  echo -e "  ${C_D}Both servers must use the SAME direction.${C_N}" >&2
+  local d; d=$(ask "Choice [1-2]" "1"); case "$d" in 2|d|direct) echo direct;; *) echo reverse;; esac
+}
+
+# ask_hostport PROMPT DEFAULT_PORT [DEFAULT] — a host:port, with the port
+# added when only a host is typed. Empty stays empty (the caller decides).
+ask_hostport(){
+  local a; a=$(ask "$1" "${3:-}")
+  a="$(echo "$a" | tr -d ' ')"
+  [ -z "$a" ] && { echo ""; return; }
+  case "$a" in
+    *:*) echo "$a" ;;
+    *)   echo "$a:$2" ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # Several tunnels on one server
 #
@@ -195,6 +233,7 @@ cfg_scan(){
   python3 - "$CFG_DIR" "$1" "$2" "${3:-}" <<'PYEOF2'
 import json, os, sys, glob
 d, mode, excl, key = sys.argv[1:5]
+P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp", "spoof")
 for f in sorted(glob.glob(os.path.join(d, "*.json"))):
     if os.path.basename(f)[:-5] == excl:
         continue
@@ -214,7 +253,14 @@ for f in sorted(glob.glob(os.path.join(d, "*.json"))):
             proto = spec.rsplit("/", 1)[1] if "/" in spec else "tcp"
             for pr in (("tcp", "udp") if proto == "both" else (proto,)):
                 print(port + "/" + pr)
-        b = c.get("bind_addr") or ""
+        # A tunnel's own port is taken only where it listens: the relay in
+        # reverse mode, the foreign server in direct mode.
+        # Same rule as the core (Config.Direct): direction counts only for
+        # the stream transports, read case- and space-insensitively.
+        stream = c.get("transport") not in P2P
+        direct = stream and str(c.get("direction") or "").strip().lower() == "direct"
+        listens = (c.get("mode") == "server") != direct
+        b = (c.get("bind_addr") or "") if listens else ""
         if ":" in b:
             pr = "udp" if c.get("transport") in ("kcp", "quic") else "tcp"
             print(b.rsplit(":", 1)[1] + "/" + pr)
@@ -239,6 +285,15 @@ next_free_net(){
     [[ "$used" == *" 10.10.$n."* || "$used" == *" fd00:10:$n::"* ]] || { echo "$n"; return; }
   done
   echo 30
+}
+
+# next_free_port START PROTO EXCLUDE — the first port >= START that no other
+# tunnel on this server listens on for PROTO. A foreign server in direct mode
+# can carry tunnels from several Iran relays, each on its own port.
+next_free_port(){
+  local p="$1" used; used=" $(cfg_scan ports "$3" | tr '\n' ' ') "
+  while [[ "$used" == *" $p/$2 "* ]] && [ "$p" -lt 65535 ]; do p=$((p+1)); done
+  echo "$p"
 }
 
 # warn_port_clash "PORTSJSON" EXCLUDE [BINDPORT] — tell the operator when a
@@ -382,7 +437,14 @@ build_ports(){
   local arr=() spec proto sfx
   echo -e "${C_B}  Port mappings${C_N} ${C_D}(formats: 443 | 8443=443 ; empty to finish)${C_N}" >&2
   while true; do
-    spec=$(ask "Port(s) (empty=done)" ""); [ -z "$spec" ] && break
+    spec=$(ask "Port(s) (empty=done)" ""); spec="${spec// /}"; [ -z "$spec" ] && break
+    # N or N=M, each 1-65535: anything else would be written into the config
+    # and stop the tunnel from starting.
+    local okp=1 part
+    if [[ "$spec" =~ ^[0-9]+(=[0-9]+)?$ ]]; then
+      for part in ${spec//=/ }; do [ "$part" -ge 1 ] && [ "$part" -le 65535 ] || okp=0; done
+    else okp=0; fi
+    if [ "$okp" = 0 ]; then warn "'$spec' is not a port mapping — use 443 or 8443=443 (1-65535)." >&2; continue; fi
     proto=$(ask "Protocol  1)tcp 2)udp 3)both" "3")
     case "$proto" in 1) sfx="";; 2) sfx="/udp";; *) sfx="/both";; esac
     arr+=("\"${spec}${sfx}\""); echo -e "${C_G}    added ${spec}${sfx}${C_N}" >&2
@@ -390,11 +452,16 @@ build_ports(){
   [ ${#arr[@]} -eq 0 ] && arr+=("\"443/both\""); ( IFS=,; echo "${arr[*]}" )
 }
 
-build_extra(){ local role="$1" tr="$2"; EXTRA=""; TLSJSON=""
+# build_extra ROLE TRANSPORT [DIRECTION] asks the transport's own settings.
+# Those that belong to the end that DIALS (ws request headers, the mtcp link
+# count) go to the client in reverse mode and to the relay in direct mode.
+build_extra(){ local role="$1" tr="$2" dir="${3:-reverse}"; EXTRA=""; TLSJSON=""
+  local dials=0
+  { [ "$role" = client ] && [ "$dir" = reverse ]; } || { [ "$role" = server ] && [ "$dir" = direct ]; } && dials=1
   case "$tr" in
     ws)
       EXTRA="\"ws_path\":\"$(ask 'WebSocket path' '/')\","
-      if [ "$role" = client ]; then
+      if [ "$dials" = 1 ]; then
         local h u; h=$(ask 'Fake Host header (domain fronting, empty=none)' '')
         u=$(ask 'User-Agent (empty=default)' '')
         [ -n "$h" ] && EXTRA="$EXTRA\"ws_host\":\"$h\","
@@ -404,7 +471,7 @@ build_extra(){ local role="$1" tr="$2"; EXTRA=""; TLSJSON=""
     kcp)
       local w; w=$(ask 'KCP window (send/recv, empty=1024)' '')
       [ -n "$w" ] && EXTRA="\"kcp_sndwnd\":$w,\"kcp_rcvwnd\":$w," ;;
-    mtcp) [ "$role" = client ] && EXTRA="\"links\":$(ask 'Parallel links (0 = AUTO, scales with load — recommended)' '0'),";;
+    mtcp) [ "$dials" = 1 ] && EXTRA="\"links\":$(ask 'Parallel links (0 = AUTO, scales with load — recommended)' '0'),";;
     sctp)
       local mh; mh=$(ask 'Extra local IPs for multihoming (comma-separated, blank = none)' '')
       local st; st=$(ask 'Outbound streams' '8')
@@ -560,8 +627,8 @@ check_bind(){
   {
     echo
     warn "This machine has no interface holding $host."
-    echo -e "  ${C_D}bind_addr is where the relay LISTENS, so it must be an address this${C_N}"
-    echo -e "  ${C_D}server actually has. On a VPS behind NAT the public ip lives on the${C_N}"
+    echo -e "  ${C_D}bind_addr is where this server LISTENS, so it must be an address it${C_N}"
+    echo -e "  ${C_D}actually has. On a VPS behind NAT the public ip lives on the${C_N}"
     echo -e "  ${C_D}provider's gateway, not here, and the tunnel will fail to start.${C_N}"
     echo -e "  ${C_D}The public ip belongs in the OTHER end's remote_addr.${C_N}"
     echo
@@ -604,6 +671,25 @@ server_summary(){
   echo -e "  ${C_D}And on the FOREIGN server, your real service (xray, v2ray, ...) must be${C_N}"
   echo -e "  ${C_D}listening on the port each mapping delivers to — the right-hand side of${C_N}"
   echo -e "  ${C_D}\"8443=443\", or the same number when there is no \"=\".${C_N}"
+}
+
+# server_summary_direct is server_summary for a relay in direct mode: users
+# still connect here, but the tunnel is dialed OUT to the foreign server, so
+# no tunnel port is open on this machine.
+server_summary_direct(){
+  local remote="$1" portspec="$2" bproto="${3:-tcp}" ip spec p
+  ip="$(detect_ip)"; ip="${ip:-YOUR-RELAY-IP}"
+  echo
+  echo -e "  ${C_G}Users / client configs connect to:${C_N}"
+  printf '%s\n' "$portspec" | tr ',' '\n' | while read -r spec || [ -n "$spec" ]; do
+    spec="${spec//\"/}"
+    p="${spec%%=*}"; p="${p%%/*}"
+    [ -n "$p" ] && echo -e "      ${C_Y}$ip:$p${C_N}"
+  done
+  echo
+  echo -e "  ${C_D}Direct mode: this server CONNECTS to ${C_N}$remote${C_D} (${bproto^^}); no tunnel port is open here.${C_N}"
+  echo -e "  ${C_D}On the FOREIGN server create the tunnel with direction ${C_N}direct${C_D}, listening on port ${C_N}${remote##*:}${C_D},${C_N}"
+  echo -e "  ${C_D}and allow ${bproto^^} ${remote##*:} inbound in its firewall.${C_N}"
 }
 
 # write_tunnel_cfg writes the config for a point-to-point tunnel: the kernel
@@ -759,15 +845,27 @@ create_tunnel(){
   elif is_tunnel_transport "$tr"; then
     write_tunnel_cfg "$role" "$name" "$tr" "$enc"
   else
-    read -r ka kmode kdata kparity <<< "$(pick_preset)"; build_extra "$role" "$tr"
+    local dir; dir=$(pick_direction)
+    read -r ka kmode kdata kparity <<< "$(pick_preset)"; build_extra "$role" "$tr" "$dir"
     local cfg="$CFG_DIR/$name.json"
+    local bproto=tcp; case "$tr" in kcp|quic) bproto=udp ;; esac
     if [ "$role" = server ]; then
-      local bind ports token qtotal qup qdown
-      bind=$(ask "Tunnel listen address (host:port)" "0.0.0.0:8443")
-      bind="$(check_bind "$bind")"
+      local bind="" remote="" addrline ports token qtotal qup qdown
+      if [ "$dir" = direct ]; then
+        # This relay dials out; nothing listens here but the user ports.
+        while [ -z "$remote" ]; do
+          remote=$(ask_hostport "Foreign server address it listens on (IP:port)" 8443)
+          [ -z "$remote" ] && warn "Required: the foreign server's real IP (and the port it will listen on)."
+        done
+        addrline="\"remote_addr\": \"$remote\","
+      else
+        bind=$(ask "Tunnel listen address (host:port)" "0.0.0.0:8443")
+        bind="$(check_bind "$bind")"
+        addrline="\"bind_addr\": \"$bind\","
+      fi
       ports=$(build_ports)
-      local bproto=tcp; case "$tr" in kcp|quic) bproto=udp ;; esac
-      warn_port_clash "$ports" "$name" "${bind##*:}" "$bproto"
+      if [ "$dir" = direct ]; then warn_port_clash "$ports" "$name"
+      else warn_port_clash "$ports" "$name" "${bind##*:}" "$bproto"; fi
       token=$(ask "Shared token" "$(gen_token)")
       echo -e "  ${C_D}Traffic quota (optional) — leave blank for unlimited. Once reached, the${C_N}"
       echo -e "  ${C_D}tunnel refuses new connections and drops active ones until you raise it.${C_N}"
@@ -786,7 +884,8 @@ create_tunnel(){
   "transport": "$tr",
   "encryption": "$enc",
   "token": "$token",
-  "bind_addr": "$bind",
+  "direction": "$dir",
+  $addrline
   "ports": [$ports],
   $TLSJSON$EXTRA
   "keepalive": $ka,
@@ -796,10 +895,22 @@ create_tunnel(){
 }
 EOF
       info "Saved $cfg"; warn "Token for the client: ${C_Y}$token${C_N}"
-      server_summary "$bind" "$ports"
+      if [ "$dir" = direct ]; then server_summary_direct "$remote" "$ports" "$bproto"
+      else server_summary "$bind" "$ports"; fi
     else
-      local remote token target
-      remote=$(ask "Tunnel server address (Iran relay IP:port)" "1.2.3.4:8443")
+      local remote="" bind="" addrline token target
+      if [ "$dir" = direct ]; then
+        bind=$(ask "Listen address for the Iran server to connect to (host:port)" "0.0.0.0:$(next_free_port 8443 "$bproto" "$name")")
+        bind="$(check_bind "$bind")"
+        warn_port_clash "" "$name" "${bind##*:}" "$bproto"
+        addrline="\"bind_addr\": \"$bind\","
+      else
+        while [ -z "$remote" ]; do
+          remote=$(ask_hostport "Tunnel server address (Iran relay IP:port)" 8443)
+          [ -z "$remote" ] && warn "Required: the Iran relay's real IP and its tunnel port."
+        done
+        addrline="\"remote_addr\": \"$remote\","
+      fi
       token=$(ask "Shared token (same as server)" ""); target=$(ask "Local services host" "127.0.0.1")
       new_cfg_file "$cfg"
     cat > "$cfg" <<EOF
@@ -808,7 +919,8 @@ EOF
   "transport": "$tr",
   "encryption": "$enc",
   "token": "$token",
-  "remote_addr": "$remote",
+  "direction": "$dir",
+  $addrline
   "target_host": "$target",
   $EXTRA
   "keepalive": $ka,
@@ -817,6 +929,13 @@ EOF
 }
 EOF
       info "Saved $cfg"
+      if [ "$dir" = direct ]; then
+        echo
+        echo -e "  ${C_B}Direct mode:${C_N} the Iran server connects to this one on ${C_Y}${bproto^^} ${bind##*:}${C_N}."
+        echo -e "  ${C_D}This server's firewall must allow that port inbound, e.g.${C_N}"
+        echo -e "  ${C_D}  ufw allow ${bind##*:}/$bproto   or   iptables -I INPUT -p $bproto --dport ${bind##*:} -j ACCEPT${C_N}"
+        echo -e "  ${C_D}On the Iran server enter:${C_N} ${C_Y}$(detect_ip):${bind##*:}${C_N}"
+      fi
     fi
   fi
 
@@ -857,18 +976,22 @@ list_tunnels(){
     # "active" while carrying no traffic at all. link_state reads the log to
     # report what really happened last.
     local link; link="$(link_state "$n")"
+    # One read of the config for everything the two lines show.
+    local dir listens addr ports
+    IFS=$'\t' read -r dir listens addr ports < <(tunnel_summary "$f")
+    [ "$dir" = direct ] && tr="$tr (direct)"
     printf "  %2d) %-14s ${col}%-8s${C_N} %-22s ${C_D}%s/%s${C_N}\n" "$i" "$n" "$st" "$link" "$m" "$tr"
     # second line: address/port + psk (token), so both sides can be re-checked
     # against each other at a glance without opening the config file.
-    local psk addr ports
+    local psk
     psk="$(sed -n 's/.*"token"[ ]*:[ ]*"\([^"]*\)".*/\1/p' "$f")"
+    # Where this end listens or what it dials depends on the direction.
+    local how="listen:"
+    [ "$listens" = 0 ] && how="dials: "
     if [ "$m" = server ]; then
-      addr="$(sed -n 's/.*"bind_addr"[ ]*:[ ]*"\([^"]*\)".*/\1/p' "$f")"
-      ports="$(sed -n 's/.*"ports"[ ]*:[ ]*\[\([^]]*\)\].*/\1/p' "$f" | tr -d '"')"
-      printf "      ${C_D}listen: %-22s ports: %-18s psk: %s${C_N}\n" "${addr:-?}" "${ports:-?}" "${psk:-?}"
+      printf "      ${C_D}%s %-22s ports: %-18s psk: %s${C_N}\n" "$how" "${addr:-?}" "${ports:-?}" "${psk:-?}"
     else
-      addr="$(sed -n 's/.*"remote_addr"[ ]*:[ ]*"\([^"]*\)".*/\1/p' "$f")"
-      printf "      ${C_D}relay:  %-22s psk: %s${C_N}\n" "${addr:-?}" "${psk:-?}"
+      printf "      ${C_D}%s %-22s psk: %s${C_N}\n" "$how" "${addr:-?}" "${psk:-?}"
     fi
   done
   [ "$any" = 0 ] && echo -e "   ${C_D}(no tunnels yet)${C_N}"
@@ -940,6 +1063,60 @@ stats_page(){
 okln(){   echo -e "  ${C_G}✔${C_N} $*"; }
 warnln(){ echo -e "  ${C_Y}▲${C_N} $*"; }
 badln(){  echo -e "  ${C_R}✗${C_N} $*"; }
+
+# doctor_dial REMOTE TRANSPORT — for the end that dials: can the other end be
+# reached, and how good is the path (loss, RTT, jitter)? Adds to the caller's
+# warns count.
+doctor_dial(){
+  local remote="$1" trans="$2" host port=""
+  case "$remote" in
+    *:*) host="${remote%:*}"; port="${remote##*:}" ;;
+    *)   host="$remote" ;;   # no port given: only the path can be checked
+  esac
+  host="${host#[}"; host="${host%]}"
+  [ -z "$host" ] && { warnln "  no remote_addr to check"; warns=$((warns+1)); return; }
+  # A TCP carrier can be probed directly; kcp and quic run over UDP and sctp
+  # over its own protocol, where a TCP probe says nothing, so for them only
+  # the ping below speaks.
+  case "$trans" in
+  kcp|quic|sctp) : ;;
+  *)
+    if [ -n "$port" ] && command -v timeout >/dev/null 2>&1; then
+      if timeout 5 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
+        okln "  $host:$port accepts connections"
+      else
+        badln "  cannot connect to $host:$port — is the other end running and listening, and is the port open in its firewall?"
+        warns=$((warns+1))
+      fi
+    fi ;;
+  esac
+  # 20 probes, not 5: jitter is the number that decides whether hit
+  # registration feels right, and five samples cannot show a distribution.
+  local pres; pres="$(ping -c 20 -i 0.2 -w 10 "$host" 2>/dev/null | tail -2)"
+  local loss rtt jit
+  loss="$(printf '%s' "$pres" | sed -n 's/.*, \([0-9.]*\)% packet loss.*/\1/p')"
+  rtt="$(printf '%s' "$pres" | sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p')"
+  # mdev, the last field of ping's rtt summary, is the jitter.
+  jit="$(printf '%s' "$pres" | sed -n 's#.*= [0-9.]*/[0-9.]*/[0-9.]*/\([0-9.]*\) ms#\1#p')"
+  if [ -n "$loss" ]; then
+    if awk "BEGIN{exit !(${loss:-0} > 3)}"; then warnln "  packet loss to $host: ${loss}% (high — hurts speed/latency)"; warns=$((warns+1));
+    else okln "  packet loss to $host: ${loss}%"; fi
+    [ -n "$rtt" ] && echo -e "  ${C_D}    avg RTT: ${rtt} ms${C_N}"
+    if [ -n "$jit" ]; then
+      # A steady 80ms beats 60ms that swings by 30. The server's lag
+      # compensation assumes your delay is predictable; jitter is what
+      # breaks that assumption, and it is what players feel as a shot
+      # that hit but did not register.
+      if awk "BEGIN{exit !(${jit:-0} > 15)}"; then
+        warnln "  jitter to $host: ${jit} ms (high — this is what breaks hit registration)"; warns=$((warns+1))
+      elif awk "BEGIN{exit !(${jit:-0} > 5)}"; then
+        echo -e "  ${C_Y}    jitter: ${jit} ms (noticeable in fast games)${C_N}"
+      else
+        echo -e "  ${C_D}    jitter: ${jit} ms (steady)${C_N}"
+      fi
+    fi
+  else warnln "  could not ping $host (ICMP blocked?)"; fi
+}
 
 # doctor: one-shot self-diagnosis of the things that actually break tunnels
 # (BBR, ports, UDP reachability, public IP, packet loss, MTU, services).
@@ -1036,11 +1213,21 @@ doctor(){
       continue
     fi
 
-    if [ "$mode" = server ]; then
+    # The end that listens checks its port; the end that dials checks the
+    # path to the other end. Which is which depends on the direction.
+    local dir; dir="$(tunnel_direction "$cf")"
+    [ "$dir" = direct ] && echo -e "  ${C_D}  direction: direct (the Iran server dials the foreign server)${C_N}"
+    if [ "$(transport_family "$trans")" != stream ]; then
+      : # spoof: no listen port and no dial address to check
+    elif tunnel_listens "$cf"; then
       local port; port="${bind##*:}"
       if [ -n "$port" ]; then
         ss -ltnup 2>/dev/null | grep -q ":$port " && okln "  listening on port $port" || { warnln "  port $port not listening"; warns=$((warns+1)); }
       fi
+    else
+      doctor_dial "$remote" "$trans"
+    fi
+    if [ "$mode" = server ]; then
       # Traffic quota status (only meaningful for non-spoof transports — see
       # quota_test.go / the stats system; ip-spoofing doesn't route through it).
       local qtot qup qdown
@@ -1072,37 +1259,6 @@ doctor(){
           if [ "$ld" -ge "$capd" ]; then badln "  DOWNLOAD QUOTA REACHED: $(hb "$ld") / $(hb "$capd")"; warns=$((warns+1));
           else okln "  download quota: $(hb "$ld") / $(hb "$capd")"; fi
         fi
-      fi
-    else
-      # client: measure path quality to the relay
-      local host="${remote%%:*}"
-      if [ -n "$host" ]; then
-        # 20 probes, not 5: jitter is the number that decides whether hit
-        # registration feels right, and five samples cannot show a distribution.
-        local pres; pres="$(ping -c 20 -i 0.2 -w 10 "$host" 2>/dev/null | tail -2)"
-        local loss rtt jit
-        loss="$(printf '%s' "$pres" | sed -n 's/.*, \([0-9.]*\)% packet loss.*/\1/p')"
-        rtt="$(printf '%s' "$pres" | sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p')"
-        # mdev, the last field of ping's rtt summary, is the jitter.
-        jit="$(printf '%s' "$pres" | sed -n 's#.*= [0-9.]*/[0-9.]*/[0-9.]*/\([0-9.]*\) ms#\1#p')"
-        if [ -n "$loss" ]; then
-          if awk "BEGIN{exit !(${loss:-0} > 3)}"; then warnln "  packet loss to $host: ${loss}% (high — hurts speed/latency)"; warns=$((warns+1));
-          else okln "  packet loss to $host: ${loss}%"; fi
-          [ -n "$rtt" ] && echo -e "  ${C_D}    avg RTT: ${rtt} ms${C_N}"
-          if [ -n "$jit" ]; then
-            # A steady 80ms beats 60ms that swings by 30. The server's lag
-            # compensation assumes your delay is predictable; jitter is what
-            # breaks that assumption, and it is what players feel as a shot
-            # that hit but did not register.
-            if awk "BEGIN{exit !(${jit:-0} > 15)}"; then
-              warnln "  jitter to $host: ${jit} ms (high — this is what breaks hit registration)"; warns=$((warns+1))
-            elif awk "BEGIN{exit !(${jit:-0} > 5)}"; then
-              echo -e "  ${C_Y}    jitter: ${jit} ms (noticeable in fast games)${C_N}"
-            else
-              echo -e "  ${C_D}    jitter: ${jit} ms (steady)${C_N}"
-            fi
-          fi
-        else warnln "  could not ping $host (ICMP blocked?)"; fi
       fi
     fi
   done
@@ -1257,9 +1413,9 @@ change_transport(){
   esac
   [ "$new" != sctp ] && { jset "$cfg" sctp_streams "" del; jset "$cfg" sctp_multihoming "" del; }
   info "transport: $cur/$curenc -> $new/$newenc"
-  if [ "$mode" = server ] && is_udp_transport "$new" && ! is_udp_transport "$cur"; then
+  if tunnel_listens "$cfg" && is_udp_transport "$new" && ! is_udp_transport "$cur"; then
     local port; port="$(jget "$cfg" bind_addr)"; port="${port##*:}"
-    warn "$new runs over UDP: the relay firewall must allow ${C_Y}UDP $port${C_N} (TCP alone is not enough)."
+    warn "$new runs over UDP: this server's firewall must allow ${C_Y}UDP $port${C_N} (TCP alone is not enough)."
     warn "e.g.  ufw allow $port/udp   or   iptables -I INPUT -p udp --dport $port -j ACCEPT"
   fi
   warn "Do the SAME on the other server: '$new' with encryption '$newenc', or they will not connect."
@@ -1267,26 +1423,109 @@ change_transport(){
   read -t 30 -rp "  ▶ press ENTER to continue... " _
 }
 
-# change_relay_ip updates where a CLIENT tunnel dials, keeping the port. This is
-# the operation needed every time the Iran relay's IP changes.
+# change_relay_ip updates the IP this end dials, keeping the port: the Iran
+# relay's IP on a foreign server in reverse mode (needed every time the relay's
+# IP changes), or the foreign server's IP on the relay in direct mode.
 change_relay_ip(){
   local n="$1"; local cfg="$CFG_DIR/$n.json"
-  local mode; mode="$(jget "$cfg" mode)"
-  if [ "$mode" != client ]; then
-    warn "'$n' is a SERVER tunnel — it listens rather than dials, so it has no relay IP."
+  local fam; fam="$(transport_family "$(jget "$cfg" transport)")"
+  if [ "$fam" != stream ]; then
+    warn "'$n' is a point-to-point tunnel: change remote_ip with 'Edit config' instead."
+    read -t 30 -rp "  ▶ press ENTER to continue... " _; return
+  fi
+  if tunnel_listens "$cfg"; then
+    warn "'$n' LISTENS for the other end in this direction, so it has no peer IP to change."
     warn "Change its listen address with 'Tune settings' instead."
     read -t 30 -rp "  ▶ press ENTER to continue... " _; return
   fi
+  local what="relay"; [ "$(jget "$cfg" mode)" = server ] && what="foreign server"
   local cur port newip; cur="$(jget "$cfg" remote_addr)"; port="${cur##*:}"
-  echo; echo -e "${C_B}  Change relay IP for '$n'${C_N}  ${C_D}(current: $cur)${C_N}"
-  newip=$(ask "New relay IP (port $port kept)" "")
+  echo; echo -e "${C_B}  Change $what IP for '$n'${C_N}  ${C_D}(current: $cur)${C_N}"
+  newip=$(ask "New $what IP (port $port kept)" "")
   [ -z "$newip" ] && { warn "cancelled"; return; }
   case "$newip" in *[!0-9.]*) err "Not an IPv4 address."; return;; esac
   jset "$cfg" remote_addr "$newip:$port"
-  info "relay: $cur -> $newip:$port"
+  info "$what: $cur -> $newip:$port"
   systemctl restart "brokennode@$n" >/dev/null 2>&1
   info "restarted '$n'"
   read -t 30 -rp "  ▶ press ENTER to continue... " _
+}
+
+# change_direction flips a stream tunnel between reverse (the foreign server
+# dials the relay) and direct (the relay dials the foreign server). Each end
+# needs the address for its new role; the old one stays in the config, so
+# flipping back later offers it as the default.
+change_direction(){
+  local n="$1"; local cfg="$CFG_DIR/$n.json"
+  local tr mode cur new; tr="$(jget "$cfg" transport)"; mode="$(jget "$cfg" mode)"
+  if [ "$(transport_family "$tr")" != stream ]; then
+    warn "$tr has no direction: both ends send to each other, so it already works either way."
+    read -t 30 -rp "  ▶ press ENTER to continue... " _; return
+  fi
+  cur="$(tunnel_direction "$cfg")"; [ "$cur" = direct ] && new=reverse || new=direct
+  echo; echo -e "${C_B}  Direction of '$n'${C_N}  ${C_D}(now: $cur)${C_N}"
+  echo -e "  ${C_D}reverse: the foreign server connects to the Iran server.${C_N}"
+  echo -e "  ${C_D}direct:  the Iran server connects to the foreign server.${C_N}"
+  local c; c=$(ask "Switch to $new? y/N" "N"); case "$c" in y|Y) :;; *) warn "cancelled"; return;; esac
+  local bproto=tcp; case "$tr" in kcp|quic) bproto=udp ;; esac
+  local bind remote port
+  bind="$(jget "$cfg" bind_addr)"; remote="$(jget "$cfg" remote_addr)"
+  # The side that will listen needs bind_addr; the side that will dial needs
+  # remote_addr. The tunnel port is the same number either way.
+  if { [ "$mode" = server ] && [ "$new" = reverse ]; } || { [ "$mode" = client ] && [ "$new" = direct ]; }; then
+    port="${bind##*:}"; [ -z "$bind" ] && port="${remote##*:}"; [ -z "$port" ] && port=8443
+    local v; v=$(ask "Listen address (host:port)" "${bind:-0.0.0.0:$port}")
+    jset "$cfg" bind_addr "$(check_bind "$v")"
+    port="$(jget "$cfg" bind_addr)"; port="${port##*:}"
+    warn_port_clash "$(jq_ports "$cfg")" "$n" "$port" "$bproto"
+    warn "This server must now accept ${bproto^^} $port inbound (firewall)."
+  else
+    local who="Iran relay"; [ "$mode" = server ] && who="foreign server"
+    port="${remote##*:}"; [ -z "$remote" ] && port="${bind##*:}"; [ -z "$port" ] && port=8443
+    local v=""
+    while [ -z "$v" ]; do
+      v=$(ask_hostport "$who address (IP:port)" "$port" "$remote")
+      [ -z "$v" ] && warn "Required: the $who's real IP and the port it listens on."
+    done
+    jset "$cfg" remote_addr "$v"
+  fi
+  jset "$cfg" direction "$new"
+  info "direction: $cur -> $new"
+  warn "Switch the OTHER server to ${C_Y}$new${C_N} too, or the two will not connect."
+  service_check "$n"
+  read -t 30 -rp "  ▶ press ENTER to continue... " _
+}
+
+# tunnel_summary CFG — "direction<TAB>listens(1|0)<TAB>address<TAB>ports" in one
+# python start, for the tunnel list (it runs once per tunnel on every redraw).
+# The address is bind_addr where this end listens, remote_addr where it dials.
+tunnel_summary(){
+  python3 - "$1" <<'PYEOF'
+import json,sys
+P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp", "spoof")
+try:
+    c = json.load(open(sys.argv[1]))
+except Exception:
+    c = {}
+stream = c.get("transport") not in P2P
+direct = stream and str(c.get("direction") or "").strip().lower() == "direct"
+listens = (c.get("mode") == "server") != direct
+addr = c.get("bind_addr" if listens else "remote_addr") or ""
+ports = ",".join(str(p) for p in (c.get("ports") or []))
+print("\t".join(["direct" if direct else "reverse", "1" if listens else "0", addr or "?", ports or "?"]))
+PYEOF
+}
+
+# jq_ports CFG — the config's "ports" list as the JSON array body build_ports
+# returns, for warn_port_clash.
+jq_ports(){
+  python3 - "$1" <<'PYEOF'
+import json,sys
+try:
+    print(",".join(json.dumps(str(p)) for p in json.load(open(sys.argv[1])).get("ports") or []))
+except Exception:
+    print("")
+PYEOF
 }
 
 # tune_tunnel exposes the per-tunnel network knobs. Blank input keeps the current
@@ -1375,10 +1614,21 @@ tune_tunnel(){
   cur="$(jget "$cfg" smux_stream_mb)"
   v=$(ask "  smux_stream_mb (per-stream window MB) [${cur:-8}]" ""); [ -n "$v" ] && jset "$cfg" smux_stream_mb "$v" int
 
+  if [ "$(transport_family "$tr")" = stream ]; then
+    if tunnel_listens "$cfg"; then
+      cur="$(jget "$cfg" bind_addr)"
+      v=$(ask "  bind_addr (listen host:port) [$cur]" "")
+      [ -n "$v" ] && jset "$cfg" bind_addr "$(check_bind "$v")"
+    else
+      cur="$(jget "$cfg" remote_addr)"
+      v=$(ask "  remote_addr (the other end, IP:port) [$cur]" ""); v="${v// /}"
+      if [ -n "$v" ]; then
+        case "$v" in *:*) : ;; *) v="$v:${cur##*:}" ;; esac  # IP only: keep the port
+        jset "$cfg" remote_addr "$v"
+      fi
+    fi
+  fi
   if [ "$mode" = server ]; then
-    cur="$(jget "$cfg" bind_addr)"
-    v=$(ask "  bind_addr (listen host:port) [$cur]" "")
-    [ -n "$v" ] && jset "$cfg" bind_addr "$(check_bind "$v")"
     cur="$(jget "$cfg" quota_total_gb)"
     v=$(ask "  quota_total_gb (0 = unlimited) [${cur:-0}]" ""); [ -n "$v" ] && jset "$cfg" quota_total_gb "$v" float
     cur="$(jget "$cfg" quota_up_gb)"
@@ -1440,8 +1690,8 @@ manage_tunnels(){
       echo "   1) Start    2) Stop    3) Restart"
       echo "   4) Live logs   5) Show config   6) Edit config (nano)"
       echo "   7) Delete   8) Live stats"
-      echo -e "   ${C_G}9) Change transport${C_N}   ${C_G}10) Change relay IP${C_N}   ${C_G}11) Tune settings (MTU/FEC/window...)${C_N}"
-      echo -e "   ${C_G}12) Duplicate UDP packets${C_N}  ${C_D}[$(udp_dup_state "$n")]${C_N}"
+      echo -e "   ${C_G}9) Change transport${C_N}   ${C_G}10) Change peer IP${C_N}   ${C_G}11) Tune settings (MTU/FEC/window...)${C_N}"
+      echo -e "   ${C_G}12) Duplicate UDP packets${C_N}  ${C_D}[$(udp_dup_state "$n")]${C_N}   ${C_G}13) Change direction${C_N}  ${C_D}[$(tunnel_direction "$CFG_DIR/$n.json")]${C_N}"
       echo "   0) Back"
       case "$(ask 'Choice' '')" in
         1) systemctl enable --now "brokennode@$n" >/dev/null 2>&1; systemctl start "brokennode@$n"; info "started";;
@@ -1457,6 +1707,7 @@ manage_tunnels(){
         10) change_relay_ip "$n";;
         11) tune_tunnel "$n";;
         12) toggle_udp_duplicate "$n";;
+        13) change_direction "$n";;
         0) break;;
         *) warn "Invalid.";;
       esac
