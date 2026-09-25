@@ -69,24 +69,46 @@ mkdir -p "$DIR/bin"
 if [ "$DIR" = . ]; then info "Updating this folder ($(pwd))"; else info "Downloading into ./$DIR"; fi
 TMP="$(mktemp -d "$DIR/.download.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
-fetch "$BASE/bin/brokennode-linux-${ARCH}" "$TMP/brokennode-linux-${ARCH}" \
-  || die "Download failed. Check the server's internet access, or grab the file manually from https://github.com/${REPO}"
-fetch "$BASE/BrokenNode.sh" "$TMP/BrokenNode.sh" || die "Could not download BrokenNode.sh"
-fetch "$BASE/SHA256SUMS"    "$TMP/SHA256SUMS"    || warn "Could not download SHA256SUMS — skipping verification"
-fetch "$BASE/VERSION"       "$TMP/VERSION"       || true
-fetch "$BASE/README.md"     "$TMP/README.md"     || true
 
-# --- verify ------------------------------------------------------------------
-# A truncated download produces a binary that fails in confusing ways much
-# later, so it is worth catching here rather than mid-tunnel.
-if [ -s "$TMP/SHA256SUMS" ] && command -v sha256sum >/dev/null 2>&1; then
-  want="$(awk -v f="bin/brokennode-linux-${ARCH}" '$2 == f || $2 == "*"f {print $1}' "$TMP/SHA256SUMS" | head -1)"
-  if [ -n "$want" ]; then
-    got="$(sha256sum "$TMP/brokennode-linux-${ARCH}" | awk '{print $1}')"
-    [ "$want" = "$got" ] || die "Checksum mismatch — the download is corrupt or tampered with. Nothing was changed; retry."
-    info "Checksum verified"
+# checksum_ok FILE PATH-IN-SUMS — FILE matches its line in SHA256SUMS (true
+# when the list has no line for it).
+checksum_ok(){
+  local want got
+  want="$(awk -v f="$2" '$2 == f || $2 == "*"f {print $1}' "$TMP/SHA256SUMS" | head -1)"
+  [ -z "$want" ] && return 0
+  got="$(sha256sum "$1" | awk '{print $1}')"
+  [ "$want" = "$got" ]
+}
+
+# GitHub serves these files through a CDN that caches each one for up to five
+# minutes, separately. Right after a release, one edge can hand out the new
+# SHA256SUMS with the old binary (or the reverse) — a checksum mismatch that
+# is nobody's fault. So every attempt asks for fresh copies (a unique query
+# string is a different cache key), and a mismatch is retried a few times
+# before it is treated as real.
+verified=0
+for attempt in 1 2 3 4; do
+  q="?nocache=$(date +%s)$RANDOM"
+  fetch "$BASE/bin/brokennode-linux-${ARCH}$q" "$TMP/brokennode-linux-${ARCH}" \
+    || die "Download failed. Check the server's internet access, or grab the file manually from https://github.com/${REPO}"
+  fetch "$BASE/BrokenNode.sh$q" "$TMP/BrokenNode.sh" || die "Could not download BrokenNode.sh"
+  if ! fetch "$BASE/SHA256SUMS$q" "$TMP/SHA256SUMS" || ! command -v sha256sum >/dev/null 2>&1; then
+    warn "Could not verify the download (no SHA256SUMS or sha256sum) — continuing unverified"
+    verified=1; break
   fi
-fi
+  # A truncated or mixed download produces a binary that fails in confusing
+  # ways much later, so it is worth catching here rather than mid-tunnel.
+  if checksum_ok "$TMP/brokennode-linux-${ARCH}" "bin/brokennode-linux-${ARCH}" &&
+     checksum_ok "$TMP/BrokenNode.sh" "BrokenNode.sh"; then
+    info "Checksum verified"; verified=1; break
+  fi
+  [ "$attempt" = 4 ] && break
+  warn "Checksum mismatch — GitHub's cache may still be serving the previous release. Retrying in $((attempt * 10))s..."
+  sleep $((attempt * 10))
+done
+[ "$verified" = 1 ] || die "Checksum mismatch — the download is corrupt or tampered with. Nothing was changed; retry in a few minutes."
+fetch "$BASE/VERSION$q"   "$TMP/VERSION"   || true
+fetch "$BASE/README.md$q" "$TMP/README.md" || true
 
 # --- put in place ------------------------------------------------------------
 chmod +x "$TMP/brokennode-linux-${ARCH}" "$TMP/BrokenNode.sh"
