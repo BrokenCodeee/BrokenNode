@@ -4,7 +4,7 @@
 
 **Multi-protocol tunnel, reverse or direct — compiled and ready to run.**
 
-`v2.3.6`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
+`v2.3.7`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
 
 **[English](#english)**  ·  **[فارسی](#فارسی)**
 
@@ -157,6 +157,24 @@ nothing to stop arbitrary traffic being injected into your TUN device.
 **Old names still work.** `tcpobf`, `mtcpobf`, `wsobf` and `rawmux` are
 translated automatically (`tcpobf` becomes `tcp` + `obfs`), so existing tunnels
 keep running untouched.
+
+## Several tunnels between the same two servers
+
+Different types run side by side between the same pair of servers — `gre`,
+`gretap`, `ipip`, `sit`, `l2tp`, `udp`, `icmp` and the stream transports — each
+with its own tunnel subnet and its own user ports (the manager picks free ones
+on the Iran server). Two of the **same** type:
+
+| Type | A second one to the same server | What keeps them apart |
+|---|---|---|
+| `gre`, `gretap` | yes | a different `gre_key` each (the manager offers one) |
+| `ipip`, `sit` | **no** — the kernel allows one per pair of IPs | — |
+| `l2tp` | yes | its own tunnel/session id, and over udp its own `l2tp_port` |
+| `udp`, `icmp` | yes | its own `carrier_port` (for icmp: the echo identifier) |
+| `spoof` over `gre` | **no** — GRE carries no port | use the udp, tcp or icmp carrier |
+| stream transports | yes | its own port |
+
+Use the same values on both servers; the Iran server's manager prints them.
 
 ## Tuning for games
 
@@ -448,6 +466,24 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 **نام‌های قدیمی هنوز کار می‌کنند.** `tcpobf`، `mtcpobf`، `wsobf` و `rawmux`
 به‌طور خودکار ترجمه می‌شوند (`tcpobf` می‌شود `tcp` + `obfs`)، پس تونل‌های موجود
 بدون هیچ تغییری به کار خود ادامه می‌دهند.
+
+## چند تانل بین همان دو سرور
+
+انواع مختلف کنار هم بین یک جفت سرور کار می‌کنند — `gre`، `gretap`، `ipip`، `sit`،
+`l2tp`، `udp`، `icmp` و ترنسپورت‌های جریانی — هر کدام با زیرشبکهٔ تانل و
+پورت‌های کاربر جداگانه (منیجر روی سرور ایران مقادیر آزاد را پیشنهاد می‌دهد). دو
+تانل از **یک** نوع:
+
+| نوع | دومی به همان سرور | چه چیزی جدایشان می‌کند |
+|---|---|---|
+| `gre`، `gretap` | بله | هر کدام `gre_key` جدا (منیجر پیشنهاد می‌دهد) |
+| `ipip`، `sit` | **نه** — کرنل برای هر جفت IP فقط یکی را اجازه می‌دهد | — |
+| `l2tp` | بله | tunnel/session id جدا و روی udp یک `l2tp_port` جدا |
+| `udp`، `icmp` | بله | `carrier_port` جدا (در icmp همان شناسهٔ echo) |
+| `spoof` روی `gre` | **نه** — GRE پورت ندارد | از حامل udp، tcp یا icmp استفاده کن |
+| ترنسپورت‌های جریانی | بله | پورت جدا |
+
+روی هر دو سرور همان مقادیر را وارد کن؛ منیجر سرور ایران آن‌ها را نشان می‌دهد.
 
 ## تنظیم برای بازی
 
