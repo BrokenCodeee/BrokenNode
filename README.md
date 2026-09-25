@@ -2,9 +2,9 @@
 
 # BrokenNode
 
-**Multi-protocol reverse tunnel — compiled and ready to run.**
+**Multi-protocol tunnel, reverse or direct — compiled and ready to run.**
 
-`v2.3.5`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
+`v2.3.6`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
 
 **[English](#english)**  ·  **[فارسی](#فارسی)**
 
@@ -77,9 +77,25 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
          (mode: server)                   (mode: client)     (real service)
 ```
 
-Note the direction. The machine **in Iran** runs `mode: server` — it listens.
-The machine **abroad** runs `mode: client` — it dials in. The tunnel is
-*reverse*: the foreign side initiates the connection.
+The machine **in Iran** runs `mode: server` (the relay: users connect to its
+ports). The machine **abroad** runs `mode: client` (it delivers to the real
+service). Which of the two opens the tunnel is a separate choice, the
+**direction**:
+
+| `direction` | Who connects to whom | Iran server | Foreign server |
+|---|---|---|---|
+| `reverse` (default) | foreign ➜ Iran | `bind_addr` (listens) | `remote_addr` = Iran IP:port |
+| `direct` | Iran ➜ foreign | `remote_addr` = foreign IP:port | `bind_addr` (listens) |
+
+Choose `direct` when connections **into** the Iran server are being blocked or
+cut: the Iran server then only makes outgoing connections. Users, ports,
+encryption and speed are the same either way. Both servers must use the same
+direction. The manager asks for it when you create a tunnel, and
+**Manage → Change direction** switches an existing one.
+
+Direction applies to the stream transports (`tcp` `mtcp` `mptcp` `ws`
+`tcpnomux` `kcp` `quic` `sctp`). The point-to-point tunnels (`gre`, `udp`,
+`spoof`, ...) send from both ends at once and have no direction.
 
 Install on **both** servers. Both ends must agree on the transport, the
 encryption layer and the token.
@@ -89,7 +105,7 @@ encryption layer and the token.
 Two independent choices. The transport decides how the bytes travel; the
 encryption layer decides what they look like on the way.
 
-**Stream transports** (relay listens, foreign server dials in):
+**Stream transports** (reverse or direct, see above):
 `tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `quic` · `sctp`
 
 **Point-to-point tunnels** (both servers' real IPs + a private address pair):
@@ -231,10 +247,14 @@ brokennode version
 
 Common: `mode`, `transport`, `encryption`, `token`, `keepalive`, `log_level`
 
-Server: `bind_addr`, `ports` (`"2052"`, `"2052/udp"`, `"2052/both"`,
+Server: `ports` (`"2052"`, `"2052/udp"`, `"2052/both"`,
 `"8443=443"`), `quota_total_gb`, `quota_up_gb`, `quota_down_gb`
 
-Client: `remote_addr`, `target_host`
+Client: `target_host`
+
+Stream transports: `direction` (`reverse` default, or `direct`); the end that
+listens sets `bind_addr`, the end that connects sets `remote_addr` — the relay
+listens in reverse mode, the foreign server in direct mode.
 
 Per-transport: `pool_size`, `pool_min_idle`, `links`, `links_max`,
 `links_per_link`, `kcp_mode`, `kcp_data`, `kcp_parity`, `kcp_mtu`, `kcp_sndwnd`,
@@ -347,9 +367,25 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 
 <div dir="rtl">
 
-به جهت دقت کن. سرور **داخل ایران** با `mode: server` اجرا می‌شود — یعنی گوش
-می‌دهد. سرور **خارج** با `mode: client` اجرا می‌شود — یعنی وصل می‌شود. تونل
-*معکوس* است: طرف خارجی اتصال را آغاز می‌کند.
+سرور **داخل ایران** با `mode: server` اجرا می‌شود (کاربران به پورت‌های آن وصل
+می‌شوند). سرور **خارج** با `mode: client` اجرا می‌شود (ترافیک را به سرویس اصلی
+می‌رساند). این‌که کدام طرف تونل را باز کند انتخاب جداگانه‌ای است به نام
+**جهت** (`direction`):
+
+| `direction` | چه کسی به چه کسی وصل می‌شود | سرور ایران | سرور خارج |
+|---|---|---|---|
+| `reverse` (پیش‌فرض، ریورس) | خارج ⬅ به ایران | `bind_addr` (گوش می‌دهد) | `remote_addr` = آی‌پی:پورت ایران |
+| `direct` (دایرکت) | ایران ⬅ به خارج | `remote_addr` = آی‌پی:پورت خارج | `bind_addr` (گوش می‌دهد) |
+
+وقتی اتصال‌های **ورودی** به سرور ایران بسته یا قطع می‌شوند `direct` را انتخاب
+کن: در این حالت سرور ایران فقط اتصال خروجی می‌سازد. کاربران، پورت‌ها،
+رمزنگاری و سرعت در هر دو حالت یکسان است. هر دو سرور باید جهت یکسان داشته
+باشند. منیجر هنگام ساخت تانل این را می‌پرسد و با
+**Manage → Change direction** می‌توان جهت یک تانل موجود را عوض کرد.
+
+جهت فقط برای ترنسپورت‌های جریانی است (`tcp` `mtcp` `mptcp` `ws` `tcpnomux`
+`kcp` `quic` `sctp`). تونل‌های نقطه‌به‌نقطه (`gre`، `udp`، `spoof` و ...) از هر
+دو طرف هم‌زمان ارسال می‌کنند و جهت ندارند.
 
 روی **هر دو** سرور نصب کن. دو طرف باید روی ترنسپورت، لایهٔ رمزنگاری و توکن
 یکسان توافق داشته باشند.
@@ -359,7 +395,7 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 این دو انتخاب **مستقل** از هم هستند. ترنسپورت تعیین می‌کند بایت‌ها چطور منتقل
 شوند؛ لایهٔ رمزنگاری تعیین می‌کند در مسیر چه شکلی داشته باشند.
 
-**ترنسپورت‌های جریانی** (سرور ایران گوش می‌دهد، سرور خارج وصل می‌شود):
+**ترنسپورت‌های جریانی** (ریورس یا دایرکت، بالا را ببین):
 `tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `quic` · `sctp`
 
 **تونل‌های نقطه‌به‌نقطه** (IP واقعی هر دو سرور + یک جفت آدرس خصوصی):
@@ -514,10 +550,14 @@ brokennode version
 
 مشترک: `mode`، `transport`، `encryption`، `token`، `keepalive`، `log_level`
 
-سرور: `bind_addr`، `ports` (به شکل `"2052"`، `"2052/udp"`، `"2052/both"`،
+سرور: `ports` (به شکل `"2052"`، `"2052/udp"`، `"2052/both"`،
 `"8443=443"`)، `quota_total_gb`، `quota_up_gb`، `quota_down_gb`
 
-کلاینت: `remote_addr`، `target_host`
+کلاینت: `target_host`
+
+ترنسپورت‌های جریانی: `direction` (پیش‌فرض `reverse`، یا `direct`)؛ طرفی که گوش
+می‌دهد `bind_addr` و طرفی که وصل می‌شود `remote_addr` می‌گیرد — در ریورس سرور
+ایران گوش می‌دهد و در دایرکت سرور خارج.
 
 مخصوص هر ترنسپورت: `pool_size`، `pool_min_idle`، `links`، `links_max`،
 `links_per_link`، `kcp_mode`، `kcp_data`، `kcp_parity`، `kcp_mtu`،
