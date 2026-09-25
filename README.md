@@ -35,6 +35,11 @@ cd BrokenNode
 sudo bash BrokenNode.sh
 ```
 
+**Updating:** menu option **5) Update BrokenNode**, or run the install command
+again from inside the folder (`cd BrokenNode` first) — both update that folder
+in place, and the menu then applies the new core and restarts the tunnels. The
+menu never puts an older core over a newer one; an old folder only says so.
+
 Or take the whole folder at once:
 
 ```bash
@@ -319,6 +324,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/BrokenCodeee/BrokenNode/main
 
 این دستور یک پوشهٔ `BrokenNode` می‌سازد، نسخهٔ مناسب پردازندهٔ سرورت را داخلش
 می‌گذارد و منو را باز می‌کند. با کاربر root اجرا کن.
+
+**به‌روزرسانی:** گزینهٔ **5) Update BrokenNode** در منو، یا اجرای دوبارهٔ دستور نصب
+از **داخل** همان پوشه (اول `cd BrokenNode`) — هر دو همان پوشه را به‌روز می‌کنند و
+منو هستهٔ جدید را اعمال و تانل‌ها را ری‌استارت می‌کند. منو هیچ‌وقت هستهٔ قدیمی‌تر
+را روی جدیدتر نمی‌گذارد؛ پوشهٔ قدیمی فقط هشدار می‌دهد.
 
 اگر پوشه را از قبل داری:
 

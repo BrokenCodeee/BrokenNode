@@ -15,7 +15,15 @@ set -euo pipefail
 REPO="BrokenCodeee/BrokenNode"
 BRANCH="main"
 BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
-DIR="${BROKENNODE_DIR:-BrokenNode}"
+# Where to install. Run from INSIDE an existing BrokenNode folder, update that
+# folder in place: creating ./BrokenNode there left a nested second copy, and
+# the old folder — the one opened with "cd BrokenNode && bash BrokenNode.sh" —
+# kept its old core and menu.
+if [ -z "${BROKENNODE_DIR:-}" ] && [ -f ./BrokenNode.sh ] && [ -d ./bin ]; then
+  DIR="."
+else
+  DIR="${BROKENNODE_DIR:-BrokenNode}"
+fi
 
 C_R='\033[0;31m'; C_G='\033[0;32m'; C_Y='\033[1;33m'; C_M='\033[0;35m'; C_D='\033[0;90m'; C_N='\033[0m'
 info(){ echo -e "${C_G}  [+]${C_N} $*"; }
@@ -54,27 +62,39 @@ else
 fi
 
 # --- download ----------------------------------------------------------------
+# Everything lands in a temporary folder first and replaces the old files only
+# once it is complete and verified: when this updates a folder in place, a
+# download that breaks halfway must leave the working copy as it was.
 mkdir -p "$DIR/bin"
-info "Downloading into ./$DIR"
-fetch "$BASE/bin/brokennode-linux-${ARCH}" "$DIR/bin/brokennode-linux-${ARCH}" \
+if [ "$DIR" = . ]; then info "Updating this folder ($(pwd))"; else info "Downloading into ./$DIR"; fi
+TMP="$(mktemp -d "$DIR/.download.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+fetch "$BASE/bin/brokennode-linux-${ARCH}" "$TMP/brokennode-linux-${ARCH}" \
   || die "Download failed. Check the server's internet access, or grab the file manually from https://github.com/${REPO}"
-fetch "$BASE/BrokenNode.sh" "$DIR/BrokenNode.sh" || die "Could not download BrokenNode.sh"
-fetch "$BASE/SHA256SUMS"    "$DIR/SHA256SUMS"    || warn "Could not download SHA256SUMS — skipping verification"
-fetch "$BASE/VERSION"       "$DIR/VERSION"       || true
-fetch "$BASE/README.md"     "$DIR/README.md"     || true
+fetch "$BASE/BrokenNode.sh" "$TMP/BrokenNode.sh" || die "Could not download BrokenNode.sh"
+fetch "$BASE/SHA256SUMS"    "$TMP/SHA256SUMS"    || warn "Could not download SHA256SUMS — skipping verification"
+fetch "$BASE/VERSION"       "$TMP/VERSION"       || true
+fetch "$BASE/README.md"     "$TMP/README.md"     || true
 
 # --- verify ------------------------------------------------------------------
 # A truncated download produces a binary that fails in confusing ways much
 # later, so it is worth catching here rather than mid-tunnel.
-if [ -s "$DIR/SHA256SUMS" ] && command -v sha256sum >/dev/null 2>&1; then
-  want="$(awk -v f="bin/brokennode-linux-${ARCH}" '$2 == f || $2 == "*"f {print $1}' "$DIR/SHA256SUMS" | head -1)"
+if [ -s "$TMP/SHA256SUMS" ] && command -v sha256sum >/dev/null 2>&1; then
+  want="$(awk -v f="bin/brokennode-linux-${ARCH}" '$2 == f || $2 == "*"f {print $1}' "$TMP/SHA256SUMS" | head -1)"
   if [ -n "$want" ]; then
-    got="$(sha256sum "$DIR/bin/brokennode-linux-${ARCH}" | awk '{print $1}')"
-    [ "$want" = "$got" ] || die "Checksum mismatch — the download is corrupt or tampered with. Delete ./$DIR and retry."
+    got="$(sha256sum "$TMP/brokennode-linux-${ARCH}" | awk '{print $1}')"
+    [ "$want" = "$got" ] || die "Checksum mismatch — the download is corrupt or tampered with. Nothing was changed; retry."
     info "Checksum verified"
   fi
 fi
 
+# --- put in place ------------------------------------------------------------
+chmod +x "$TMP/brokennode-linux-${ARCH}" "$TMP/BrokenNode.sh"
+mv -f "$TMP/brokennode-linux-${ARCH}" "$DIR/bin/brokennode-linux-${ARCH}"
+for f in BrokenNode.sh SHA256SUMS VERSION README.md; do
+  if [ -s "$TMP/$f" ]; then mv -f "$TMP/$f" "$DIR/$f"; fi
+done
+rm -rf "$TMP"; trap - EXIT   # exec below would skip the trap
 chmod +x "$DIR/bin/brokennode-linux-${ARCH}" "$DIR/BrokenNode.sh"
 info "Installed: $("$DIR/bin/brokennode-linux-${ARCH}" version 2>/dev/null || echo "brokennode ($ARCH)")"
 

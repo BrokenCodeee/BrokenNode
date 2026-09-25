@@ -25,12 +25,18 @@ REPO_DIR="$(cd "$SRC_DIR/.." && pwd)"
 # this is run as "scripts/BrokenNode.sh" from a checkout or as "BrokenNode.sh"
 # from a release directory.
 SELF="${BASH_SOURCE[0]}"
+INSTALL_URL="https://raw.githubusercontent.com/BrokenCodeee/BrokenNode/main/install.sh"
 
 C_R='\033[0;31m'; C_G='\033[0;32m'; C_Y='\033[1;33m'; C_B='\033[0;36m'; C_M='\033[0;35m'; C_D='\033[0;90m'; C_N='\033[0m'
 info(){ echo -e "${C_G}  [+]${C_N} $*"; }
 warn(){ echo -e "${C_Y}  [!]${C_N} $*"; }
 err(){ echo -e "${C_R}  [x]${C_N} $*" >&2; }
 ask(){ local p="$1" d="${2:-}" a; if [ -n "$d" ]; then read -rp "$(echo -e "${C_B}  ?${C_N} $p [${C_D}$d${C_N}]: ")" a; echo "${a:-$d}"; else read -rp "$(echo -e "${C_B}  ?${C_N} $p: ")" a; echo "$a"; fi; }
+# menu_ask PROMPT — a menu choice; "__eof__" once input has ended. The menus
+# loop until a choice exits them, and ask() cannot tell end of input from an
+# empty answer, so a closed stdin (a script feeding the menu, a dropped SSH
+# session) spun them forever printing "Invalid.".
+menu_ask(){ local a; if read -rp "$(echo -e "${C_B}  ?${C_N} $1: ")" a; then echo "$a"; else echo "__eof__"; fi; }
 need_root(){ [ "$(id -u)" -eq 0 ] || { err "Run as root: sudo bash $SELF"; exit 1; }; }
 detect_ip(){ ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1 || true; }
 default_iface(){ ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1; }
@@ -94,9 +100,32 @@ detect_bin(){
     [ -f "$c" ] && { echo "$c"; return; }
   done
 }
+# core_version BINARY — "2.3.7" from "BrokenNode Tunnel v2.3.7"; empty if the
+# binary does not run.
+core_version(){ "$1" version 2>/dev/null | sed -n 's/.* v\{0,1\}\([0-9][0-9.]*\)$/\1/p' | head -n 1; }
+
+# version_lt A B — true when version A is older than B.
+version_lt(){ [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$1" ]; }
+
+# bundled_is_older SRC — the core in this folder is OLDER than the one already
+# installed. Installing it would be a downgrade: that is what happened when an
+# update landed in a second, nested BrokenNode folder and the old folder, opened
+# later, put its old core back ("updated, and then it is 2.3.5 again").
+bundled_is_older(){
+  [ -x "$BIN" ] || return 1
+  local have new; have="$(core_version "$BIN")"; new="$(core_version "$1")"
+  [ -n "$have" ] && [ -n "$new" ] && version_lt "$new" "$have"
+}
+
+warn_old_folder(){
+  warn "This folder ($SRC_DIR) holds an OLDER BrokenNode (core v$(core_version "$1")) than the one installed (v$(core_version "$BIN")) — not downgrading."
+  echo -e "  ${C_D}Update this folder: menu option 5, or  cd \"$SRC_DIR\" && bash <(curl -fsSL $INSTALL_URL)${C_N}"
+}
+
 ensure_core(){
   local src; src="$(detect_bin)"
   if [ -n "$src" ] && [ -f "$src" ]; then
+    if bundled_is_older "$src"; then warn_old_folder "$src"; return 0; fi
     { [ ! -x "$BIN" ] || ! cmp -s "$src" "$BIN"; } && { install -m0755 "$src" "$BIN"; info "Core updated: $("$BIN" version)"; }
     return 0
   fi
@@ -1793,7 +1822,7 @@ manage_tunnels(){
       echo -e "   ${C_G}9) Change transport${C_N}   ${C_G}10) Change peer IP${C_N}   ${C_G}11) Tune settings (MTU/FEC/window...)${C_N}"
       echo -e "   ${C_G}12) Duplicate UDP packets${C_N}  ${C_D}[$(udp_dup_state "$n")]${C_N}   ${C_G}13) Change direction${C_N}  ${C_D}[$(tunnel_direction "$CFG_DIR/$n.json")]${C_N}"
       echo "   0) Back"
-      case "$(ask 'Choice' '')" in
+      case "$(menu_ask 'Choice')" in
         1) systemctl enable --now "brokennode@$n" >/dev/null 2>&1; systemctl start "brokennode@$n"; info "started";;
         2) systemctl stop "brokennode@$n"; info "stopped";;
         3) systemctl restart "brokennode@$n"; info "restarted";;
@@ -1808,6 +1837,7 @@ manage_tunnels(){
         11) tune_tunnel "$n";;
         12) toggle_udp_duplicate "$n";;
         13) change_direction "$n";;
+        __eof__) return;;
         0) break;;
         *) warn "Invalid.";;
       esac
@@ -1832,10 +1862,6 @@ restart_all_tunnels(){
   [ "$any" = 0 ] && warn "No tunnels configured yet."
 }
 
-# auto_apply_bundled: run at startup. If the binary shipped next to the script
-# differs from what's installed, install it and restart tunnels automatically —
-# so customers never have to pick an "update" menu item. No-op when already
-# up to date, or when not root.
 # auto_tune_once applies the network tuning (BBR + fq + buffers) the first time
 # this host runs the manager. The manual menu entry is gone, so tuning has to
 # happen on its own — but only ONCE, tracked by a stamp file, so we never fight
@@ -1866,11 +1892,21 @@ auto_tune_once(){
   mkdir -p "$CFG_DIR" 2>/dev/null; : > "$stamp"
 }
 
+# auto_apply_bundled: run at startup. If the binary shipped next to the script
+# differs from what's installed, install it and restart tunnels automatically —
+# so customers never have to pick an "update" menu item. No-op when already
+# up to date, or when not root. Never a downgrade: a folder older than the
+# installed core only says so (see bundled_is_older).
 auto_apply_bundled(){
   [ "$(id -u)" -eq 0 ] || return 0
   auto_tune_once
   local src; src="$(detect_bin)"
   [ -n "$src" ] && [ -f "$src" ] || return 0
+  if bundled_is_older "$src"; then
+    warn_old_folder "$src"
+    read -t 15 -rp "  ▶ Press ENTER to continue (auto-continuing in 15s)... " _ 2>/dev/null || true
+    return 0
+  fi
   if [ ! -x "$BIN" ] || ! cmp -s "$src" "$BIN"; then
     warn "New core bundled with this package — applying automatically..."
     install -m0755 "$src" "$BIN"; info "Core: $("$BIN" version)"
@@ -1878,6 +1914,21 @@ auto_apply_bundled(){
     info "Auto-update done — configs untouched."
     read -t 15 -rp "  ▶ Press ENTER to continue (auto-continuing in 15s)... " _ 2>/dev/null || true
   fi
+}
+
+# update_self downloads the latest release into THIS folder — the one the
+# operator opens with "cd BrokenNode && bash BrokenNode.sh" — and restarts the
+# menu from it, which then applies the new core and restarts the tunnels.
+# Updating in place is the point: the installer run from somewhere else makes a
+# second folder, and the old one kept offering (and installing) its old core.
+update_self(){
+  need_root
+  local tmp; tmp="$(mktemp)"
+  if command -v curl >/dev/null 2>&1; then curl -fsSL --retry 3 -o "$tmp" "$INSTALL_URL"
+  else wget -q --tries=3 -O "$tmp" "$INSTALL_URL"; fi || { err "Could not download the installer ($INSTALL_URL)."; rm -f "$tmp"; return; }
+  info "Updating $SRC_DIR ..."
+  cd "$(dirname "$SRC_DIR")" || return
+  BROKENNODE_DIR="$(basename "$SRC_DIR")" exec bash "$tmp"
 }
 
 # uninstall_all: remove EVERYTHING — tunnels, core, configs, units.
@@ -2089,15 +2140,17 @@ main_menu(){
     echo "   2) Create CLIENT tunnel   (foreign server)"
     echo "   3) Manage tunnels         (edit / transport / IP / logs / stats)"
     echo "   4) Health check           (doctor: BBR / ports / loss / IP)"
+    echo "   5) Update BrokenNode      (download the latest into this folder)"
     echo "   0) Exit"
     echo -e "  ${C_D}(the core in this folder is applied automatically on start)${C_N}"
     echo
-    case "$(ask 'Choice' '')" in
+    case "$(menu_ask 'Choice')" in
       1) create_tunnel server; read -t 30 -rp "  ▶ press ENTER to continue... " _ ;;
       2) create_tunnel client; read -t 30 -rp "  ▶ press ENTER to continue... " _ ;;
       3) manage_tunnels ;;
       4) doctor; read -t 30 -rp "  ▶ press ENTER to continue... " _ ;;
-      0) exit 0 ;;
+      5) update_self ;;
+      0|__eof__) echo; exit 0 ;;
       *) warn "Invalid." ;;
     esac
   done
@@ -2120,6 +2173,7 @@ case "${1:-}" in
     systemctl "$action" $units && echo "done." ;;
   uninstall|purge) uninstall_all ;;
   version) echo "BrokenNode manager v$VERSION" ;;
+  update) update_self ;;
   ""|menu) main_menu ;;
-  *) echo "usage: sudo bash $SELF [server|client|manage|transports|tune|restart-all|start-all|stop-all|doctor|uninstall|version]"; exit 1 ;;
+  *) echo "usage: sudo bash $SELF [server|client|manage|transports|tune|restart-all|start-all|stop-all|doctor|update|uninstall|version]"; exit 1 ;;
 esac
