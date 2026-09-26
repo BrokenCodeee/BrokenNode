@@ -4,7 +4,7 @@
 
 **Multi-protocol tunnel, reverse or direct — compiled and ready to run.**
 
-`v2.3.7`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
+`v2.3.8`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
 
 **[English](#english)**  ·  **[فارسی](#فارسی)**
 
@@ -104,6 +104,24 @@ Direction applies to the stream transports (`tcp` `mtcp` `mptcp` `ws`
 
 Install on **both** servers. Both ends must agree on the transport, the
 encryption layer and the token.
+
+### Pairing code — set up the foreign server without typing anything
+
+Create the tunnel on the **Iran** server first. The manager picks every value
+that must not clash with this server's other tunnels by itself — tunnel subnet,
+gre key, l2tp ids and port, carrier ports, listen port — and prints a one-line
+**pairing code** (`BN1:…`). On the **foreign** server choose *Create CLIENT
+tunnel* and paste it: the whole config is built from it, checked against what
+that server already uses, started, and the manager waits until it connects.
+*Manage → 14) Pairing code* shows it again. The code contains the token — share
+it like the token.
+
+**Which transport under load?** On a path that loses packets, every user sharing
+one TCP link waits behind each loss (head-of-line blocking). `mtcp` therefore
+opens one link per concurrent user by default (measured with 40 users, 80 ms,
+0.3 % loss: ping 135 ms instead of 320–410 ms — as good as no tunnel), and
+`tcpnomux` does the same by design. `tcp` and `ws` use a single link. `quic`
+collapses on lossy paths (≈5 Mbit in total at 0.3 % loss) — prefer `mtcp` or `kcp`.
 
 ## Transports and encryption
 
@@ -281,7 +299,7 @@ listens in reverse mode, the foreign server in direct mode.
 
 Per-transport: `pool_size`, `pool_min_idle`, `links`, `links_max`,
 `links_per_link`, `kcp_mode`, `kcp_data`, `kcp_parity`, `kcp_mtu`, `kcp_sndwnd`,
-`kcp_rcvwnd`, `smux_recv_mb`, `smux_stream_mb`, `server_name`, `alpn`,
+`kcp_rcvwnd`, `smux_recv_mb`, `smux_stream_mb`, `smux_frame_kb`, `server_name`, `alpn`,
 `sctp_streams`, `sctp_multihoming`
 
 Point-to-point tunnels: `local_ip`, `remote_ip` (the two servers' real IPv4
@@ -417,6 +435,23 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 
 روی **هر دو** سرور نصب کن. دو طرف باید روی ترنسپورت، لایهٔ رمزنگاری و توکن
 یکسان توافق داشته باشند.
+
+### کد جفت‌سازی — راه‌اندازی سرور خارج بدون تایپ هیچ تنظیمی
+
+اول تانل را روی سرور **ایران** بساز. منیجر هر مقداری را که نباید با تانل‌های دیگر
+این سرور تداخل کند خودش انتخاب می‌کند — زیرشبکهٔ تانل، کلید gre، شناسه و پورت
+l2tp، پورت حامل، پورت شنود — و در آخر یک **کد جفت‌سازی** یک‌خطی (`BN1:…`) نشان
+می‌دهد. روی سرور **خارج** گزینهٔ *Create CLIENT tunnel* را بزن و کد را بچسبان:
+کل کانفیگ از روی آن ساخته می‌شود، با چیزهایی که آن سرور از قبل استفاده می‌کند
+مقایسه می‌شود، اجرا می‌شود و منیجر تا وصل شدن صبر می‌کند. در *Manage → 14) Pairing
+code* دوباره نمایش داده می‌شود. کد شامل توکن است — مثل توکن از آن محافظت کن.
+
+**زیر بار کدام ترنسپورت؟** در مسیری که بسته گم می‌کند، هر کاربری که روی یک لینک TCP
+مشترک است پشت هر بستهٔ گم‌شده منتظر می‌ماند. برای همین `mtcp` حالا به‌طور پیش‌فرض
+برای هر کاربر هم‌زمان یک لینک باز می‌کند (با ۴۰ کاربر، ۸۰ms و ۰٫۳٪ گم‌شدن: پینگ
+۱۳۵ms به‌جای ۳۲۰ تا ۴۱۰ms — هم‌اندازهٔ حالت بدون تانل) و `tcpnomux` هم ذاتاً همین‌طور
+است. `tcp` و `ws` یک لینک دارند. `quic` در مسیر پرافت عملاً از کار می‌افتد (حدود ۵
+مگابیت کل با ۰٫۳٪ افت) — `mtcp` یا `kcp` را انتخاب کن.
 
 ## ترنسپورت‌ها و رمزنگاری
 
@@ -607,7 +642,7 @@ brokennode version
 
 مخصوص هر ترنسپورت: `pool_size`، `pool_min_idle`، `links`، `links_max`،
 `links_per_link`، `kcp_mode`، `kcp_data`، `kcp_parity`، `kcp_mtu`،
-`kcp_sndwnd`، `kcp_rcvwnd`، `smux_recv_mb`، `smux_stream_mb`، `server_name`،
+`kcp_sndwnd`، `kcp_rcvwnd`، `smux_recv_mb`، `smux_stream_mb`، `smux_frame_kb`، `server_name`،
 `alpn`، `sctp_streams`، `sctp_multihoming`
 
 تونل‌های نقطه‌به‌نقطه: `local_ip`، `remote_ip` (IPv4 واقعی دو سرور)،
