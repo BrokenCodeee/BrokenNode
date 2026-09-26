@@ -8,7 +8,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.3.7"
+VERSION="2.3.8"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=2
@@ -331,6 +331,320 @@ next_free_net(){
   echo 30
 }
 
+# show_pair_code CFG — print the pairing code for a relay config. Everything
+# the foreign server needs (transport, encryption, token, addresses, subnet,
+# keys, ids, ports, direction, transport settings) is in it, so the foreign
+# wizard asks for nothing else and nothing can be mistyped. It holds the token:
+# treat it like the token.
+show_pair_code(){
+  local cfg="$1" ip="" fam; fam="$(transport_family "$(jget "$cfg" transport)")"
+  case "$fam" in
+    stream)
+      if [ "$(tunnel_direction "$cfg")" = direct ]; then ip="-"
+      else
+        ip="$(jget "$cfg" public_ip)"
+        if [ -z "$ip" ]; then
+          ip=$(ask "This server's PUBLIC IP (the foreign server connects to it)" "$(detect_ip)")
+          jset "$cfg" public_ip "$ip"
+        fi
+      fi ;;
+    spoof) ip="$(jget "$cfg" spoof_local_ip)" ;;
+    *)     ip="$(jget "$cfg" local_ip)" ;;
+  esac
+  local code; code="$(bnpy pair make "$cfg" "$ip")" || { err "Could not build the pairing code."; return; }
+  echo
+  echo -e "  ${C_B}╭─ Pairing code — on the FOREIGN server: Create CLIENT tunnel, paste this ─╮${C_N}"
+  echo -e "  ${C_Y}$code${C_N}"
+  echo -e "  ${C_B}╰──────────────────────────────────────────────────────────────────────────╯${C_N}"
+  echo -e "  ${C_D}It carries every setting (and the token): nothing else to type on the other side.${C_N}"
+  echo -e "  ${C_D}Setting the foreign server up by hand instead (or it runs an older manager)? Its values:${C_N}"
+  bnpy pair show "$cfg" "$ip" 2>/dev/null | sed "s/^/      /"
+}
+
+# client_from_code NAME CODE — the foreign server's side of pairing: build the
+# config from the code, check it against what this machine already uses, start
+# it, and wait to see it connect.
+client_from_code(){
+  local name="$1" code="$2" target out line
+  target=$(ask "Local services host (Enter = this server)" "")
+  local rc=0; out="$(bnpy pair apply "$code" "$name" "$target" 2>&1)" || rc=$?
+  if grep -q '^ERR ' <<<"$out"; then err "$(sed -n 's/^ERR //p' <<<"$out")"; return 1; fi
+  if [ "$rc" != 0 ] || ! grep -q '^OK ' <<<"$out"; then
+    err "Could not build the config from this code:"; echo "$out" | tail -n 3 | sed 's/^/    /'; return 1
+  fi
+  info "Config created from the pairing code: $(sed -n 's/^OK //p' <<<"$out")"
+  if grep -q '^CONFLICT ' <<<"$out"; then
+    while IFS= read -r line; do warn "${line#CONFLICT }"; done < <(grep '^CONFLICT ' <<<"$out")
+    echo -e "  ${C_D}Re-create the tunnel on the Iran server (it picks other free values) and paste the new code.${C_N}"
+    local go; go=$(ask "Start it anyway? y/N" "N"); case "$go" in y|Y) : ;; *) warn "Not started — config kept at $CFG_DIR/$name.json"; return 1 ;; esac
+  fi
+  local cfg="$CFG_DIR/$name.json" b
+  b="$(jget "$cfg" bind_addr)"
+  if [ -n "$b" ]; then
+    local pr=tcp; case "$(jget "$cfg" transport)" in kcp|quic) pr=udp ;; esac
+    echo -e "  ${C_D}Direct mode: the Iran server connects here on ${pr^^} ${b##*:} — allow it in this server's firewall.${C_N}"
+  fi
+  # Only log lines from THIS start count: an overwritten tunnel of the same
+  # name may have "Connected" from its previous run in the journal.
+  local since; since="$(date '+%Y-%m-%d %H:%M:%S')"
+  systemctl enable "brokennode@$name" >/dev/null 2>&1; systemctl restart "brokennode@$name"; sleep 1.5
+  if [ "$(systemctl is-active "brokennode@$name" 2>/dev/null)" != active ]; then
+    err "Tunnel '$name' failed to start. Recent log:"; journalctl -u "brokennode@$name" --since "$since" -n 10 --no-pager 2>/dev/null | sed 's/^/    /'; return 1
+  fi
+  info "Tunnel '$name' is ${C_G}active${C_N} — waiting for the other end..."
+  local i; for i in $(seq 1 20); do
+    journalctl -u "brokennode@$name" --since "$since" --no-pager -o cat 2>/dev/null | grep -q -E '🟢 Connected|ready on' && { info "${C_G}Connected.${C_N}"; return 0; }
+    sleep 1
+  done
+  warn "No connection yet. If the Iran side is running, check with the Health check (menu 4)."
+}
+
+# auto_or_ask ROLE PROMPT VALUE — on the relay a value that must not clash
+# with anything else on this server is chosen, not asked (the operator asked
+# not to have to pick them); it is shown and ends up in the pairing code. The
+# foreign server, set up by hand, is still asked.
+auto_or_ask(){
+  if [ "$1" = server ]; then
+    echo -e "  ${C_D}  $2: ${C_N}${C_Y}$3${C_N}${C_D} (chosen automatically)${C_N}" >&2
+    echo "$3"
+  else
+    ask "$2" "$3"
+  fi
+}
+
+# bnpy SUBCOMMAND ... — the config-aware helpers that need more than sed:
+#
+#   alloc net EXCL            a free N for 10.10.N.x: no other tunnel here uses
+#                             it and no address or route on this machine does
+#   alloc port PROTO EXCL     a free port (tcp|udp) in 20000-40000: not in any
+#                             tunnel config here and nothing listening on it
+#   alloc l2tpid EXCL         a free l2tp tunnel/session id (1000-60000)
+#   pair make CFG IP          the pairing code for relay config CFG; IP is the
+#                             address the foreign server reaches this one at
+#   pair apply CODE NAME TGT  write the foreign server's config NAME from a
+#                             pairing code; TGT is its local services host
+#   pair check CFG            conflicts of config CFG with this machine
+#
+# Values are picked at RANDOM among the free ones, not the lowest: a foreign
+# server may carry tunnels from several Iran relays, and relays that all chose
+# "the first free" would all choose the same subnet, id and port.
+bnpy(){
+  python3 - "$CFG_DIR" "$@" <<'PYEOF'
+import base64, glob, json, os, random, re, subprocess, sys, zlib
+
+cfgdir, cmd, args = sys.argv[1], sys.argv[2], sys.argv[3:]
+P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp")
+
+def configs(excl=""):
+    out = []
+    for f in sorted(glob.glob(os.path.join(cfgdir, "*.json"))):
+        n = os.path.basename(f)[:-5]
+        if n == excl:
+            continue
+        try:
+            out.append((n, json.load(open(f))))
+        except Exception:
+            pass
+    return out
+
+def sh(*a):
+    try:
+        return subprocess.run(a, capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return ""
+
+def used_nets(excl):
+    used = set()
+    for _, c in configs(excl):
+        for k in ("tun_local", "tun_remote"):
+            m = re.match(r"10\.10\.(\d+)\.", str(c.get(k) or "")) or re.match(r"fd00:10:(\d+)::", str(c.get(k) or ""))
+            if m:
+                used.add(int(m.group(1)))
+    for line in (sh("ip", "-o", "addr") + sh("ip", "route")).splitlines():
+        for m in re.finditer(r"\b10\.10\.(\d+)\.", line):
+            used.add(int(m.group(1)))
+    return used
+
+def used_ports(proto, excl):
+    used = set()
+    for _, c in configs(excl):
+        t = c.get("transport")
+        for spec in c.get("ports") or []:
+            spec = str(spec)
+            p = spec.split("=")[0].split("/")[0]
+            pr = spec.rsplit("/", 1)[1] if "/" in spec else "tcp"
+            if p.isdigit() and pr in (proto, "both"):
+                used.add(int(p))
+        for k in ("bind_addr", "remote_addr"):
+            v = str(c.get(k) or "")
+            if ":" in v and v.rsplit(":", 1)[1].isdigit():
+                used.add(int(v.rsplit(":", 1)[1]))
+        if t == "l2tp":
+            used.add(int(c.get("l2tp_port") or 1701))
+        if t in ("udp", "icmp", "spoof"):
+            used.add(int(c.get("carrier_port") or 6262))
+    flag = "-Hlnu" if proto == "udp" else "-Hlnt"
+    for line in sh("ss", flag).splitlines():
+        f = line.split()
+        if len(f) >= 4 and ":" in f[3]:
+            p = f[3].rsplit(":", 1)[1]
+            if p.isdigit():
+                used.add(int(p))
+    return used
+
+def used_l2tp(excl):
+    used = set()
+    for _, c in configs(excl):
+        for k in ("l2tp_tunnel_id", "l2tp_session_id"):
+            if c.get(k):
+                used.add(int(c[k]))
+    for m in re.finditer(r"(?:Tunnel|Session) (\d+)", sh("ip", "l2tp", "show", "tunnel") + sh("ip", "l2tp", "show", "session")):
+        used.add(int(m.group(1)))
+    return used
+
+def pick(lo, hi, used):
+    free = [v for v in range(lo, hi + 1) if v not in used]
+    return random.choice(free) if free else lo
+
+def mirror(r, relay_ip, target):
+    """The foreign server's config: the relay's, seen from the other end."""
+    c = {k: v for k, v in r.items() if k not in ("ports", "quota_total_gb", "quota_up_gb", "quota_down_gb", "public_ip")}
+    c["mode"] = "client"
+    t = c.get("transport")
+    sw = lambda a, b: c.update({a: r.get(b), b: r.get(a)}) if (a in r or b in r) else None
+    if t in P2P:
+        sw("local_ip", "remote_ip"); sw("tun_local", "tun_remote")
+    elif t == "spoof":
+        sw("spoof_local_ip", "spoof_peer_ip"); sw("spoof_src", "spoof_dst"); sw("tun_local", "tun_remote")
+    else:
+        if str(r.get("direction") or "").lower() == "direct":
+            port = str(r.get("remote_addr") or ":8443").rsplit(":", 1)[-1] or "8443"
+            c["bind_addr"] = "0.0.0.0:" + port
+            c.pop("remote_addr", None)
+        else:
+            port = str(r.get("bind_addr") or ":8443").rsplit(":", 1)[-1] or "8443"
+            host = "[" + relay_ip + "]" if ":" in relay_ip and not relay_ip.startswith("[") else relay_ip
+            c["remote_addr"] = host + ":" + port
+            c.pop("bind_addr", None)
+    c["target_host"] = target or ("::1" if t == "sit" else "127.0.0.1")
+    return {k: v for k, v in c.items() if v is not None}
+
+def own_values(name):
+    """Values the existing config NAME (about to be replaced) holds: its running
+    tunnel shows them on this machine, but they are not a conflict with it."""
+    try:
+        o = json.load(open(os.path.join(cfgdir, name + ".json")))
+    except Exception:
+        return set(), set(), set()
+    nets, ports, ids = set(), set(), set()
+    m = re.match(r"10\.10\.(\d+)\.", str(o.get("tun_local") or ""))
+    if m:
+        nets.add(int(m.group(1)))
+    for k in ("carrier_port", "l2tp_port"):
+        if o.get(k):
+            ports.add(int(o[k]))
+    for k in ("bind_addr",):
+        v = str(o.get(k) or "")
+        if v.rsplit(":", 1)[-1].isdigit():
+            ports.add(int(v.rsplit(":", 1)[-1]))
+    for k in ("l2tp_tunnel_id", "l2tp_session_id"):
+        if o.get(k):
+            ids.add(int(o[k]))
+    return nets, ports, ids
+
+def conflicts(name, c):
+    """What in config c is already taken on THIS machine."""
+    out = []
+    own_nets, own_ports, own_ids = own_values(name)
+    used_nets_ = lambda n: used_nets(n) - own_nets
+    used_ports_ = lambda pr, n: used_ports(pr, n) - own_ports
+    used_l2tp_ = lambda n: used_l2tp(n) - own_ids
+    t = c.get("transport")
+    for k in ("tun_local",):
+        m = re.match(r"10\.10\.(\d+)\.", str(c.get(k) or ""))
+        if m and int(m.group(1)) in used_nets_(name):
+            out.append("tunnel subnet 10.10.%s.x is already used here" % m.group(1))
+    if t == "l2tp":
+        for k in ("l2tp_tunnel_id", "l2tp_session_id"):
+            if c.get(k) and int(c[k]) in used_l2tp_(name):
+                out.append("%s %s is already used here" % (k, c[k]))
+        if (c.get("l2tp_encap") or "udp") == "udp" and int(c.get("l2tp_port") or 1701) in used_ports_("udp", name):
+            out.append("l2tp udp port %s is already used here" % (c.get("l2tp_port") or 1701))
+    if t in ("gre", "gretap"):
+        for n, o in configs(name):
+            if o.get("transport") == t and o.get("remote_ip") == c.get("remote_ip") and int(o.get("gre_key") or 0) == int(c.get("gre_key") or 0):
+                out.append("%s tunnel '%s' to %s already uses gre key %s" % (t, n, c.get("remote_ip"), int(c.get("gre_key") or 0)))
+    if t in ("ipip", "sit"):
+        for n, o in configs(name):
+            if o.get("transport") == t and o.get("remote_ip") == c.get("remote_ip"):
+                out.append("%s tunnel '%s' to %s exists — the kernel allows only one" % (t, n, c.get("remote_ip")))
+    if t == "udp" or (t == "spoof" and (c.get("carrier_proto") or "udp") == "udp"):
+        if int(c.get("carrier_port") or 6262) in used_ports_("udp", name):
+            out.append("udp carrier port %s is already used here" % (c.get("carrier_port") or 6262))
+    b = str(c.get("bind_addr") or "")
+    if c.get("mode") == "client" and ":" in b:
+        proto = "udp" if t in ("kcp", "quic") else "tcp"
+        if int(b.rsplit(":", 1)[1]) in used_ports_(proto, name):
+            out.append("port %s/%s (to listen on) is already used here" % (b.rsplit(":", 1)[1], proto))
+    return out
+
+if cmd == "alloc":
+    what = args[0]
+    if what == "net":
+        print(pick(30, 250, used_nets(args[1])))
+    elif what == "port":
+        print(pick(20000, 40000, used_ports(args[1], args[2])))
+    elif what == "l2tpid":
+        print(pick(1000, 60000, used_l2tp(args[1])))
+elif cmd == "pair" and args[0] == "make":
+    r = json.load(open(args[1]))
+    blob = json.dumps({"v": 1, "ip": args[2], "cfg": r}, separators=(",", ":")).encode()
+    print("BN1:" + base64.urlsafe_b64encode(zlib.compress(blob, 9)).decode().rstrip("="))
+elif cmd == "pair" and args[0] == "apply":
+    code, name, target = args[1].strip(), args[2], args[3] if len(args) > 3 else ""
+    try:
+        if not code.startswith("BN1:"):
+            raise ValueError("not a pairing code (it starts with BN1:)")
+        raw = code[4:] + "=" * (-len(code[4:]) % 4)
+        d = json.loads(zlib.decompress(base64.urlsafe_b64decode(raw)))
+    except Exception as e:
+        print("ERR the pairing code is damaged or incomplete (%s) — copy the whole line again" % e)
+        sys.exit(2)
+    c = mirror(d["cfg"], d.get("ip", ""), target)
+    bad = conflicts(name, c)
+    path = os.path.join(cfgdir, name + ".json")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(c, f, indent=2); f.write("\n")
+    t = c.get("transport")
+    info = [t + ("+" + c["encryption"] if c.get("encryption") not in (None, "", "none") else "")]
+    if t not in P2P and t != "spoof":
+        info.append("direction " + (c.get("direction") or "reverse"))
+        info.append(("listens on " + c["bind_addr"]) if c.get("bind_addr") else ("connects to " + c.get("remote_addr", "?")))
+    else:
+        info.append("tunnel " + str(c.get("tun_local")) + " <-> " + str(c.get("tun_remote")))
+    for k in ("gre_key", "l2tp_tunnel_id", "l2tp_port", "carrier_port"):
+        if c.get(k):
+            info.append("%s %s" % (k, c[k]))
+    print("OK " + " · ".join(info))
+    for b in bad:
+        print("CONFLICT " + b)
+elif cmd == "pair" and args[0] == "show":
+    # the foreign side's values, for setting it up by hand (an older manager)
+    c = mirror(json.load(open(args[1])), args[2], "")
+    keys = ("transport", "encryption", "token", "direction", "remote_addr", "bind_addr",
+            "local_ip", "remote_ip", "tun_local", "tun_remote", "gre_key", "l2tp_tunnel_id",
+            "l2tp_session_id", "l2tp_encap", "l2tp_port", "carrier_proto", "carrier_port",
+            "spoof_local_ip", "spoof_peer_ip", "spoof_src", "spoof_dst", "ws_path", "mtu")
+    for k in keys:
+        if c.get(k) not in (None, "", 0) or (k == "gre_key" and c.get(k)):
+            print("%-16s %s" % (k, c[k]))
+elif cmd == "pair" and args[0] == "check":
+    for b in conflicts(os.path.basename(args[1])[:-5], json.load(open(args[1]))):
+        print(b)
+PYEOF
+}
+
 # peer_tunnels TRANSPORTS RIP EXCLUDE — for every other tunnel on this server
 # whose transport is in TRANSPORTS (comma-separated) and whose peer is RIP, one
 # line: its gre_key (0 = none; meaningful for gre/gretap only).
@@ -406,18 +720,6 @@ warn_port_clash(){
   fi
 }
 
-# print_peer_values tells the operator exactly what to type on the foreign
-# server, whose wizard cannot know which free values this relay picked.
-print_peer_values(){
-  echo
-  echo -e "  ${C_B}Enter these on the OTHER (foreign) server:${C_N}"
-  echo -e "    this server's real IP      ${C_Y}$1${C_N}   (the other server's own IP: $2)"
-  echo -e "    this end's tunnel address  ${C_Y}$3${C_N}"
-  echo -e "    other end's tunnel address ${C_Y}$4${C_N}"
-  [ -n "$5" ] && echo -e "    token                      ${C_Y}$5${C_N}"
-  [ -n "$PEER_HINT" ] && printf "$PEER_HINT" | sed "s/^/  /"
-}
-
 pick_transport(){
   # Numbers 1-7 are exactly what 2.2.0 and earlier used. Operators pick these by
   # habit on both servers, so renumbering them (2.3.0 inserted the new ones in
@@ -453,7 +755,17 @@ pick_transport(){
       0) echo ""; return ;;
       1|tcp) echo tcp; return ;;        2|mtcp) echo mtcp; return ;;
       3|ws) echo ws; return ;;          4|tcpnomux) echo tcpnomux; return ;;
-      5|kcp) echo kcp; return ;;        6|quic) echo quic; return ;;
+      5|kcp) echo kcp; return ;;
+      6|quic)
+        # Measured: with 0.3% packet loss on an 80ms path, quic carried 4-5
+        # Mbit in total and 0.1 Mbit per download, where the TCP carriers
+        # carried 220 (its congestion control backs off on every random loss).
+        {
+          echo -e "  ${C_Y}[!]${C_N} quic slows to a crawl when the path loses packets — as paths in Iran do"
+          echo -e "      ${C_D}(tested: 0.3% loss → about 5 Mbit in total). mtcp or kcp hold up far better.${C_N}"
+        } >&2
+        local qc; qc=$(ask "Use quic anyway? y/N" "N")
+        case "$qc" in y|Y) echo quic; return ;; *) continue ;; esac ;;
       7|spoof|ip-spoofing) echo spoof; return ;;
       8|mptcp) echo mptcp; return ;;    9|sctp) echo sctp; return ;;
       10|gre) echo gre; return ;;       11|gretap) echo gretap; return ;;
@@ -612,8 +924,14 @@ write_spoof_cfg(){
   # The relay offers a carrier port and tunnel subnet no other tunnel here
   # uses; the foreign side offers the base values and must match the relay.
   local dcp=6262 nn=20
-  if [ "$role" = server ]; then dcp=$(next_free_int "carrier_port:$cproto" 6262 "$name"); nn=$(next_free_net "$name" 20); fi
-  local cport mtu jit jjson; cport=$(ask "Carrier port (udp/tcp, same on both ends)" "$dcp"); mtu=$(ask "MTU" "1320")
+  if [ "$role" = server ]; then
+    case "$cproto" in
+      udp|tcp) dcp=$(bnpy alloc port "$cproto" "$name") ;;
+      *)       dcp=$(next_free_int "carrier_port:$cproto" 6262 "$name") ;;
+    esac
+    nn=$(bnpy alloc net "$name")
+  fi
+  local cport mtu jit jjson; cport=$(auto_or_ask "$role" "Carrier port (udp/tcp, same on both ends)" "$dcp"); mtu=$(ask "MTU" "1320")
   # These go into the JSON unquoted: anything but a number in range would
   # leave a config the core cannot parse, so fall back to the default.
   case "$cport" in ''|*[!0-9]*) cport=$dcp ;; esac
@@ -621,7 +939,7 @@ write_spoof_cfg(){
   case "$mtu" in ''|*[!0-9]*) mtu=1320 ;; esac
   if [ "$mtu" -lt 576 ] || [ "$mtu" -gt 9000 ]; then warn "MTU must be 576-9000; using 1320"; mtu=1320; fi
   local dnn=$nn
-  nn=$(ask "Tunnel subnet: 10.10.N.x — N (same on both ends)" "$nn"); case "$nn" in ''|*[!0-9]*) nn=$dnn ;; esac
+  nn=$(auto_or_ask "$role" "Tunnel subnet: 10.10.N.x — N (same on both ends)" "$nn"); case "$nn" in ''|*[!0-9]*) nn=$dnn ;; esac
   if [ "$nn" -gt 255 ]; then warn "N must be 0-255; using $dnn"; nn=$dnn; fi
   jit=$(ask "TTL jitter? (anti-fingerprint) y/N" "N")
   local jline jtail; case "$jit" in y|Y) jline='
@@ -688,15 +1006,7 @@ EOF
   fi
   info "Saved $cfg"
   echo -e "  ${C_D}  proto=$cproto  spoof_src=$ssrc  spoof_dst=$sdst  encryption=$enc${C_N}"
-  if [ "$role" = server ]; then
-    # The foreign wizard offers the base carrier port and subnet; this relay
-    # may have picked others to stay clear of its other tunnels.
-    echo
-    echo -e "  ${C_B}Enter these on the OTHER (foreign) server:${C_N}"
-    echo -e "    carrier port   ${C_Y}$cport${C_N}"
-    echo -e "    subnet N       ${C_Y}$nn${C_N}   (10.10.$nn.x)"
-    [ "$enc" != none ] && echo -e "    token          ${C_Y}$token${C_N}"
-  fi
+  [ "$role" = server ] && show_pair_code "$cfg"
 }
 
 # check_bind warns when bind_addr names an address this machine does not have.
@@ -798,7 +1108,6 @@ write_tunnel_cfg(){
   # (see write_spoof_cfg). It only worked because the caller has its own $name.
   local role="$1" name="$2" tr="$3" enc="$4"
   local cfg="$CFG_DIR/$name.json"
-  PEER_HINT=""
   echo
   echo -e "  ${C_D}$tr is a point-to-point tunnel. Give the two servers' real IPs and${C_N}"
   echo -e "  ${C_D}the private addresses to use on the tunnel (any unused /30 works).${C_N}"
@@ -833,14 +1142,14 @@ write_tunnel_cfg(){
   # Only the relay picks free values: it is the side that carries several
   # tunnels. The foreign server usually has one and cannot know what the relay
   # picked, so it offers the base values; the relay prints what to enter.
-  local nn=30; [ "$role" = server ] && nn="$(next_free_net "$name")"
+  local nn=30; [ "$role" = server ] && nn="$(bnpy alloc net "$name")"
   local a1=10.10.$nn.1 a2=10.10.$nn.2
   if [ "$tr" = sit ]; then
     a1=fd00:10:$nn::1 a2=fd00:10:$nn::2
     echo -e "  ${C_D}sit carries IPv6: the tunnel addresses below must be IPv6.${C_N}"
   fi
-  tl=$(ask "This end's tunnel address" "$([ "$role" = server ] && echo $a1 || echo $a2)")
-  trr=$(ask "The OTHER end's tunnel address" "$([ "$role" = server ] && echo $a2 || echo $a1)")
+  tl=$(auto_or_ask "$role" "This end's tunnel address" "$([ "$role" = server ] && echo $a1 || echo $a2)")
+  trr=$(auto_or_ask "$role" "The OTHER end's tunnel address" "$([ "$role" = server ] && echo $a2 || echo $a1)")
   local mtu; mtu=$(ask "MTU (blank = auto)" "")
   case "$mtu" in ""|*[!0-9]*) mtu=0 ;; esac
 
@@ -857,10 +1166,9 @@ write_tunnel_cfg(){
         dk=1; while [[ "$keys" == *" $dk "* ]]; do dk=$((dk+1)); done
         echo -e "  ${C_D}Another $tr tunnel to $rip exists here: this one needs its own key.${C_N}"
       fi
-      k=$(ask "GRE key (0 = none, same on both ends)" "$dk"); case "$k" in ''|*[!0-9]*) k=$dk ;; esac
+      k=$(auto_or_ask "$role" "GRE key (0 = none, same on both ends)" "$dk"); case "$k" in ''|*[!0-9]*) k=$dk ;; esac
       if [ "$k" != 0 ]; then
         extra="\"gre_key\": $k,"
-        PEER_HINT="$PEER_HINT  gre key $k\n"
       elif [[ "$keys" == *" 0 "* ]]; then
         warn "Another keyless $tr tunnel to $rip exists — this one will not start without a key."
       fi
@@ -868,20 +1176,18 @@ write_tunnel_cfg(){
     l2tp)
       local tid sid en
       local dt=1000 ds=1000
-      [ "$role" = server ] && { dt=$(next_free_int l2tp_tunnel_id 1000 "$name"); ds=$(next_free_int l2tp_session_id 1000 "$name"); }
-      tid=$(ask "Tunnel id (same on both ends)" "$dt")
-      sid=$(ask "Session id (same on both ends)" "$ds")
-      PEER_HINT="$PEER_HINT  l2tp tunnel id $tid, session id $sid\n"
+      [ "$role" = server ] && { dt=$(bnpy alloc l2tpid "$name"); ds=$dt; }
+      tid=$(auto_or_ask "$role" "Tunnel id (same on both ends)" "$dt")
+      sid=$(auto_or_ask "$role" "Session id (same on both ends)" "$ds")
       en=$(ask "Encap  1)udp 2)ip" "1"); [ "$en" = 2 ] && en=ip || en=udp
       extra="\"l2tp_tunnel_id\": ${tid:-1000}, \"l2tp_session_id\": ${sid:-1000}, \"l2tp_encap\": \"$en\","
       if [ "$en" = udp ]; then
         # Over udp each l2tp tunnel on a server binds its own port: a second
         # one on a taken port fails with "Address already in use".
-        local dlp=1701 lp; [ "$role" = server ] && dlp=$(next_free_int "carrier_port:l2tp" 1701 "$name")
-        lp=$(ask "L2TP UDP port (same on both ends)" "$dlp"); case "$lp" in ''|*[!0-9]*) lp=$dlp ;; esac
+        local dlp=1701 lp; [ "$role" = server ] && dlp=$(bnpy alloc port udp "$name")
+        lp=$(auto_or_ask "$role" "L2TP UDP port (same on both ends)" "$dlp"); case "$lp" in ''|*[!0-9]*) lp=$dlp ;; esac
         if [ "$lp" -lt 1 ] || [ "$lp" -gt 65535 ]; then warn "Port must be 1-65535; using $dlp"; lp=$dlp; fi
         extra="$extra \"l2tp_port\": $lp,"
-        PEER_HINT="$PEER_HINT  l2tp udp port $lp\n"
       fi
       ;;
     udp|icmp)
@@ -894,13 +1200,15 @@ write_tunnel_cfg(){
       # Each tunnel on this server needs its own carrier port: a second udp
       # tunnel on a taken one cannot bind and will not start, and two icmp
       # tunnels with one identifier would receive each other's packets.
-      local dcp=6262; [ "$role" = server ] && dcp=$(next_free_int "carrier_port:$tr" 6262 "$name")
+      local dcp=6262
+      if [ "$role" = server ]; then
+        if [ "$tr" = udp ]; then dcp=$(bnpy alloc port udp "$name"); else dcp=$(next_free_int "carrier_port:$tr" 6262 "$name"); fi
+      fi
       local cport what="Carrier UDP port"; [ "$tr" = icmp ] && what="ICMP tunnel id"
-      cport=$(ask "$what (same on both ends)" "$dcp")
+      cport=$(auto_or_ask "$role" "$what (same on both ends)" "$dcp")
       case "$cport" in ''|*[!0-9]*) cport=$dcp ;; esac
       if [ "$cport" -lt 1 ] || [ "$cport" -gt 65535 ]; then warn "$what must be 1-65535; using $dcp"; cport=$dcp; fi
       extra="$extra\"carrier_port\": $cport,"
-      PEER_HINT="$PEER_HINT  ${what,,} $cport\n"
       ;;
   esac
 
@@ -929,8 +1237,8 @@ write_tunnel_cfg(){
   "log_level": "info"
 }
 EOF
-    info "Saved $cfg"; warn "Token for the client: ${C_Y}$token${C_N}"
-    print_peer_values "$rip" "$lip" "$trr" "$tl" "$token"
+    info "Saved $cfg"
+    show_pair_code "$cfg"
   else
     local target tdef=127.0.0.1
     # sit delivers IPv6 straight to this host; the service must listen on [::].
@@ -965,6 +1273,12 @@ create_tunnel(){
   echo; info "Create ${role^^} tunnel"
   name=$(ask "Instance name" "main"); name="$(echo "$name" | tr -cd 'A-Za-z0-9_-')"; [ -z "$name" ] && name=main
   if [ -f "$CFG_DIR/$name.json" ]; then local o; o=$(ask "'$name' exists. Overwrite? y/N" "N"); case "$o" in y|Y) :;; *) warn "Cancelled."; return;; esac; fi
+  if [ "$role" = client ]; then
+    echo -e "  ${C_D}Paste the pairing code the Iran server printed (starts with BN1:) and every${C_N}"
+    echo -e "  ${C_D}setting comes from it. Press Enter instead to set this tunnel up by hand.${C_N}"
+    local code; code=$(ask "Pairing code" "")
+    if [ -n "$code" ]; then client_from_code "$name" "$code"; return; fi
+  fi
   tr=$(pick_transport)
   [ -z "$tr" ] && { warn "Cancelled."; return; }
   enc=$(pick_encryption "$tr")
@@ -981,14 +1295,18 @@ create_tunnel(){
     if [ "$role" = server ]; then
       local bind="" remote="" addrline ports token qtotal qup qdown
       if [ "$dir" = direct ]; then
-        # This relay dials out; nothing listens here but the user ports.
+        # This relay dials out; nothing listens here but the user ports. The
+        # foreign server's listen port is picked at random from a quiet range
+        # so tunnels from several relays to one foreign server do not collide
+        # (it checks the port is free when the pairing code is applied there).
+        local dport; dport=$(bnpy alloc port "$bproto" "$name")
         while [ -z "$remote" ]; do
-          remote=$(ask_hostport "Foreign server address it listens on (IP:port)" 8443)
+          remote=$(ask_hostport "Foreign server IP (it will listen on port $dport)" "$dport")
           [ -z "$remote" ] && warn "Required: the foreign server's real IP (and the port it will listen on)."
         done
         addrline="\"remote_addr\": \"$remote\","
       else
-        bind=$(ask "Tunnel listen address (host:port)" "0.0.0.0:8443")
+        bind=$(ask "Tunnel listen address (host:port)" "0.0.0.0:$(next_free_port 8443 "$bproto" "$name")")
         bind="$(check_bind "$bind")"
         addrline="\"bind_addr\": \"$bind\","
       fi
@@ -1023,9 +1341,10 @@ create_tunnel(){
   "log_level": "info"
 }
 EOF
-      info "Saved $cfg"; warn "Token for the client: ${C_Y}$token${C_N}"
+      info "Saved $cfg"
       if [ "$dir" = direct ]; then server_summary_direct "$remote" "$ports" "$bproto"
       else server_summary "$bind" "$ports"; fi
+      show_pair_code "$cfg"
     else
       local remote="" bind="" addrline token target
       if [ "$dir" = direct ]; then
@@ -1084,6 +1403,12 @@ link_state(){
     "")                 printf "%b" "${C_D}no events yet${C_N}" ;;
     *"TUNNEL IS DOWN"*) printf "%b" "${C_R}● no peer${C_N}" ;;
     *"🟢 Connected"*)   printf "%b" "${C_G}● connected${C_N}" ;;
+    # mtcp closes links it no longer needs; the relay logs each one, with how
+    # many are left. Links left means the tunnel is up.
+    *"🔴 Disconnected"*" link(s) left"*)
+      if [[ "$last" =~ ·\ ([0-9]+)\ link\(s\)\ left ]] && [ "${BASH_REMATCH[1]}" -gt 0 ]; then
+        printf "%b" "${C_G}● connected${C_N}"
+      else printf "%b" "${C_Y}● disconnected${C_N}"; fi ;;
     *"🔴 Disconnected"*) printf "%b" "${C_Y}● disconnected${C_N}" ;;
     *)                  printf "%b" "${C_D}unknown${C_N}" ;;
   esac
@@ -1821,6 +2146,7 @@ manage_tunnels(){
       echo "   7) Delete   8) Live stats"
       echo -e "   ${C_G}9) Change transport${C_N}   ${C_G}10) Change peer IP${C_N}   ${C_G}11) Tune settings (MTU/FEC/window...)${C_N}"
       echo -e "   ${C_G}12) Duplicate UDP packets${C_N}  ${C_D}[$(udp_dup_state "$n")]${C_N}   ${C_G}13) Change direction${C_N}  ${C_D}[$(tunnel_direction "$CFG_DIR/$n.json")]${C_N}"
+      echo -e "   ${C_G}14) Pairing code${C_N}  ${C_D}(for setting up the foreign server)${C_N}"
       echo "   0) Back"
       case "$(menu_ask 'Choice')" in
         1) systemctl enable --now "brokennode@$n" >/dev/null 2>&1; systemctl start "brokennode@$n"; info "started";;
@@ -1837,6 +2163,8 @@ manage_tunnels(){
         11) tune_tunnel "$n";;
         12) toggle_udp_duplicate "$n";;
         13) change_direction "$n";;
+        14) if [ "$(jget "$CFG_DIR/$n.json" mode)" = server ]; then show_pair_code "$CFG_DIR/$n.json"; else warn "Pairing codes come from the Iran (server) side."; fi
+            read -t 60 -rp "  ▶ press ENTER to continue... " _;;
         __eof__) return;;
         0) break;;
         *) warn "Invalid.";;
