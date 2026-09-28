@@ -8,7 +8,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.3.9"
+VERSION="2.3.10"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -1550,6 +1550,11 @@ stats_page(){
       out+="    Service: ${C_G}active${C_N}   ${role} · ${L[transport]:-}   up $(printf '%dh%02dm%02ds' $((upt/3600)) $((upt%3600/60)) $((upt%60)))\n"
       if [ "${L[src]:-}" = dev ]; then
         local dst="gone"; [ -n "${L[dev]:-}" ] && dst=$(cat "/sys/class/net/${L[dev]:-}/operstate" 2>/dev/null || echo gone)
+        # Tunnel devices have no carrier to report and say "unknown" while up.
+        if [ "$dst" = unknown ]; then
+          local fl; fl=$(cat "/sys/class/net/${L[dev]:-}/flags" 2>/dev/null)
+          [ -n "$fl" ] && [ $(( fl & 1 )) -eq 1 ] && dst=up
+        fi
         out+="    Device : ${L[dev]:-none yet} (${dst})\n"
       else
         local lk="${L[links]:--1}"

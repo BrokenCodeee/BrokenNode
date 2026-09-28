@@ -4,7 +4,7 @@
 
 **Multi-protocol tunnel, reverse or direct — compiled and ready to run.**
 
-`v2.3.9`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
+`v2.3.10`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
 
 **[English](#english)**  ·  **[فارسی](#فارسی)**
 
@@ -255,6 +255,15 @@ it, and give up a few percent of bandwidth to get far more back in latency.
 
 Forwarded UDP sockets are marked DSCP EF and given interactive priority, so a
 download through the same relay cannot queue in front of a game.
+
+**Games next to busy users (2.3.10).** On the stream transports a game's UDP
+packets used to wait behind everyone else's downloads inside the tunnel;
+with 100 people browsing over one tcp link, games lost 72% of their packets
+and the rest arrived 11-20 seconds late. Each UDP session now has its own
+queue that is sent in one piece whenever its turn comes, and a packet that is
+already half a second late is dropped instead of delivered: measured with the
+same load, loss under 1% and ping 250 ms on tcp, 140 ms on mtcp, 97 ms on
+udp (80 ms path).
 
 ## Duplicate UDP packets
 
@@ -605,6 +614,13 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 </div>
 
 <div dir="rtl">
+
+**بازی کنار کاربرهای پرمصرف (2.3.10).** روی ترنسپورت‌های جریانی، بسته‌های UDP
+بازی داخل تانل پشت دانلود بقیه منتظر می‌ماندند؛ با ۱۰۰ نفر در حال وب‌گردی روی یک
+لینک tcp، بازی‌ها ۷۲٪ بسته‌ها را از دست می‌دادند و بقیه ۱۱ تا ۲۰ ثانیه دیر
+می‌رسید. حالا هر نشست UDP صف خودش را دارد که هر نوبت یک‌جا فرستاده می‌شود، و بسته‌ای
+که نیم ثانیه دیر شده به‌جای رسیدن دیرهنگام دور ریخته می‌شود: با همان بار، loss زیر
+۱٪ و پینگ ۲۵۰ میلی‌ثانیه روی tcp، ۱۴۰ روی mtcp و ۹۷ روی udp (مسیر ۸۰ میلی‌ثانیه).
 
 بخش **Health check** در منو حالا **جیتر** را هم گزارش می‌کند، نه فقط میانگین
 پینگ. عددی که باید نگاه کنی همین است: ۸۰ میلی‌ثانیهٔ ثابت بهتر از ۶۰ است که
