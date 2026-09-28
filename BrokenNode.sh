@@ -8,10 +8,10 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.3.8"
+VERSION="2.3.9"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
-TUNE_VERSION=2
+TUNE_VERSION=3
 BIN="/usr/local/bin/brokennode"
 CFG_DIR="/etc/brokennode"
 TPL="/etc/systemd/system/brokennode@.service"
@@ -760,9 +760,14 @@ pick_transport(){
         # Measured: with 0.3% packet loss on an 80ms path, quic carried 4-5
         # Mbit in total and 0.1 Mbit per download, where the TCP carriers
         # carried 220 (its congestion control backs off on every random loss).
+        # And with NO loss: traffic one way fills the path's queue, the RTT
+        # the other way rises, quic-go's hybrid slow start takes that for
+        # congestion and leaves slow start with a ~40 KB window that then
+        # grows one packet per round trip — about 10 Mbit (measured, 2.3.9).
         {
           echo -e "  ${C_Y}[!]${C_N} quic slows to a crawl when the path loses packets — as paths in Iran do"
           echo -e "      ${C_D}(tested: 0.3% loss → about 5 Mbit in total). mtcp or kcp hold up far better.${C_N}"
+          echo -e "      ${C_D}Even with no loss, while users download, its upload direction stays near 10 Mbit.${C_N}"
         } >&2
         local qc; qc=$(ask "Use quic anyway? y/N" "N")
         case "$qc" in y|Y) echo quic; return ;; *) continue ;; esac ;;
@@ -1476,42 +1481,203 @@ live_logs(){
   echo -e "\n${C_G}  ← back to menu${C_N}"; sleep 0.3
 }
 
-# stats_page: live per-tunnel traffic (upload/download/total + connections),
-# refreshed from the core's stats file. Ctrl+C returns to the menu.
+# hr_rate BYTES_PER_SEC -> "12.4 Mbit/s" (network speeds are quoted in bits).
+hr_rate(){
+  awk -v b="${1:-0}" 'BEGIN{ x=b*8; u="bit/s";
+    if(x>=1000){x/=1000;u="Kbit/s"} if(x>=1000){x/=1000;u="Mbit/s"} if(x>=1000){x/=1000;u="Gbit/s"}
+    if(u=="bit/s")printf "%d %s",x,u; else printf "%.1f %s",x,u }'
+}
+
+# stats_page: live traffic for one tunnel, redrawn IN PLACE once a second.
+#
+# It used to clear the screen and redraw every 2 seconds from the 30-second
+# lifetime file, which only the Iran relay writes: on the foreign server, and
+# for gre/ipip/l2tp/udp/icmp whose traffic never passes a user socket, that file
+# never existed, so the page flashed "No stats yet" for ever. The core (2.3.9+)
+# now writes /run/brokennode/<name>.live every second on BOTH ends for EVERY
+# transport; this page turns two samples into a speed. Any key or Ctrl+C
+# returns to the menu.
 stats_page(){
-  local n="$1" unit="brokennode@$1" f="/var/lib/brokennode/$1.stats"
-  local leave=0
-  # Ctrl+C must LEAVE this page, as the on-screen hint promises. The previous
-  # trap made SIGINT a no-op (':'), so pressing Ctrl+C only cut the sleep short
-  # and the "while true" loop kept redrawing forever — the page was inescapable
-  # and the "trap - INT" below was unreachable. Set a flag the loop can see.
+  local n="$1" unit="brokennode@$1" lf="/run/brokennode/$1.live" sf="/var/lib/brokennode/$1.stats"
+  local leave=0 key k
+  local pts=0 pup=0 pdown=0 rup=0 rdown=0 mup=0 mdown=0 hist=()
   trap 'leave=1' INT
+  # The header is drawn once; each frame is then drawn from a fixed row
+  # below it. (Saving and restoring the cursor broke on a short terminal:
+  # the first frame scrolled the screen and every later one landed higher.)
+  local hdr
+  hdr="$(banner; echo -e "${C_B}  Live stats: $n${C_N}   ${C_D}(any key or Ctrl+C = back)${C_N}"; echo -e "  ${C_D}──────────────────────────────────────────────${C_N}")"
+  clear 2>/dev/null || true
+  printf '%s\n' "$hdr"
+  local top; top=$(printf '%s\n' "$hdr" | wc -l)
+  tput civis 2>/dev/null   # no blinking cursor jumping around
   while [ "$leave" -eq 0 ]; do
-    banner
-    echo -e "${C_B}  Live stats: $n${C_N}   ${C_D}[$(systemctl is-active "$unit" 2>/dev/null)]  (Ctrl+C = back)${C_N}"
-    echo -e "  ${C_D}──────────────────────────────────────────────${C_N}"
-    if [ -f "$f" ]; then
-      local lup ldown ltot sup sdown stot atcp audp peak conns ts age
-      lup=$(sed -n 's/^life_up=//p' "$f");     ldown=$(sed -n 's/^life_down=//p' "$f");   ltot=$(sed -n 's/^life_total=//p' "$f")
-      sup=$(sed -n 's/^sess_up=//p' "$f");     sdown=$(sed -n 's/^sess_down=//p' "$f");   stot=$(sed -n 's/^sess_total=//p' "$f")
-      atcp=$(sed -n 's/^active_tcp=//p' "$f"); audp=$(sed -n 's/^active_udp=//p' "$f")
-      peak=$(sed -n 's/^peak=//p' "$f");       conns=$(sed -n 's/^conns=//p' "$f");       ts=$(sed -n 's/^ts=//p' "$f")
-      age=$(( $(date +%s) - ${ts:-0} ))
-      echo -e "    ${C_B}Lifetime${C_N} ${C_D}(survives restarts & reboots)${C_N}"
-      printf "      ↑ %s   ↓ %s   total %s\n" "$(hb "${lup:-0}")" "$(hb "${ldown:-0}")" "$(hb "${ltot:-0}")"
-      echo -e "    ${C_B}This session${C_N}"
-      printf "      ↑ %s   ↓ %s   total %s\n" "$(hb "${sup:-0}")" "$(hb "${sdown:-0}")" "$(hb "${stot:-0}")"
-      echo -e "  ${C_D}──────────────────────────────────────────────${C_N}"
-      printf "    Active connections : %s  (tcp %s, udp %s)\n" "$(( ${atcp:-0} + ${audp:-0} ))" "${atcp:-0}" "${audp:-0}"
-      printf "    Peak / total seen  : %s / %s\n" "${peak:-0}" "${conns:-0}"
-      echo -e "  ${C_D}  (updated ${age}s ago; core writes stats every 30s)${C_N}"
-    else
-      echo "    No stats yet — start the tunnel; the core writes stats every 30s."
+    local out="" st; st=$(systemctl is-active "$unit" 2>/dev/null); [ -z "$st" ] && st=unknown
+    local now; now=$(date +%s)
+    declare -A L=()
+    if [ -f "$lf" ]; then
+      while IFS='=' read -r k v; do [ -n "$k" ] && L[$k]="$v"; done < "$lf"
     fi
-    sleep 2
+    local ts="${L[ts]:-0}" age=$(( now - ${L[ts]:-0} ))
+    if [ "$st" != active ]; then
+      out+="    Service: ${C_R}${st}${C_N} — the tunnel is not running. Start it from this menu.\n"
+      pts=0
+    elif [ ! -f "$lf" ] || [ "$age" -gt 5 ]; then
+      out+="    Service: ${C_G}active${C_N}\n"
+      if [ ! -f "$lf" ] && [ -f "$sf" ]; then
+        out+="    ${C_Y}The running core is older than this manager and has no live counters.${C_N}\n"
+        out+="    ${C_D}Update (main menu → Update) and restart the tunnel for live speeds.${C_N}\n"
+        out+="    Lifetime traffic: $(hb "$(sed -n 's/^life_total=//p' "$sf")")\n"
+      else
+        out+="    ${C_Y}Waiting for the core's first counters…${C_N}\n"
+        out+="    ${C_D}(If this stays, the core is older than 2.3.9: update, then restart.)${C_N}\n"
+      fi
+    else
+      local up="${L[up]:-0}" down="${L[down]:-0}"
+      if [ "$pts" -gt 0 ] && [ "$ts" -gt "$pts" ]; then
+        local dt=$(( ts - pts ))
+        rup=$(( (up - pup) / dt )); rdown=$(( (down - pdown) / dt ))
+        [ "$rup" -lt 0 ] && rup=0; [ "$rdown" -lt 0 ] && rdown=0
+        [ "$rup" -gt "$mup" ] && mup=$rup; [ "$rdown" -gt "$mdown" ] && mdown=$rdown
+        # a 40-second picture of the download speed, scaled to its own peak
+        local bars=(▁ ▂ ▃ ▄ ▅ ▆ ▇ █) lvl=0
+        [ "$mdown" -gt 0 ] && lvl=$(( rdown * 7 / mdown ))
+        hist+=("${bars[$lvl]}"); [ "${#hist[@]}" -gt 40 ] && hist=("${hist[@]: -40}")
+      fi
+      if [ "$ts" -gt "$pts" ]; then pts=$ts; pup=$up; pdown=$down; fi
+      local role="foreign server"; [ "${L[role]:-}" = server ] && role="Iran relay"
+      local upt=$(( now - ${L[started]:-$now} ))
+      out+="    Service: ${C_G}active${C_N}   ${role} · ${L[transport]:-}   up $(printf '%dh%02dm%02ds' $((upt/3600)) $((upt%3600/60)) $((upt%60)))\n"
+      if [ "${L[src]:-}" = dev ]; then
+        local dst="gone"; [ -n "${L[dev]:-}" ] && dst=$(cat "/sys/class/net/${L[dev]:-}/operstate" 2>/dev/null || echo gone)
+        out+="    Device : ${L[dev]:-none yet} (${dst})\n"
+      else
+        local lk="${L[links]:--1}"
+        if [ "$lk" -gt 0 ]; then out+="    Links  : ${C_G}${lk} up${C_N}\n"
+        elif [ "$lk" -eq 0 ]; then out+="    Links  : ${C_R}0 up — not connected to the other server${C_N}\n"; fi
+      fi
+      out+="  ${C_D}──────────────────────────────────────────────${C_N}\n"
+      out+="    ${C_B}Speed now${C_N}    ↓ download $(hr_rate "$rdown")   ↑ upload $(hr_rate "$rup")\n"
+      out+="    ${C_D}Peak here${C_N}    ↓ $(hr_rate "$mdown")   ↑ $(hr_rate "$mup")\n"
+      out+="    ${C_D}↓ history${C_N}    $(printf '%s' "${hist[@]}")\n"
+      out+="    ${C_B}This run${C_N}     ↓ $(hb "$down")   ↑ $(hb "$up")   total $(hb $(( up + down )))\n"
+      if [ -n "${L[life_up]:-}" ]; then
+        out+="    ${C_B}Lifetime${C_N}     ↓ $(hb "${L[life_down]:-}")   ↑ $(hb "${L[life_up]:-}")   ${C_D}(survives restarts)${C_N}\n"
+      fi
+      if [ "${L[src]:-}" != dev ]; then
+        out+="    Users now    $(( ${L[active_tcp]:-0} + ${L[active_udp]:-0} ))  (tcp ${L[active_tcp]:-0}, udp ${L[active_udp]:-0})   peak ${L[peak]:-0} · total ${L[conns]:-0}\n"
+      else
+        out+="    ${C_D}Kernel/packet tunnel: speeds are the tunnel device's own counters.${C_N}\n"
+      fi
+    fi
+    # Redraw over the previous frame instead of clearing: no flashing. Only
+    # as many lines as the terminal has room for, so nothing ever scrolls.
+    local rows; rows=$(tput lines 2>/dev/null || echo 40)
+    local room=$(( rows - top - 1 )); [ "$room" -lt 3 ] && room=3
+    tput cup "$top" 0 2>/dev/null || printf '\033[%d;1H' $(( top + 1 ))
+    printf '%b' "$out" | head -n "$room" | sed 's/$/\x1b[K/'
+    printf '\033[J'
+    unset L
+    # Waits one second, or returns at once on a key press.
+    if [ -t 0 ]; then
+      if read -rsn1 -t 1 key 2>/dev/null; then
+        leave=1
+        # An arrow or function key is several bytes: take the rest too, or
+        # the menu reads them next and answers "Invalid."
+        while read -rsn1 -t 0.05 key 2>/dev/null; do :; done
+      fi
+    else
+      leave=1   # no terminal to watch or to press a key on: one frame
+    fi
   done
+  tput cnorm 2>/dev/null
   trap - INT
   echo -e "\n${C_G}  ← back to menu${C_N}"; sleep 0.3
+}
+
+# speed_test NAME: ping, jitter, download and upload THROUGH the tunnel, with
+# its own transport (core: `brokennode speedtest`). The numbers are what the
+# users get, so running it on each transport shows which one suits this path.
+# Every result is kept in $CFG_DIR/.speedtests, and the last ones are listed
+# side by side for comparison.
+speed_test(){
+  local n="$1" cfg="$CFG_DIR/$1.json" hist="$CFG_DIR/.speedtests"
+  local tr role; tr="$(jget "$cfg" transport)"; role="$(jget "$cfg" mode)"
+  echo
+  echo -e "${C_B}  Speed test: $n  (${tr})${C_N}"
+  echo -e "  ${C_D}──────────────────────────────────────────────${C_N}"
+  local cv; cv="$(core_version "$BIN")"
+  if [ -n "$cv" ] && version_lt "$cv" 2.3.9; then
+    warn "The installed core ($cv) has no speed test — update (main menu → Update) first."
+    return
+  fi
+  if [ "$(systemctl is-active "brokennode@$n" 2>/dev/null)" != active ]; then
+    warn "The tunnel is not running — start it first (option 1)."
+    return
+  fi
+  case "$tr" in
+    gre|gretap|ipip|sit|l2tp|udp|icmp|spoof) : ;;
+    *) if [ "$role" != server ]; then
+         warn "For $tr the test runs on the Iran relay (the server that forwards the users' ports)."
+         echo -e "  ${C_D}Its tunnel opens the test streams and this server answers them. Open this menu there.${C_N}"
+         return
+       fi ;;
+  esac
+  # The path itself, outside the tunnel: the floor the tunnel is measured against.
+  local peer; peer="$(jget "$cfg" remote_ip)"
+  [ -z "$peer" ] && { peer="$(jget "$cfg" remote_addr)"; peer="${peer%:*}"; peer="${peer#[}"; peer="${peer%]}"; }
+  local pavg="" ploss=""
+  if [ -n "$peer" ] && command -v ping >/dev/null 2>&1; then
+    echo -e "  ${C_D}Path to $peer outside the tunnel (10 pings)…${C_N}"
+    local pres; pres="$(ping -c 10 -i 0.2 -w 6 "$peer" 2>/dev/null | tail -2)"
+    ploss="$(printf '%s' "$pres" | sed -n 's/.*, \([0-9.]*\)% packet loss.*/\1/p')"
+    pavg="$(printf '%s' "$pres" | sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p')"
+    if [ -n "$pavg" ]; then echo "  path   ping ${pavg}ms   loss ${ploss}%"
+    else echo -e "  ${C_D}  (the other server does not answer ping — fine, the test below does not need it)${C_N}"; fi
+  fi
+  local secs streams
+  secs=$(ask "Seconds per direction (3-30)" "10"); case "$secs" in ''|*[!0-9]*) secs=10 ;; esac
+  streams=$(ask "Parallel streams (1 = one user, 8 = many users)" "4"); case "$streams" in ''|*[!0-9]*) streams=4 ;; esac
+  echo
+  local out ttyf=""
+  [ -t 2 ] && ttyf=-tty
+  out="$("$BIN" speedtest -c "$cfg" -t "$secs" -p "$streams" $ttyf 2>&1 | tee /dev/stderr)"
+  local res; res="$(printf '%s\n' "$out" | sed -n 's/.*RESULT //p' | tail -n 1)"
+  if [ -z "$res" ]; then
+    echo; warn "No result — see the message above."
+    return
+  fi
+  local tping tjit down up
+  tping="$(printf '%s' "$res" | sed -n 's/.*ping=\([0-9.]*\)ms.*/\1/p')"
+  tjit="$(printf '%s' "$res" | sed -n 's/.*jitter=\([0-9.]*\)ms.*/\1/p')"
+  down="$(printf '%s' "$res" | sed -n 's/.*down=\([0-9.]*\)Mbit.*/\1/p')"
+  up="$(printf '%s' "$res" | sed -n 's/.*up=\([0-9.]*\)Mbit.*/\1/p')"
+  echo
+  echo -e "  ${C_B}Result${C_N}  ↓ ${C_G}${down} Mbit/s${C_N}   ↑ ${C_G}${up} Mbit/s${C_N}   ping ${tping}ms   jitter ${tjit}ms"
+  # What the numbers say.
+  if [ -n "$pavg" ]; then
+    local extra; extra=$(awk -v a="$tping" -v b="$pavg" 'BEGIN{printf "%.0f", a-b}')
+    if [ "$extra" -gt 30 ]; then warnln "The tunnel adds ${extra}ms over the bare path — the tunnel or its links are queueing. Try mtcp or tcpnomux."
+    else okln "The tunnel adds ${extra}ms over the bare path."; fi
+    if awk -v l="${ploss:-0}" 'BEGIN{exit !(l > 2)}'; then warnln "The path loses ${ploss}% of packets: kcp or udp copes with loss best; quic suffers most."; fi
+  fi
+  if awk -v d="$down" 'BEGIN{exit !(d < 20)}'; then
+    case "$tr" in
+      quic) warnln "quic slows down sharply on lossy paths. Compare with mtcp or tcp (option 9 changes the transport)." ;;
+      *) warnln "Low speed: run the test again with another transport (option 9) and compare below." ;;
+    esac
+  fi
+  if awk -v j="$tjit" 'BEGIN{exit !(j > 20)}'; then warnln "High jitter: games and calls will feel it. Try the udp transport or the gaming profile."; fi
+  local dir; dir="$(jget "$cfg" direction)"
+  printf '%s %s %s %s down=%s up=%s ping=%s jitter=%s streams=%s\n' "$(date '+%Y-%m-%d %H:%M')" "$n" "$tr" "${dir:-reverse}" \
+    "$down" "$up" "$tping" "$tjit" "$streams" >> "$hist" 2>/dev/null
+  tail -n 200 "$hist" > "$hist.tmp" 2>/dev/null && mv "$hist.tmp" "$hist"
+  echo
+  echo -e "  ${C_B}Recent results${C_N} ${C_D}(all tunnels on this server — compare transports)${C_N}"
+  printf "  %-16s %-12s %-9s %9s %9s %8s %7s\n" "when" "tunnel" "transport" "↓ Mbit" "↑ Mbit" "ping" "jitter"
+  tail -n 8 "$hist" | while read -r d t nm tt dir dn u p j st; do
+    printf "  %-16s %-12s %-9s %9s %9s %8s %7s\n" "$d $t" "$nm" "$tt" "${dn#down=}" "${u#up=}" "${p#ping=}" "${j#jitter=}"
+  done
 }
 
 okln(){   echo -e "  ${C_G}✔${C_N} $*"; }
@@ -2042,6 +2208,11 @@ tune_tunnel(){
       v=$(ask "  kcp_sndwnd (send window, packets) [${cur:-auto}]" ""); [ -n "$v" ] && jset "$cfg" kcp_sndwnd "$v" int
       cur="$(jget "$cfg" kcp_rcvwnd)"
       v=$(ask "  kcp_rcvwnd (recv window, packets) [${cur:-auto}]" ""); [ -n "$v" ] && jset "$cfg" kcp_rcvwnd "$v" int
+      cur="$(jget "$cfg" links)"
+      echo -e "  ${C_D}Parallel kcp links (0 = auto: 4). One kcp link tops out near 120 Mbit/s for all users;${C_N}"
+      echo -e "  ${C_D}4 carry about twice as much. 1 gives the steadiest ping under heavy load (gaming).${C_N}"
+      echo -e "  ${C_D}Set it on the end that dials (the foreign server, or the relay in direct mode).${C_N}"
+      v=$(ask "  links [${cur:-0}]" ""); [ -n "$v" ] && jset "$cfg" links "$v" int
       ;;
     mtcp|mtcpobf)
       cur="$(jget "$cfg" links)"
@@ -2147,6 +2318,7 @@ manage_tunnels(){
       echo -e "   ${C_G}9) Change transport${C_N}   ${C_G}10) Change peer IP${C_N}   ${C_G}11) Tune settings (MTU/FEC/window...)${C_N}"
       echo -e "   ${C_G}12) Duplicate UDP packets${C_N}  ${C_D}[$(udp_dup_state "$n")]${C_N}   ${C_G}13) Change direction${C_N}  ${C_D}[$(tunnel_direction "$CFG_DIR/$n.json")]${C_N}"
       echo -e "   ${C_G}14) Pairing code${C_N}  ${C_D}(for setting up the foreign server)${C_N}"
+      echo -e "   ${C_G}15) Speed test${C_N}  ${C_D}(download/upload/ping through this tunnel)${C_N}"
       echo "   0) Back"
       case "$(menu_ask 'Choice')" in
         1) systemctl enable --now "brokennode@$n" >/dev/null 2>&1; systemctl start "brokennode@$n"; info "started";;
@@ -2165,6 +2337,7 @@ manage_tunnels(){
         13) change_direction "$n";;
         14) if [ "$(jget "$CFG_DIR/$n.json" mode)" = server ]; then show_pair_code "$CFG_DIR/$n.json"; else warn "Pairing codes come from the Iran (server) side."; fi
             read -t 60 -rp "  ▶ press ENTER to continue... " _;;
+        15) speed_test "$n"; read -t 120 -rp "  ▶ press ENTER to continue... " _;;
         __eof__) return;;
         0) break;;
         *) warn "Invalid.";;
@@ -2336,7 +2509,24 @@ net.core.netdev_max_backlog = 16384
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 net.ipv4.ip_local_port_range = 1024 65535
+# Room for hundreds of thousands of users: every user is an open socket on
+# each server (and an entry in the connection-tracking table wherever NAT or a
+# firewall is in use: the kernel tunnels' port forwarding always is). Linux's
+# defaults stop at 1 million files per process and 65536-262144 tracked
+# connections, and a full table silently drops new connections. (fs.file-max
+# is left alone: current kernels already set it to the maximum.) The conntrack
+# lines only apply while nf_conntrack is loaded, which at boot it may not be
+# yet: the core raises the table itself when it starts.
+fs.nr_open = 4194304
+net.netfilter.nf_conntrack_tcp_timeout_established = 7200
+net.ipv4.tcp_max_orphans = 262144
 EOC
+  # The table size follows RAM (an entry is ~300 bytes: RAM/8192 keeps even a
+  # full table under 4% of memory), the same rule the core applies itself.
+  local kb; kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)
+  local ct=$(( ${kb:-1048576} * 1024 / 8192 ))
+  [ "$ct" -lt 131072 ] && ct=131072; [ "$ct" -gt 2097152 ] && ct=2097152
+  echo "net.netfilter.nf_conntrack_max = $ct"
 }
 
 apply_sysctl_gaming(){

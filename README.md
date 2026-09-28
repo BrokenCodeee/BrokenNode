@@ -4,7 +4,7 @@
 
 **Multi-protocol tunnel, reverse or direct — compiled and ready to run.**
 
-`v2.3.8`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
+`v2.3.9`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
 
 **[English](#english)**  ·  **[فارسی](#فارسی)**
 
@@ -144,8 +144,8 @@ encryption layer decides what they look like on the way.
 | `mptcp` | *Experimental.* Kernel Multipath TCP: one connection across every path. Prefer `mtcp` | Linux ≥ 5.6, `net.mptcp.enabled=1` on both |
 | `ws` | WebSocket, looks like HTTP | — |
 | `tcpnomux` | One pooled TCP connection per user | — |
-| `kcp` | KCP over UDP with FEC | usable UDP |
-| `quic` | QUIC, TLS 1.3 built in. **Collapses to ~1 Mbit/s on a lossy path** — use `kcp` or `mtcp` there | clean UDP, near-zero loss |
+| `kcp` | KCP over UDP with FEC; 4 parallel sessions by default (`links`) | usable UDP |
+| `quic` | QUIC, TLS 1.3 built in. **Collapses to ~1 Mbit/s on a lossy path, and its upload stalls near 10 Mbit/s while users download** — use `kcp` or `mtcp` | clean UDP, near-zero loss |
 | `sctp` | Multi-stream, multihomed across several source IPs | kernel `sctp` module |
 | `gre` / `gretap` | Kernel GRE (L3 / L2). Highest throughput | `ip_gre` module, root |
 | `ipip` | Kernel IP-in-IP. Lowest overhead, IPv4 only | `ipip` module, root |
@@ -159,10 +159,25 @@ should be encrypted.
 
 | Situation | Use |
 |---|---|
-| Maximum bandwidth | `mtcp` + `aead` |
-| Gaming, low and stable ping | `kcp` |
+| Maximum bandwidth | `udp`/`icmp` (if UDP or ping passes), else `mtcp` + `aead` |
+| Gaming, low and stable ping | `kcp` with `kcp_mode` gaming, or `udp` |
 | One heavy stream (backup, large file) | `tcpnomux` |
 | Deep packet inspection blocking everything | `ws` + `aead`, or `spoof` |
+
+Measured in 2.3.9 on an emulated Iran-like path (80 ms, 0.3% loss, 500 Mbit/s)
+with 300 users at once, 10 of them downloading and 5 uploading without pause:
+
+| | ↓ Mbit/s | ↑ Mbit/s | ping, median | ping, 95% |
+|---|---|---|---|---|
+| no tunnel at all | 460 | 425 | 144 ms | 489 ms |
+| `udp`, `icmp` | 453 | 402 | 145 ms | 490 ms |
+| `mtcp` | 449 | 446 | 102 ms | 293 ms |
+| `tcpnomux` | 458 | 399 | 142 ms | 495 ms |
+| `kcp` (4 links) | 160 | 256 | 369 ms | 690 ms |
+| `tcp`, `ws` (one link) | 140 | 136 | 240 ms | 340 ms |
+
+Your path is not this one: run the **speed test** (below) on each candidate
+and keep the one that does best on yours.
 
 `quic` takes no encryption layer — it already uses TLS 1.3 internally. The
 kernel tunnels (`gre`, `gretap`, `ipip`, `sit`, `l2tp`) take none either: the
@@ -198,6 +213,21 @@ on the Iran server). Two of the **same** type:
 | stream transports | yes | its own port |
 
 Use the same values on both servers; the Iran server's manager prints them.
+
+## Speed test and live stats
+
+**Speed test** (Manage tunnels → a tunnel → 15) measures ping, jitter,
+download and upload *through the tunnel*, with its own transport and
+encryption, so the numbers are what your users get. It first pings the other
+server outside the tunnel, so you see what the tunnel adds, and it keeps every
+result: the table at the end lists the last runs of all tunnels side by side,
+which is how you compare transports on your own path. Stream transports run it
+on the Iran server; `gre`, `ipip`, `l2tp`, `udp`, `icmp` and `spoof` on either.
+Both servers need 2.3.9 or newer.
+
+**Live stats** (→ 8) shows the speed right now, the peak, a 40-second
+history, the links that are up and the users connected, on both servers and for
+every transport. It updates in place once a second; any key goes back.
 
 ## Tuning for games
 
@@ -272,6 +302,15 @@ pool grows and shrinks with live load.
 The traffic **quota** is opt-in and unlimited by default. It does nothing at all
 unless you set one.
 
+Tested in 2.3.9: 18,000 users at once on one tunnel, 80 of them moving data
+flat out (about 6 Gbit/s down and 5 Gbit/s up on a 4-core machine), for 5
+minutes without a single dropped user and with steady latency; memory settled
+near 1 GB and fell back when the users left. What decides how many users one
+server holds is its RAM (about 30 KB per idle user, more while they move data)
+and its file limit, which the service raises. On the foreign server, when every
+source port toward a local service (`127.0.0.1:port`) is taken — about 64,000
+users — new users are dialed from another `127.x` address instead of failing.
+
 ## Command line
 
 The manager covers everything, but the core takes commands directly:
@@ -281,6 +320,7 @@ brokennode -c /etc/brokennode/main.json   # run a tunnel from a config
 brokennode -gen server                    # print a sample server config
 brokennode -gen client                    # print a sample client config
 brokennode -transports                    # list transports and encryption layers
+brokennode speedtest -c /etc/brokennode/main.json [-t 10] [-p 4]
 brokennode version
 ```
 
@@ -297,7 +337,8 @@ Stream transports: `direction` (`reverse` default, or `direct`); the end that
 listens sets `bind_addr`, the end that connects sets `remote_addr` — the relay
 listens in reverse mode, the foreign server in direct mode.
 
-Per-transport: `pool_size`, `pool_min_idle`, `links`, `links_max`,
+Per-transport: `pool_size`, `pool_min_idle`, `links` (mtcp; for kcp the
+number of parallel sessions, default 4, 1 in gaming mode), `links_max`,
 `links_per_link`, `kcp_mode`, `kcp_data`, `kcp_parity`, `kcp_mtu`, `kcp_sndwnd`,
 `kcp_rcvwnd`, `smux_recv_mb`, `smux_stream_mb`, `smux_frame_kb`, `server_name`, `alpn`,
 `sctp_streams`, `sctp_multihoming`
@@ -474,8 +515,8 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 | `mptcp` | *آزمایشی.* Multipath TCP کرنل: یک اتصال روی همهٔ مسیرها. `mtcp` بهتر است | لینوکس ≥ 5.6 و `net.mptcp.enabled=1` روی هر دو سرور |
 | `ws` | وب‌سوکت، شبیه HTTP | — |
 | `tcpnomux` | برای هر کاربر یک اتصال TCP از استخر | — |
-| `kcp` | KCP روی UDP با FEC | UDP سالم |
-| `quic` | QUIC با TLS 1.3 داخلی. **روی مسیر پر از loss به حدود ۱ مگابیت سقوط می‌کند** — آنجا `kcp` یا `mtcp` بزن | UDP تمیز، تقریباً بدون loss |
+| `kcp` | KCP روی UDP با FEC؛ به‌طور پیش‌فرض ۴ نشست موازی (`links`) | UDP سالم |
+| `quic` | QUIC با TLS 1.3 داخلی. **روی مسیر پر از loss به حدود ۱ مگابیت سقوط می‌کند، و وقتی کاربرها دانلود می‌کنند آپلودش نزدیک ۱۰ مگابیت گیر می‌کند** — `kcp` یا `mtcp` بزن | UDP تمیز، تقریباً بدون loss |
 | `sctp` | چندجریانی، multihome روی چند IP مبدأ | ماژول `sctp` کرنل |
 | `gre` / `gretap` | GRE کرنلی (L3 / L2)؛ بیشترین سرعت | ماژول `ip_gre`، روت |
 | `ipip` | IP-in-IP کرنلی؛ کمترین سربار، فقط IPv4 | ماژول `ipip`، روت |
@@ -489,10 +530,25 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 
 | وضعیت | انتخاب |
 |---|---|
-| بیشترین پهنای باند | `mtcp` + `aead` |
-| بازی، پینگ پایین و پایدار | `kcp` |
+| بیشترین پهنای باند | `udp`/`icmp` (اگر UDP یا پینگ رد می‌شود)، وگرنه `mtcp` + `aead` |
+| بازی، پینگ پایین و پایدار | `kcp` با `kcp_mode` gaming، یا `udp` |
 | یک جریان سنگین (بکاپ، فایل بزرگ) | `tcpnomux` |
 | DPI که همه‌چیز را می‌بندد | `ws` + `aead` یا `spoof` |
+
+اندازه‌گیری نسخهٔ 2.3.9 روی مسیر شبیه‌سازی‌شدهٔ ایران (۸۰ میلی‌ثانیه، ۰٫۳٪ loss،
+۵۰۰ مگابیت) با ۳۰۰ کاربر هم‌زمان که ۱۰ نفرشان بی‌وقفه دانلود و ۵ نفر آپلود می‌کنند:
+
+| | ↓ مگابیت | ↑ مگابیت | پینگ میانه | پینگ ۹۵٪ |
+|---|---|---|---|---|
+| بدون تانل | 460 | 425 | 144 ms | 489 ms |
+| `udp`، `icmp` | 453 | 402 | 145 ms | 490 ms |
+| `mtcp` | 449 | 446 | 102 ms | 293 ms |
+| `tcpnomux` | 458 | 399 | 142 ms | 495 ms |
+| `kcp` (۴ لینک) | 160 | 256 | 369 ms | 690 ms |
+| `tcp`، `ws` (یک لینک) | 140 | 136 | 240 ms | 340 ms |
+
+مسیر تو همین نیست: روی هر گزینه **تست سرعت** (پایین‌تر) را بزن و بهترینش روی
+مسیر خودت را نگه دار.
 
 ترنسپورت `quic` لایهٔ رمزنگاری نمی‌گیرد — خودش از TLS 1.3 استفاده می‌کند.
 تونل‌های کرنلی (`gre`، `gretap`، `ipip`، `sit`، `l2tp`) هم نمی‌گیرند: بسته‌ها را
@@ -529,6 +585,20 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 | ترنسپورت‌های جریانی | بله | پورت جدا |
 
 روی هر دو سرور همان مقادیر را وارد کن؛ منیجر سرور ایران آن‌ها را نشان می‌دهد.
+
+## تست سرعت و آمار زنده
+
+**تست سرعت** (مدیریت تانل‌ها ← یک تانل ← ۱۵) پینگ، جیتر، دانلود و آپلود را
+*از داخل خود تانل* و با همان ترنسپورت و رمزنگاری می‌سنجد؛ پس عددها همان چیزی است
+که کاربرهایت می‌گیرند. اول سرور مقابل را بیرون از تانل پینگ می‌کند تا ببینی
+تانل چقدر اضافه می‌کند، و هر نتیجه را نگه می‌دارد: جدول آخر، آخرین اجراهای همهٔ
+تانل‌ها را کنار هم نشان می‌دهد — این‌طوری ترنسپورت‌ها را روی مسیر خودت مقایسه
+می‌کنی. برای ترنسپورت‌های جریانی روی سرور ایران اجرا کن؛ برای `gre`، `ipip`،
+`l2tp`، `udp`، `icmp` و `spoof` روی هر کدام. هر دو سرور باید 2.3.9 یا جدیدتر باشند.
+
+**آمار زنده** (← ۸) سرعت همین لحظه، بیشینه، تاریخچهٔ ۴۰ ثانیه، لینک‌های وصل و
+کاربرهای متصل را روی هر دو سرور و برای همهٔ ترنسپورت‌ها نشان می‌دهد. هر ثانیه
+درجا به‌روز می‌شود (بدون پرش صفحه)؛ با زدن هر کلیدی برمی‌گردی.
 
 ## تنظیم برای بازی
 
@@ -611,6 +681,15 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 **سهمیهٔ ترافیک** اختیاری است و به‌صورت پیش‌فرض نامحدود. تا وقتی خودت مقداری
 تنظیم نکنی، هیچ کاری انجام نمی‌دهد.
 
+تست‌شده در 2.3.9: ۱۸٬۰۰۰ کاربر هم‌زمان روی یک تانل، ۸۰ نفرشان با تمام سرعت در
+حال جابه‌جایی داده (حدود ۶ گیگابیت دانلود و ۵ گیگابیت آپلود روی یک ماشین ۴ هسته‌ای)،
+۵ دقیقه بدون قطع شدن حتی یک کاربر و با تأخیر ثابت؛ حافظه حدود ۱ گیگابایت ماند و
+بعد از رفتن کاربرها پایین آمد. تعداد کاربری که یک سرور نگه می‌دارد را RAM آن
+(حدود ۳۰ کیلوبایت برای هر کاربر بیکار، بیشتر وقتی داده جابه‌جا می‌کند) و سقف
+فایل‌های باز تعیین می‌کند که سرویس بالا می‌برد. روی سرور خارج، وقتی همهٔ پورت‌های
+مبدأ به سمت سرویس محلی (`127.0.0.1:port`) پر شود — حدود ۶۴٬۰۰۰ کاربر — کاربر
+جدید از یک آدرس دیگر `127.x` وصل می‌شود به‌جای اینکه قطع شود.
+
 ## خط فرمان
 
 منو همهٔ کارها را پوشش می‌دهد، ولی هستهٔ برنامه دستورها را مستقیم هم می‌پذیرد:
@@ -622,6 +701,7 @@ brokennode -c /etc/brokennode/main.json   # اجرای تونل از روی کا
 brokennode -gen server                    # چاپ یک کانفیگ نمونهٔ سرور
 brokennode -gen client                    # چاپ یک کانفیگ نمونهٔ کلاینت
 brokennode -transports                    # فهرست ترنسپورت‌ها و لایه‌های رمزنگاری
+brokennode speedtest -c /etc/brokennode/main.json [-t 10] [-p 4]   # تست سرعت از داخل تانل
 brokennode version
 ```
 
