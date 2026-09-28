@@ -4,7 +4,7 @@
 
 **Multi-protocol tunnel, reverse or direct — compiled and ready to run.**
 
-`v2.3.10`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
+`v2.3.11`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
 
 **[English](#english)**  ·  **[فارسی](#فارسی)**
 
@@ -132,7 +132,7 @@ encryption layer decides what they look like on the way.
 `tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `quic` · `sctp`
 
 **Point-to-point tunnels** (both servers' real IPs + a private address pair):
-`gre` · `gretap` · `ipip` · `sit` · `l2tp` (kernel) · `udp` · `icmp` (TUN) · `spoof`
+`gre` · `gretap` · `ipip` · `sit` · `l2tp` (kernel) · `udp` · `icmp` (TUN) · `spoof` (disabled in this release)
 
 **Encryption:** `none` · `obfs` (AES-CTR keystream) · `aead`
 (ChaCha20-Poly1305, authenticated — recommended)
@@ -152,7 +152,7 @@ encryption layer decides what they look like on the way.
 | `sit` | Kernel 6in4: IPv6 over IPv4. Tunnel addresses are **IPv6** | `sit` module, root |
 | `l2tp` | Kernel L2TPv3 over UDP or IP | `l2tp_eth`/`l2tp_netlink`, root |
 | `udp` / `icmp` | TUN over plain UDP / ICMP echo, real source IP by default | root |
-| `spoof` | TUN with a forged whitelisted source IP, for a blackout | spoof-friendly datacenters |
+| `spoof` | **Disabled in this release**, as is forging a source IP on `udp`/`icmp` | — |
 
 The manager asks for them separately: pick a transport, then answer whether it
 should be encrypted.
@@ -162,7 +162,7 @@ should be encrypted.
 | Maximum bandwidth | `udp`/`icmp` (if UDP or ping passes), else `mtcp` + `aead` |
 | Gaming, low and stable ping | `kcp` with `kcp_mode` gaming, or `udp` |
 | One heavy stream (backup, large file) | `tcpnomux` |
-| Deep packet inspection blocking everything | `ws` + `aead`, or `spoof` |
+| Deep packet inspection blocking everything | `ws` + `aead` |
 
 Measured in 2.3.9 on an emulated Iran-like path (80 ms, 0.3% loss, 500 Mbit/s)
 with 300 users at once, 10 of them downloading and 5 uploading without pause:
@@ -355,8 +355,8 @@ number of parallel sessions, default 4, 1 in gaming mode), `links_max`,
 Point-to-point tunnels: `local_ip`, `remote_ip` (the two servers' real IPv4
 addresses), `tun_local`, `tun_remote` (the pair on the tunnel — IPv6 for `sit`),
 `tun_name`, `mtu`, `tun_ttl`, `gre_key`, `l2tp_tunnel_id`, `l2tp_session_id`,
-`l2tp_encap` (`udp`|`ip`), `l2tp_port`; `spoof_src`/`spoof_dst` to forge on
-`udp`/`icmp`. The server's `ports` are NATed across the tunnel; the client's
+`l2tp_encap` (`udp`|`ip`), `l2tp_port`. (`spoof_src`/`spoof_dst`, forging on
+`udp`/`icmp`, are disabled in this release.) The server's `ports` are NATed across the tunnel; the client's
 `target_host` is where they land.
 
 Both ends must agree on the transport, the encryption layer and the
@@ -512,7 +512,7 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 `tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `quic` · `sctp`
 
 **تونل‌های نقطه‌به‌نقطه** (IP واقعی هر دو سرور + یک جفت آدرس خصوصی):
-`gre` · `gretap` · `ipip` · `sit` · `l2tp` (کرنلی) · `udp` · `icmp` (TUN) · `spoof`
+`gre` · `gretap` · `ipip` · `sit` · `l2tp` (کرنلی) · `udp` · `icmp` (TUN) · `spoof` (در این نسخه غیرفعال)
 
 **رمزنگاری:** `none` · `obfs` (کی‌استریم AES-CTR) · `aead`
 (ChaCha20-Poly1305 با احراز اصالت — پیشنهادی)
@@ -532,7 +532,7 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 | `sit` | 6in4 کرنلی: IPv6 روی IPv4؛ آدرس‌های تونل **IPv6** هستند | ماژول `sit`، روت |
 | `l2tp` | L2TPv3 کرنلی روی UDP یا IP | `l2tp_eth`/`l2tp_netlink`، روت |
 | `udp` / `icmp` | TUN روی UDP ساده / ICMP echo؛ پیش‌فرض با IP واقعی | روت |
-| `spoof` | TUN با IP مبدأ جعلیِ سفید، برای قطعی سراسری | دیتاسنترهای اجازه‌دهنده به جعل |
+| `spoof` | **در این نسخه غیرفعال است**، همین‌طور جعل IP مبدأ روی `udp`/`icmp` | — |
 
 منو این دو را جدا از هم می‌پرسد: اول ترنسپورت را انتخاب می‌کنی، بعد می‌پرسد
 رمزگذاری شود یا نه.
@@ -542,7 +542,7 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 | بیشترین پهنای باند | `udp`/`icmp` (اگر UDP یا پینگ رد می‌شود)، وگرنه `mtcp` + `aead` |
 | بازی، پینگ پایین و پایدار | `kcp` با `kcp_mode` gaming، یا `udp` |
 | یک جریان سنگین (بکاپ، فایل بزرگ) | `tcpnomux` |
-| DPI که همه‌چیز را می‌بندد | `ws` + `aead` یا `spoof` |
+| DPI که همه‌چیز را می‌بندد | `ws` + `aead` |
 
 اندازه‌گیری نسخهٔ 2.3.9 روی مسیر شبیه‌سازی‌شدهٔ ایران (۸۰ میلی‌ثانیه، ۰٫۳٪ loss،
 ۵۰۰ مگابیت) با ۳۰۰ کاربر هم‌زمان که ۱۰ نفرشان بی‌وقفه دانلود و ۵ نفر آپلود می‌کنند:
@@ -744,8 +744,8 @@ brokennode version
 تونل‌های نقطه‌به‌نقطه: `local_ip`، `remote_ip` (IPv4 واقعی دو سرور)،
 `tun_local`، `tun_remote` (جفت آدرس روی تونل — برای `sit` از نوع IPv6)،
 `tun_name`، `mtu`، `tun_ttl`، `gre_key`، `l2tp_tunnel_id`، `l2tp_session_id`،
-`l2tp_encap` (`udp`|`ip`)، `l2tp_port`؛ و `spoof_src`/`spoof_dst` برای جعل روی
-`udp`/`icmp`. پورت‌های `ports` سرور از روی تونل NAT می‌شوند و `target_host`
+`l2tp_encap` (`udp`|`ip`)، `l2tp_port`. (`spoof_src`/`spoof_dst`، یعنی جعل روی
+`udp`/`icmp`، در این نسخه غیرفعال است.) پورت‌های `ports` سرور از روی تونل NAT می‌شوند و `target_host`
 کلاینت مقصد نهایی آن‌هاست.
 
 دو طرف تونل باید روی ترنسپورت، لایهٔ رمزنگاری و تنظیمات سطح ترنسپورت توافق

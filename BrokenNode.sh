@@ -8,10 +8,14 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.3.10"
+VERSION="2.3.11"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
+# IP spoofing (the spoof transport, and forging a source IP on udp/icmp) is
+# switched OFF in this release. Nothing is removed: set this to 1 — and
+# config.SpoofingEnabled to true in the core — to bring every screen back.
+SPOOF_ENABLED=0
 BIN="/usr/local/bin/brokennode"
 CFG_DIR="/etc/brokennode"
 TPL="/etc/systemd/system/brokennode@.service"
@@ -371,6 +375,13 @@ client_from_code(){
   if grep -q '^ERR ' <<<"$out"; then err "$(sed -n 's/^ERR //p' <<<"$out")"; return 1; fi
   if [ "$rc" != 0 ] || ! grep -q '^OK ' <<<"$out"; then
     err "Could not build the config from this code:"; echo "$out" | tail -n 3 | sed 's/^/    /'; return 1
+  fi
+  local cfg0="$CFG_DIR/$name.json"
+  if [ "$SPOOF_ENABLED" != 1 ] && { [ "$(jget "$cfg0" transport)" = spoof ] || [ -n "$(jget "$cfg0" spoof_src)" ] || [ -n "$(jget "$cfg0" spoof_dst)" ]; }; then
+    rm -f "$cfg0"
+    err "This pairing code needs IP spoofing, which is disabled in this release."
+    echo -e "  ${C_D}Re-create the tunnel on the Iran server with another transport (udp, icmp or a stream transport).${C_N}"
+    return 1
   fi
   info "Config created from the pairing code: $(sed -n 's/^OK //p' <<<"$out")"
   if grep -q '^CONFLICT ' <<<"$out"; then
@@ -734,7 +745,9 @@ pick_transport(){
   echo    "   4) tcpnomux  TCP pool, no HoL         (heavy single-flow)" >&2
   echo -e "   5) kcp       KCP/UDP + FEC            ${C_Y}(only if UDP works)${C_N}" >&2
   echo -e "   6) quic      QUIC/UDP, built-in TLS   ${C_R}(slow on lossy paths — prefer kcp)${C_N}" >&2
-  echo -e "   7) ip-spoofing  Spoofed-IP TUN        ${C_M}(blackout / national whitelist)${C_N}" >&2
+  if [ "$SPOOF_ENABLED" = 1 ]; then
+    echo -e "   7) ip-spoofing  Spoofed-IP TUN        ${C_M}(blackout / national whitelist)${C_N}" >&2
+  fi
   echo -e "   8) mptcp     Multipath TCP (kernel)   ${C_G}(link aggregation, kernel >= 5.6)${C_N}" >&2
   echo -e "   9) sctp      Multi-stream + multihome ${C_Y}(needs kernel sctp module)${C_N}" >&2
   echo -e "  ${C_D}── kernel tunnels (point-to-point, root on both ends) ──${C_N}" >&2
@@ -771,7 +784,9 @@ pick_transport(){
         } >&2
         local qc; qc=$(ask "Use quic anyway? y/N" "N")
         case "$qc" in y|Y) echo quic; return ;; *) continue ;; esac ;;
-      7|spoof|ip-spoofing) echo spoof; return ;;
+      7|spoof|ip-spoofing)
+        if [ "$SPOOF_ENABLED" = 1 ]; then echo spoof; return; fi
+        err "ip-spoofing is disabled in this release." ;;
       8|mptcp) echo mptcp; return ;;    9|sctp) echo sctp; return ;;
       10|gre) echo gre; return ;;       11|gretap) echo gretap; return ;;
       12|ipip) echo ipip; return ;;     13|sit) echo sit; return ;;
@@ -1196,10 +1211,13 @@ write_tunnel_cfg(){
       fi
       ;;
     udp|icmp)
-      echo -e "  ${C_D}By default the real source IP is used (no forging). To forge a${C_N}"
-      echo -e "  ${C_D}whitelisted source for a blackout, answer the next two; blank = no forging.${C_N}"
-      local ssrc sdst; ssrc=$(ask "Forge source IP (blank = real)" "")
-      sdst=$(ask "Expected peer source IP (blank = real)" "")
+      local ssrc="" sdst=""
+      if [ "$SPOOF_ENABLED" = 1 ]; then
+        echo -e "  ${C_D}By default the real source IP is used (no forging). To forge a${C_N}"
+        echo -e "  ${C_D}whitelisted source for a blackout, answer the next two; blank = no forging.${C_N}"
+        ssrc=$(ask "Forge source IP (blank = real)" "")
+        sdst=$(ask "Expected peer source IP (blank = real)" "")
+      fi
       [ -n "$ssrc" ] && extra="$extra\"spoof_src\": \"$ssrc\","
       [ -n "$sdst" ] && extra="$extra\"spoof_dst\": \"$sdst\","
       # Each tunnel on this server needs its own carrier port: a second udp
