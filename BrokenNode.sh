@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.3.14"
+VERSION="2.3.15"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -1608,6 +1608,27 @@ doctor(){
   # FD limit
   local fd; fd="$(ulimit -n)"
   okln "Open-file limit (ulimit -n): $fd"
+
+  # Leftover ICMP-echo suppression. An icmp tunnel turns the kernel's ping
+  # responder off while it runs; a release before 2.3.13 (or a hard kill) could
+  # leave it off for good, so the server answers no pings even after the tunnel
+  # is gone or switched to another transport. If it is off here but NO configured
+  # tunnel is icmp, that is a leftover — turn it back on so the host pings again.
+  local echoOff; echoOff="$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)"
+  if [ "$echoOff" = 1 ]; then
+    local hasICMP=0
+    for cf in "$CFG_DIR"/*.json; do
+      [ -e "$cf" ] || continue
+      [ "$(jget "$cf" transport)" = icmp ] && hasICMP=1 && break
+    done
+    if [ "$hasICMP" = 1 ]; then
+      okln "ICMP echo responder off (an icmp tunnel is running — expected)"
+    else
+      sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1
+      warnln "ICMP echo was disabled with no icmp tunnel configured — a leftover from an older run. Re-enabled it, so this server answers pings again."
+      warns=$((warns+1))
+    fi
+  fi
 
   echo -e "  ${C_D}── per-tunnel ─────────────────────────────────${C_N}"
   shopt -s nullglob
