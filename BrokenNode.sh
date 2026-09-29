@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.3.12"
+VERSION="2.3.13"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -1652,6 +1652,15 @@ doctor(){
         # would tell the operator their peer is filtered when nothing was tested.
         warnln "  ping is not installed — cannot test the peer (apt install iputils-ping)"
         warns=$((warns+1)); continue
+      fi
+      # An icmp tunnel IS ping: its server end turns off the kernel's echo
+      # responder while it runs (otherwise the kernel would answer the tunnel's
+      # own packets), so that server does not reply to a normal ping. A failed
+      # ping to it is expected, not a fault, so skip the ping asserts for icmp.
+      if [ "$trans" = icmp ]; then
+        echo -e "  ${C_D}icmp carries traffic inside ping; the server end does not answer normal${C_N}"
+        echo -e "  ${C_D}ICMP echo while running, so a failed ping to it here is expected.${C_N}"
+        continue
       fi
       local l1 l2
       l1="$(ping -c 10 -i 0.2 -W 2 "$rip" 2>/dev/null | sed -n 's/.*, \([0-9.]*\)% packet loss.*/\1/p')"

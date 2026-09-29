@@ -4,7 +4,7 @@
 
 **Multi-protocol tunnel, reverse or direct — compiled and ready to run.**
 
-`v2.3.12`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
+`v2.3.13`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
 
 **[English](#english)**  ·  **[فارسی](#فارسی)**
 
@@ -151,7 +151,7 @@ encryption layer decides what they look like on the way.
 | `ipip` | Kernel IP-in-IP. Lowest overhead, IPv4 only | `ipip` module, root |
 | `sit` | Kernel 6in4: IPv6 over IPv4. Tunnel addresses are **IPv6** | `sit` module, root |
 | `l2tp` | Kernel L2TPv3 over UDP or IP | `l2tp_eth`/`l2tp_netlink`, root |
-| `udp` / `icmp` | TUN over plain UDP / ICMP echo between the two servers' real IPs | root |
+| `udp` / `icmp` | TUN over plain UDP / ICMP echo between the two servers' real IPs | root; an `icmp` server stops answering normal pings while it runs |
 
 The manager asks for them separately: pick a transport, then answer whether it
 should be encrypted.
@@ -530,7 +530,7 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 | `ipip` | IP-in-IP کرنلی؛ کمترین سربار، فقط IPv4 | ماژول `ipip`، روت |
 | `sit` | 6in4 کرنلی: IPv6 روی IPv4؛ آدرس‌های تونل **IPv6** هستند | ماژول `sit`، روت |
 | `l2tp` | L2TPv3 کرنلی روی UDP یا IP | `l2tp_eth`/`l2tp_netlink`، روت |
-| `udp` / `icmp` | TUN روی UDP ساده / ICMP echo بین IP واقعی دو سرور | روت |
+| `udp` / `icmp` | TUN روی UDP ساده / ICMP echo بین IP واقعی دو سرور | روت؛ سرورِ `icmp` تا وقتی بالاست به پینگ معمولی جواب نمی‌دهد |
 
 منو این دو را جدا از هم می‌پرسد: اول ترنسپورت را انتخاب می‌کنی، بعد می‌پرسد
 رمزگذاری شود یا نه.
