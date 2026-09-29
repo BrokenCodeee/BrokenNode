@@ -3,19 +3,14 @@
 #  BrokenNode Tunnel - Manager (prebuilt core, no build / no internet)
 #  Multi-instance | presets | per-port tcp/udp/both | systemd
 #  Transport and encryption are chosen separately (see pick_transport /
-#  pick_encryption). ip-spoofing is built into the core and uses the same
-#  config/unit as every other transport.
+#  pick_encryption).
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.3.11"
+VERSION="2.3.12"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
-# IP spoofing (the spoof transport, and forging a source IP on udp/icmp) is
-# switched OFF in this release. Nothing is removed: set this to 1 — and
-# config.SpoofingEnabled to true in the core — to bring every screen back.
-SPOOF_ENABLED=0
 BIN="/usr/local/bin/brokennode"
 CFG_DIR="/etc/brokennode"
 TPL="/etc/systemd/system/brokennode@.service"
@@ -201,11 +196,9 @@ is_tunnel_transport(){
 #   stream  bind_addr / remote_addr         tcp mtcp mptcp ws tcpnomux kcp quic sctp
 #   p2p4    local_ip / remote_ip / tun_* v4 gre gretap ipip l2tp udp icmp
 #   sit     the same fields, but an IPv6 tunnel pair
-#   spoof   spoof_* fields
 transport_family(){
   case "$1" in
     sit) echo sit ;;
-    spoof) echo spoof ;;
     *) if is_tunnel_transport "$1"; then echo p2p4; else echo stream; fi ;;
   esac
 }
@@ -267,7 +260,7 @@ cfg_scan(){
   python3 - "$CFG_DIR" "$1" "$2" "${3:-}" <<'PYEOF2'
 import json, os, sys, glob
 d, mode, excl, key = sys.argv[1:5]
-P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp", "spoof")
+P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp")
 for f in sorted(glob.glob(os.path.join(d, "*.json"))):
     if os.path.basename(f)[:-5] == excl:
         continue
@@ -308,7 +301,7 @@ for f in sorted(glob.glob(os.path.join(d, "*.json"))):
         if key in ("udp", "l2tp") and t == "l2tp" and (c.get("l2tp_encap") or "udp") == "udp":
             print(c.get("l2tp_port") or 1701)
             continue
-        cp = t if t in ("udp", "icmp") else (c.get("carrier_proto") or "udp") if t == "spoof" else None
+        cp = t if t in ("udp", "icmp") else None
         if cp == key or (key == "l2tp" and cp == "udp"):
             print(c.get("carrier_port") or 6262)
 PYEOF2
@@ -352,7 +345,6 @@ show_pair_code(){
           jset "$cfg" public_ip "$ip"
         fi
       fi ;;
-    spoof) ip="$(jget "$cfg" spoof_local_ip)" ;;
     *)     ip="$(jget "$cfg" local_ip)" ;;
   esac
   local code; code="$(bnpy pair make "$cfg" "$ip")" || { err "Could not build the pairing code."; return; }
@@ -375,13 +367,6 @@ client_from_code(){
   if grep -q '^ERR ' <<<"$out"; then err "$(sed -n 's/^ERR //p' <<<"$out")"; return 1; fi
   if [ "$rc" != 0 ] || ! grep -q '^OK ' <<<"$out"; then
     err "Could not build the config from this code:"; echo "$out" | tail -n 3 | sed 's/^/    /'; return 1
-  fi
-  local cfg0="$CFG_DIR/$name.json"
-  if [ "$SPOOF_ENABLED" != 1 ] && { [ "$(jget "$cfg0" transport)" = spoof ] || [ -n "$(jget "$cfg0" spoof_src)" ] || [ -n "$(jget "$cfg0" spoof_dst)" ]; }; then
-    rm -f "$cfg0"
-    err "This pairing code needs IP spoofing, which is disabled in this release."
-    echo -e "  ${C_D}Re-create the tunnel on the Iran server with another transport (udp, icmp or a stream transport).${C_N}"
-    return 1
   fi
   info "Config created from the pairing code: $(sed -n 's/^OK //p' <<<"$out")"
   if grep -q '^CONFLICT ' <<<"$out"; then
@@ -445,6 +430,8 @@ import base64, glob, json, os, random, re, subprocess, sys, zlib
 
 cfgdir, cmd, args = sys.argv[1], sys.argv[2], sys.argv[3:]
 P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp")
+KNOWN = P2P + ("tcp", "mtcp", "mptcp", "ws", "tcpnomux", "kcp", "quic", "sctp",
+               "tcpobf", "mtcpobf", "wsobf", "rawmux")
 
 def configs(excl=""):
     out = []
@@ -492,7 +479,7 @@ def used_ports(proto, excl):
                 used.add(int(v.rsplit(":", 1)[1]))
         if t == "l2tp":
             used.add(int(c.get("l2tp_port") or 1701))
-        if t in ("udp", "icmp", "spoof"):
+        if t in ("udp", "icmp"):
             used.add(int(c.get("carrier_port") or 6262))
     flag = "-Hlnu" if proto == "udp" else "-Hlnt"
     for line in sh("ss", flag).splitlines():
@@ -525,8 +512,6 @@ def mirror(r, relay_ip, target):
     sw = lambda a, b: c.update({a: r.get(b), b: r.get(a)}) if (a in r or b in r) else None
     if t in P2P:
         sw("local_ip", "remote_ip"); sw("tun_local", "tun_remote")
-    elif t == "spoof":
-        sw("spoof_local_ip", "spoof_peer_ip"); sw("spoof_src", "spoof_dst"); sw("tun_local", "tun_remote")
     else:
         if str(r.get("direction") or "").lower() == "direct":
             port = str(r.get("remote_addr") or ":8443").rsplit(":", 1)[-1] or "8443"
@@ -589,7 +574,7 @@ def conflicts(name, c):
         for n, o in configs(name):
             if o.get("transport") == t and o.get("remote_ip") == c.get("remote_ip"):
                 out.append("%s tunnel '%s' to %s exists — the kernel allows only one" % (t, n, c.get("remote_ip")))
-    if t == "udp" or (t == "spoof" and (c.get("carrier_proto") or "udp") == "udp"):
+    if t == "udp":
         if int(c.get("carrier_port") or 6262) in used_ports_("udp", name):
             out.append("udp carrier port %s is already used here" % (c.get("carrier_port") or 6262))
     b = str(c.get("bind_addr") or "")
@@ -621,6 +606,9 @@ elif cmd == "pair" and args[0] == "apply":
     except Exception as e:
         print("ERR the pairing code is damaged or incomplete (%s) — copy the whole line again" % e)
         sys.exit(2)
+    if (d["cfg"].get("transport") or "tcp") not in KNOWN:
+        print("ERR this pairing code is for a transport this release does not have — re-create the tunnel on the Iran server with another transport")
+        sys.exit(2)
     c = mirror(d["cfg"], d.get("ip", ""), target)
     bad = conflicts(name, c)
     path = os.path.join(cfgdir, name + ".json")
@@ -629,7 +617,7 @@ elif cmd == "pair" and args[0] == "apply":
         json.dump(c, f, indent=2); f.write("\n")
     t = c.get("transport")
     info = [t + ("+" + c["encryption"] if c.get("encryption") not in (None, "", "none") else "")]
-    if t not in P2P and t != "spoof":
+    if t not in P2P:
         info.append("direction " + (c.get("direction") or "reverse"))
         info.append(("listens on " + c["bind_addr"]) if c.get("bind_addr") else ("connects to " + c.get("remote_addr", "?")))
     else:
@@ -645,8 +633,7 @@ elif cmd == "pair" and args[0] == "show":
     c = mirror(json.load(open(args[1])), args[2], "")
     keys = ("transport", "encryption", "token", "direction", "remote_addr", "bind_addr",
             "local_ip", "remote_ip", "tun_local", "tun_remote", "gre_key", "l2tp_tunnel_id",
-            "l2tp_session_id", "l2tp_encap", "l2tp_port", "carrier_proto", "carrier_port",
-            "spoof_local_ip", "spoof_peer_ip", "spoof_src", "spoof_dst", "ws_path", "mtu")
+            "l2tp_session_id", "l2tp_encap", "l2tp_port", "carrier_port", "ws_path", "mtu")
     for k in keys:
         if c.get(k) not in (None, "", 0) or (k == "gre_key" and c.get(k)):
             print("%-16s %s" % (k, c[k]))
@@ -672,26 +659,6 @@ for f in sorted(glob.glob(os.path.join(d, "*.json"))):
         continue
     if c.get("transport") in trs.split(",") and c.get("remote_ip") == rip:
         print(int(c.get("gre_key") or 0))
-PYEOF
-}
-
-# gre_carrier_peers PEER EXCLUDE — other tunnels here that exchange GRE packets
-# with PEER: kernel gre/gretap, or spoof over a gre carrier. One line each.
-gre_carrier_peers(){
-  python3 - "$CFG_DIR" "$1" "$2" <<'PYEOF'
-import json, os, sys, glob
-d, peer, excl = sys.argv[1:4]
-for f in sorted(glob.glob(os.path.join(d, "*.json"))):
-    if os.path.basename(f)[:-5] == excl:
-        continue
-    try:
-        c = json.load(open(f))
-    except Exception:
-        continue
-    t = c.get("transport")
-    if (t in ("gre", "gretap") and c.get("remote_ip") == peer) or \
-       (t == "spoof" and c.get("carrier_proto") == "gre" and c.get("spoof_peer_ip") == peer):
-        print(os.path.basename(f)[:-5])
 PYEOF
 }
 
@@ -745,9 +712,6 @@ pick_transport(){
   echo    "   4) tcpnomux  TCP pool, no HoL         (heavy single-flow)" >&2
   echo -e "   5) kcp       KCP/UDP + FEC            ${C_Y}(only if UDP works)${C_N}" >&2
   echo -e "   6) quic      QUIC/UDP, built-in TLS   ${C_R}(slow on lossy paths — prefer kcp)${C_N}" >&2
-  if [ "$SPOOF_ENABLED" = 1 ]; then
-    echo -e "   7) ip-spoofing  Spoofed-IP TUN        ${C_M}(blackout / national whitelist)${C_N}" >&2
-  fi
   echo -e "   8) mptcp     Multipath TCP (kernel)   ${C_G}(link aggregation, kernel >= 5.6)${C_N}" >&2
   echo -e "   9) sctp      Multi-stream + multihome ${C_Y}(needs kernel sctp module)${C_N}" >&2
   echo -e "  ${C_D}── kernel tunnels (point-to-point, root on both ends) ──${C_N}" >&2
@@ -784,9 +748,6 @@ pick_transport(){
         } >&2
         local qc; qc=$(ask "Use quic anyway? y/N" "N")
         case "$qc" in y|Y) echo quic; return ;; *) continue ;; esac ;;
-      7|spoof|ip-spoofing)
-        if [ "$SPOOF_ENABLED" = 1 ]; then echo spoof; return; fi
-        err "ip-spoofing is disabled in this release." ;;
       8|mptcp) echo mptcp; return ;;    9|sctp) echo sctp; return ;;
       10|gre) echo gre; return ;;       11|gretap) echo gretap; return ;;
       12|ipip) echo ipip; return ;;     13|sit) echo sit; return ;;
@@ -798,8 +759,8 @@ pick_transport(){
 }
 
 # pick_encryption asks whether the chosen transport should be encrypted. quic
-# already encrypts with TLS 1.3 and spoof is a packet carrier, so neither takes a
-# layer and neither is asked.
+# already encrypts with TLS 1.3 and the kernel tunnels carry plain IP, so
+# neither takes a layer and neither is asked.
 pick_encryption(){
   local tr="$1"
   # quic (TLS 1.3) and the kernel tunnels (encrypt at the service) take no
@@ -807,7 +768,8 @@ pick_encryption(){
   case "$tr" in
     quic|gre|gretap|ipip|sit|l2tp) echo none; return ;;
   esac
-  # udp/icmp seal each datagram, exactly like spoof: offer aead/none.
+  # udp/icmp seal each datagram: offer aead/none (a stream cipher cannot key
+  # packets that may be lost or reordered).
   case "$tr" in
     udp|icmp)
       echo >&2
@@ -821,17 +783,6 @@ pick_encryption(){
   echo >&2
   echo -e "${C_B}  Encrypt this '$tr' tunnel?${C_N}" >&2
   echo -e "  ${C_D}──────────────────────────────────────────────${C_N}" >&2
-  if [ "$tr" = spoof ]; then
-    # spoof seals each datagram; a stream cipher cannot key reorderable packets.
-    echo -e "   1) aead   ChaCha20-Poly1305   ${C_G}(encrypted + tamper-proof, Recommended)${C_N}" >&2
-    echo    "   2) none   No encryption (what older builds did)" >&2
-    echo -e "  ${C_D}──────────────────────────────────────────────${C_N}" >&2
-    echo -e "  ${C_D}Without this, anyone who can forge the whitelisted source IP can${C_N}" >&2
-    echo -e "  ${C_D}inject packets straight into your TUN device.${C_N}" >&2
-    local n; n=$(ask "Choice [1-2]" "1")
-    case "$n" in 2) echo none ;; *) echo aead ;; esac
-    return
-  fi
   echo -e "   1) aead   ChaCha20-Poly1305   ${C_G}(encrypted + tamper-proof, Recommended)${C_N}" >&2
   echo -e "   2) obfs   AES-CTR obfuscation ${C_G}(anti-DPI, matches older builds)${C_N}" >&2
   echo    "   3) none   No encryption layer (lowest overhead)" >&2
@@ -872,6 +823,14 @@ build_ports(){
   [ ${#arr[@]} -eq 0 ] && arr+=("\"443/both\""); ( IFS=,; echo "${arr[*]}" )
 }
 
+# jstr TEXT — TEXT escaped for use inside a JSON string. Typed answers
+# (a token with a quote or a backslash in it, a header value) used to go into
+# the config as they were, which left JSON the core could not parse.
+jstr(){ local v="$1"; v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; printf '%s' "$v" | tr -d '\000-\037'; }
+# jint VALUE DEFAULT — VALUE if it is a whole number, else DEFAULT (an answer
+# like "auto" used to be written into the config as-is).
+jint(){ case "$1" in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$((10#$1))" ;; esac; }
+
 # build_extra ROLE TRANSPORT [DIRECTION] asks the transport's own settings.
 # Those that belong to the end that DIALS (ws request headers, the mtcp link
 # count) go to the client in reverse mode and to the relay in direct mode.
@@ -880,153 +839,25 @@ build_extra(){ local role="$1" tr="$2" dir="${3:-reverse}"; EXTRA=""; TLSJSON=""
   { [ "$role" = client ] && [ "$dir" = reverse ]; } || { [ "$role" = server ] && [ "$dir" = direct ]; } && dials=1
   case "$tr" in
     ws)
-      EXTRA="\"ws_path\":\"$(ask 'WebSocket path' '/')\","
+      EXTRA="\"ws_path\":\"$(jstr "$(ask 'WebSocket path' '/')")\","
       if [ "$dials" = 1 ]; then
         local h u; h=$(ask 'Fake Host header (domain fronting, empty=none)' '')
         u=$(ask 'User-Agent (empty=default)' '')
-        [ -n "$h" ] && EXTRA="$EXTRA\"ws_host\":\"$h\","
-        [ -n "$u" ] && EXTRA="$EXTRA\"ws_user_agent\":\"$u\","
+        [ -n "$h" ] && EXTRA="$EXTRA\"ws_host\":\"$(jstr "$h")\","
+        [ -n "$u" ] && EXTRA="$EXTRA\"ws_user_agent\":\"$(jstr "$u")\","
       fi ;;
-    tcpnomux) EXTRA="\"pool_size\":$(ask 'Connection pool size (0 = AUTO, scales with load — recommended)' '0'),";;
+    tcpnomux) EXTRA="\"pool_size\":$(jint "$(ask 'Connection pool size (0 = AUTO, scales with load — recommended)' '0')" 0),";;
     kcp)
       local w; w=$(ask 'KCP window (send/recv, empty=1024)' '')
-      [ -n "$w" ] && EXTRA="\"kcp_sndwnd\":$w,\"kcp_rcvwnd\":$w," ;;
-    mtcp) [ "$dials" = 1 ] && EXTRA="\"links\":$(ask 'Parallel links (0 = AUTO, scales with load — recommended)' '0'),";;
+      w=$(jint "$w" ""); [ -n "$w" ] && EXTRA="\"kcp_sndwnd\":$w,\"kcp_rcvwnd\":$w," ;;
+    mtcp) [ "$dials" = 1 ] && EXTRA="\"links\":$(jint "$(ask 'Parallel links (0 = AUTO, scales with load — recommended)' '0')" 0),";;
     sctp)
       local mh; mh=$(ask 'Extra local IPs for multihoming (comma-separated, blank = none)' '')
       local st; st=$(ask 'Outbound streams' '8')
-      EXTRA="\"sctp_streams\":${st:-8},"
-      [ -n "$mh" ] && EXTRA="$EXTRA\"sctp_multihoming\":\"$mh\","
+      EXTRA="\"sctp_streams\":$(jint "$st" 8),"
+      [ -n "$mh" ] && EXTRA="$EXTRA\"sctp_multihoming\":\"$(jstr "$mh")\","
       ;;
   esac
-}
-
-# spoof transport: collect spoof_* fields, write a NORMAL JSON config (transport=spoof)
-write_spoof_cfg(){
-  # NOTE: these must be SEPARATE 'local' statements. Bash does not make an
-  # earlier assignment visible to a later one in the same 'local', so
-  #   local name="$2" cfg="$CFG_DIR/$name.json"
-  # silently produced "/etc/brokennode/.json" (name empty) and every
-  # ip-spoofing tunnel was written to the wrong path.
-  local role="$1"
-  local name="$2"
-  local enc="${3:-none}"
-  local cfg="$CFG_DIR/$name.json"
-  # An encrypted spoof tunnel needs a shared token: it keys the per-packet
-  # sealer. Both ends must use the SAME one, exactly like every other transport.
-  local token="" tokline=""
-  if [ "$enc" != none ]; then
-    if [ "$role" = server ]; then
-      token=$(ask "Shared token (for encryption)" "$(gen_token)")
-    else
-      token=$(ask "Shared token (same as the other side)" "")
-    fi
-    tokline="
-  \"token\": \"$token\","
-  fi
-  echo -e "${C_B}  Spoof carrier protocol:${C_N}" >&2
-  echo    "   1) udp    (tested, recommended)" >&2
-  echo -e "   2) tcp    fake-TCP ${C_Y}(untested)${C_N}" >&2
-  echo -e "   3) icmp   echo      ${C_Y}(untested)${C_N}" >&2
-  echo -e "   4) gre    IP proto 47 ${C_Y}(untested; often whitelisted)${C_N}" >&2
-  local pn cproto; pn=$(ask "Choice [1-4]" "1"); case "$pn" in 2) cproto=tcp;; 3) cproto=icmp;; 4) cproto=gre;; *) cproto=udp;; esac
-  echo -e "  ${C_D}Enter the SAME IPs on BOTH servers; cross-over is automatic.${C_N}" >&2
-  local det iran foreign w1 w2; det=$(detect_ip)
-  if [ "$role" = server ]; then
-    iran=$(ask "Iran IP    (this machine, real)" "$det")
-    foreign=$(ask "Foreign IP (peer, real)" "")
-  else
-    foreign=$(ask "Foreign IP (this machine, real)" "$det")
-    iran=$(ask "Iran IP    (peer, real)" "")
-  fi
-  w1=$(ask "White IP #1 — the one IRAN sends as source" "")
-  w2=$(ask "White IP #2 — the one FOREIGN sends as source" "")
-  # The relay offers a carrier port and tunnel subnet no other tunnel here
-  # uses; the foreign side offers the base values and must match the relay.
-  local dcp=6262 nn=20
-  if [ "$role" = server ]; then
-    case "$cproto" in
-      udp|tcp) dcp=$(bnpy alloc port "$cproto" "$name") ;;
-      *)       dcp=$(next_free_int "carrier_port:$cproto" 6262 "$name") ;;
-    esac
-    nn=$(bnpy alloc net "$name")
-  fi
-  local cport mtu jit jjson; cport=$(auto_or_ask "$role" "Carrier port (udp/tcp, same on both ends)" "$dcp"); mtu=$(ask "MTU" "1320")
-  # These go into the JSON unquoted: anything but a number in range would
-  # leave a config the core cannot parse, so fall back to the default.
-  case "$cport" in ''|*[!0-9]*) cport=$dcp ;; esac
-  if [ "$cport" -lt 1 ] || [ "$cport" -gt 65535 ]; then warn "Carrier port must be 1-65535; using $dcp"; cport=$dcp; fi
-  case "$mtu" in ''|*[!0-9]*) mtu=1320 ;; esac
-  if [ "$mtu" -lt 576 ] || [ "$mtu" -gt 9000 ]; then warn "MTU must be 576-9000; using 1320"; mtu=1320; fi
-  local dnn=$nn
-  nn=$(auto_or_ask "$role" "Tunnel subnet: 10.10.N.x — N (same on both ends)" "$nn"); case "$nn" in ''|*[!0-9]*) nn=$dnn ;; esac
-  if [ "$nn" -gt 255 ]; then warn "N must be 0-255; using $dnn"; nn=$dnn; fi
-  jit=$(ask "TTL jitter? (anti-fingerprint) y/N" "N")
-  local jline jtail; case "$jit" in y|Y) jline='
-  "ttl_jitter": true,'; jtail=',
-  "ttl_jitter": true';; *) jline=''; jtail='';; esac
-  local lip pip ssrc sdst tl trr
-  if [ "$role" = server ]; then
-    lip="$iran"; pip="$foreign"; ssrc="$w1"; sdst="$w2"; tl=10.10.$nn.1; trr=10.10.$nn.2
-  else
-    lip="$foreign"; pip="$iran"; ssrc="$w2"; sdst="$w1"; tl=10.10.$nn.2; trr=10.10.$nn.1
-  fi
-  # A gre carrier has no port or identifier: this tunnel receives every GRE
-  # packet the peer sends here — another spoof-gre tunnel's, or a kernel gre
-  # tunnel's to the same server. With aead those fail authentication and are
-  # dropped; without, they would land in this tunnel.
-  if [ "$cproto" = gre ] && [ -n "$(gre_carrier_peers "$pip" "$name")" ]; then
-    warn "This server already has a GRE-based tunnel to $pip. A spoof tunnel over gre cannot be told apart from it:"
-    echo -e "  ${C_D}only one GRE-carried tunnel per pair of servers — use the udp, tcp or icmp carrier for this one.${C_N}"
-  fi
-  local portsjson=""
-  if [ "$role" = server ]; then
-    portsjson=$(build_ports)
-    warn_port_clash "$portsjson" "$name"
-  fi
-  if [ "$role" = server ]; then
-    new_cfg_file "$cfg"
-    cat > "$cfg" <<EOF
-{
-  "mode": "server",
-  "transport": "spoof",
-  "encryption": "$enc",$tokline
-  "log_level": "info",
-  "spoof_local_ip": "$lip",
-  "spoof_peer_ip": "$pip",
-  "spoof_src": "$ssrc",
-  "spoof_dst": "$sdst",
-  "carrier_proto": "$cproto",
-  "carrier_port": $cport,
-  "tun_local": "$tl",
-  "tun_remote": "$trr",
-  "mtu": $mtu,$jline
-  "ports": [$portsjson]
-}
-EOF
-  else
-    new_cfg_file "$cfg"
-    cat > "$cfg" <<EOF
-{
-  "mode": "client",
-  "transport": "spoof",
-  "encryption": "$enc",$tokline
-  "log_level": "info",
-  "spoof_local_ip": "$lip",
-  "spoof_peer_ip": "$pip",
-  "spoof_src": "$ssrc",
-  "spoof_dst": "$sdst",
-  "carrier_proto": "$cproto",
-  "carrier_port": $cport,
-  "tun_local": "$tl",
-  "tun_remote": "$trr",
-  "mtu": $mtu$jtail
-}
-EOF
-  fi
-  info "Saved $cfg"
-  echo -e "  ${C_D}  proto=$cproto  spoof_src=$ssrc  spoof_dst=$sdst  encryption=$enc${C_N}"
-  [ "$role" = server ] && show_pair_code "$cfg"
 }
 
 # check_bind warns when bind_addr names an address this machine does not have.
@@ -1124,8 +955,7 @@ server_summary_direct(){
 # and the addresses on the tunnel itself. The server also maps user ports across
 # the tunnel; the client names the local backend.
 write_tunnel_cfg(){
-  # Two statements: in one 'local', $name would expand before it is assigned
-  # (see write_spoof_cfg). It only worked because the caller has its own $name.
+  # Two statements: in one 'local', $name would expand before it is assigned.
   local role="$1" name="$2" tr="$3" enc="$4"
   local cfg="$CFG_DIR/$name.json"
   echo
@@ -1211,15 +1041,6 @@ write_tunnel_cfg(){
       fi
       ;;
     udp|icmp)
-      local ssrc="" sdst=""
-      if [ "$SPOOF_ENABLED" = 1 ]; then
-        echo -e "  ${C_D}By default the real source IP is used (no forging). To forge a${C_N}"
-        echo -e "  ${C_D}whitelisted source for a blackout, answer the next two; blank = no forging.${C_N}"
-        ssrc=$(ask "Forge source IP (blank = real)" "")
-        sdst=$(ask "Expected peer source IP (blank = real)" "")
-      fi
-      [ -n "$ssrc" ] && extra="$extra\"spoof_src\": \"$ssrc\","
-      [ -n "$sdst" ] && extra="$extra\"spoof_dst\": \"$sdst\","
       # Each tunnel on this server needs its own carrier port: a second udp
       # tunnel on a taken one cannot bind and will not start, and two icmp
       # tunnels with one identifier would receive each other's packets.
@@ -1237,7 +1058,7 @@ write_tunnel_cfg(){
 
   local tokline=""; local token
   token=$(ask "Shared token (same on both ends)" "$(gen_token)")
-  tokline="\"token\": \"$token\","
+  tokline="\"token\": \"$(jstr "$token")\","
 
   local portsjson=""
   if [ "$role" = server ]; then portsjson=$(build_ports); warn_port_clash "$portsjson" "$name"; fi
@@ -1277,7 +1098,7 @@ EOF
   "remote_ip": "$rip",
   "tun_local": "$tl",
   "tun_remote": "$trr",
-  "target_host": "$target",
+  "target_host": "$(jstr "$target")",
   "mtu": $mtu,
   $extra
   "log_level": "info"
@@ -1306,9 +1127,7 @@ create_tunnel(){
   [ -z "$tr" ] && { warn "Cancelled."; return; }
   enc=$(pick_encryption "$tr")
 
-  if [ "$tr" = spoof ]; then
-    write_spoof_cfg "$role" "$name" "$enc"
-  elif is_tunnel_transport "$tr"; then
+  if is_tunnel_transport "$tr"; then
     write_tunnel_cfg "$role" "$name" "$tr" "$enc"
   else
     local dir; dir=$(pick_direction)
@@ -1353,7 +1172,7 @@ create_tunnel(){
   "mode": "server",
   "transport": "$tr",
   "encryption": "$enc",
-  "token": "$token",
+  "token": "$(jstr "$token")",
   "direction": "$dir",
   $addrline
   "ports": [$ports],
@@ -1389,10 +1208,10 @@ EOF
   "mode": "client",
   "transport": "$tr",
   "encryption": "$enc",
-  "token": "$token",
+  "token": "$(jstr "$token")",
   "direction": "$dir",
   $addrline
-  "target_host": "$target",
+  "target_host": "$(jstr "$target")",
   $EXTRA
   "keepalive": $ka,
   "kcp_mode": "$kmode", "kcp_data": $kdata, "kcp_parity": $kparity,
@@ -1639,7 +1458,7 @@ speed_test(){
     return
   fi
   case "$tr" in
-    gre|gretap|ipip|sit|l2tp|udp|icmp|spoof) : ;;
+    gre|gretap|ipip|sit|l2tp|udp|icmp) : ;;
     *) if [ "$role" != server ]; then
          warn "For $tr the test runs on the Iran relay (the server that forwards the users' ports)."
          echo -e "  ${C_D}Its tunnel opens the test streams and this server answers them. Open this menu there.${C_N}"
@@ -1861,7 +1680,7 @@ doctor(){
     local dir; dir="$(tunnel_direction "$cf")"
     [ "$dir" = direct ] && echo -e "  ${C_D}  direction: direct (the Iran server dials the foreign server)${C_N}"
     if [ "$(transport_family "$trans")" != stream ]; then
-      : # spoof: no listen port and no dial address to check
+      : # no listen port and no dial address to check
     elif tunnel_listens "$cf"; then
       local port; port="${bind##*:}"
       if [ -n "$port" ]; then
@@ -1871,8 +1690,7 @@ doctor(){
       doctor_dial "$remote" "$trans"
     fi
     if [ "$mode" = server ]; then
-      # Traffic quota status (only meaningful for non-spoof transports — see
-      # quota_test.go / the stats system; ip-spoofing doesn't route through it).
+      # Traffic quota status.
       local qtot qup qdown
       qtot="$(sed -n 's/.*"quota_total_gb"[ ]*:[ ]*\([0-9.]*\).*/\1/p' "$cf")"
       qup="$(sed -n 's/.*"quota_up_gb"[ ]*:[ ]*\([0-9.]*\).*/\1/p' "$cf")"
@@ -1993,9 +1811,6 @@ toggle_udp_duplicate(){
   info "Restarted brokennode@$n."
 }
 
-# change_transport swaps a tunnel's transport in place, keeping token, ports and
-# addresses. It also clears settings that belong to the OLD transport so a
-# leftover field cannot confuse the new one.
 # is_udp_transport: carried over UDP, so the relay's firewall must allow UDP.
 is_udp_transport(){ case "$1" in kcp|quic) return 0 ;; *) return 1 ;; esac; }
 
@@ -2145,7 +1960,7 @@ change_direction(){
 tunnel_summary(){
   python3 - "$1" <<'PYEOF'
 import json,sys
-P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp", "spoof")
+P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp")
 try:
     c = json.load(open(sys.argv[1]))
 except Exception:

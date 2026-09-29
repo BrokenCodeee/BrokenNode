@@ -4,7 +4,7 @@
 
 **Multi-protocol tunnel, reverse or direct — compiled and ready to run.**
 
-`v2.3.11`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
+`v2.3.12`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
 
 **[English](#english)**  ·  **[فارسی](#فارسی)**
 
@@ -100,7 +100,7 @@ direction. The manager asks for it when you create a tunnel, and
 
 Direction applies to the stream transports (`tcp` `mtcp` `mptcp` `ws`
 `tcpnomux` `kcp` `quic` `sctp`). The point-to-point tunnels (`gre`, `udp`,
-`spoof`, ...) send from both ends at once and have no direction.
+`icmp`, ...) send from both ends at once and have no direction.
 
 Install on **both** servers. Both ends must agree on the transport, the
 encryption layer and the token.
@@ -132,7 +132,7 @@ encryption layer decides what they look like on the way.
 `tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `quic` · `sctp`
 
 **Point-to-point tunnels** (both servers' real IPs + a private address pair):
-`gre` · `gretap` · `ipip` · `sit` · `l2tp` (kernel) · `udp` · `icmp` (TUN) · `spoof` (disabled in this release)
+`gre` · `gretap` · `ipip` · `sit` · `l2tp` (kernel) · `udp` · `icmp` (TUN)
 
 **Encryption:** `none` · `obfs` (AES-CTR keystream) · `aead`
 (ChaCha20-Poly1305, authenticated — recommended)
@@ -151,8 +151,7 @@ encryption layer decides what they look like on the way.
 | `ipip` | Kernel IP-in-IP. Lowest overhead, IPv4 only | `ipip` module, root |
 | `sit` | Kernel 6in4: IPv6 over IPv4. Tunnel addresses are **IPv6** | `sit` module, root |
 | `l2tp` | Kernel L2TPv3 over UDP or IP | `l2tp_eth`/`l2tp_netlink`, root |
-| `udp` / `icmp` | TUN over plain UDP / ICMP echo, real source IP by default | root |
-| `spoof` | **Disabled in this release**, as is forging a source IP on `udp`/`icmp` | — |
+| `udp` / `icmp` | TUN over plain UDP / ICMP echo between the two servers' real IPs | root |
 
 The manager asks for them separately: pick a transport, then answer whether it
 should be encrypted.
@@ -186,11 +185,13 @@ kernel moves the packets, so encrypt at the service (TLS) if you need it.
 A point-to-point tunnel cannot be switched to a stream transport in place (or
 back) — they are configured with different fields. Create a new tunnel instead.
 
-`spoof`, `udp` and `icmp` are packet carriers: it seals each datagram on its own
-(XChaCha20-Poly1305, random per-packet nonce) and accepts `aead` or `none`, but
-not `obfs`. Encrypt it — the transport accepts any packet carrying the expected
-forged source IP, which anyone on the path can send, so without a tag there is
+`udp` and `icmp` are packet carriers: each datagram is sealed on its own
+(XChaCha20-Poly1305, random per-packet nonce), so they accept `aead` or `none`,
+but not `obfs`. Encrypt them — the carrier accepts any packet carrying the
+peer's source IP, which anyone on the path can fake, so without a tag there is
 nothing to stop arbitrary traffic being injected into your TUN device.
+With `aead`, both servers need 2.3.12 or newer (its keys changed in 2.3.12);
+unencrypted `udp`/`icmp` still work with older releases.
 
 **Old names still work.** `tcpobf`, `mtcpobf`, `wsobf` and `rawmux` are
 translated automatically (`tcpobf` becomes `tcp` + `obfs`), so existing tunnels
@@ -209,7 +210,6 @@ on the Iran server). Two of the **same** type:
 | `ipip`, `sit` | **no** — the kernel allows one per pair of IPs | — |
 | `l2tp` | yes | its own tunnel/session id, and over udp its own `l2tp_port` |
 | `udp`, `icmp` | yes | its own `carrier_port` (for icmp: the echo identifier) |
-| `spoof` over `gre` | **no** — GRE carries no port | use the udp, tcp or icmp carrier |
 | stream transports | yes | its own port |
 
 Use the same values on both servers; the Iran server's manager prints them.
@@ -222,7 +222,7 @@ encryption, so the numbers are what your users get. It first pings the other
 server outside the tunnel, so you see what the tunnel adds, and it keeps every
 result: the table at the end lists the last runs of all tunnels side by side,
 which is how you compare transports on your own path. Stream transports run it
-on the Iran server; `gre`, `ipip`, `l2tp`, `udp`, `icmp` and `spoof` on either.
+on the Iran server; `gre`, `ipip`, `l2tp`, `udp` and `icmp` on either.
 Both servers need 2.3.9 or newer.
 
 **Live stats** (→ 8) shows the speed right now, the peak, a 40-second
@@ -297,7 +297,7 @@ a **congested** one.
   same MAC — so a device on the path cannot flip a bit to strip a capability or
   force a format the peer will not parse. **The token is never transmitted**, so it cannot be lifted off the wire even on an unencrypted
   transport.
-- `spoof` keys each direction separately, so a captured packet cannot be
+- `udp` and `icmp` key each direction separately, so a captured packet cannot be
   reflected back at its own sender.
 
 ## No artificial limits
@@ -355,8 +355,7 @@ number of parallel sessions, default 4, 1 in gaming mode), `links_max`,
 Point-to-point tunnels: `local_ip`, `remote_ip` (the two servers' real IPv4
 addresses), `tun_local`, `tun_remote` (the pair on the tunnel — IPv6 for `sit`),
 `tun_name`, `mtu`, `tun_ttl`, `gre_key`, `l2tp_tunnel_id`, `l2tp_session_id`,
-`l2tp_encap` (`udp`|`ip`), `l2tp_port`. (`spoof_src`/`spoof_dst`, forging on
-`udp`/`icmp`, are disabled in this release.) The server's `ports` are NATed across the tunnel; the client's
+`l2tp_encap` (`udp`|`ip`), `l2tp_port`, `carrier_port` (`udp`/`icmp`). The server's `ports` are NATed across the tunnel; the client's
 `target_host` is where they land.
 
 Both ends must agree on the transport, the encryption layer and the
@@ -480,7 +479,7 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 **Manage → Change direction** می‌توان جهت یک تانل موجود را عوض کرد.
 
 جهت فقط برای ترنسپورت‌های جریانی است (`tcp` `mtcp` `mptcp` `ws` `tcpnomux`
-`kcp` `quic` `sctp`). تونل‌های نقطه‌به‌نقطه (`gre`، `udp`، `spoof` و ...) از هر
+`kcp` `quic` `sctp`). تونل‌های نقطه‌به‌نقطه (`gre`، `udp`، `icmp` و ...) از هر
 دو طرف هم‌زمان ارسال می‌کنند و جهت ندارند.
 
 روی **هر دو** سرور نصب کن. دو طرف باید روی ترنسپورت، لایهٔ رمزنگاری و توکن
@@ -512,7 +511,7 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 `tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `quic` · `sctp`
 
 **تونل‌های نقطه‌به‌نقطه** (IP واقعی هر دو سرور + یک جفت آدرس خصوصی):
-`gre` · `gretap` · `ipip` · `sit` · `l2tp` (کرنلی) · `udp` · `icmp` (TUN) · `spoof` (در این نسخه غیرفعال)
+`gre` · `gretap` · `ipip` · `sit` · `l2tp` (کرنلی) · `udp` · `icmp` (TUN)
 
 **رمزنگاری:** `none` · `obfs` (کی‌استریم AES-CTR) · `aead`
 (ChaCha20-Poly1305 با احراز اصالت — پیشنهادی)
@@ -531,8 +530,7 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 | `ipip` | IP-in-IP کرنلی؛ کمترین سربار، فقط IPv4 | ماژول `ipip`، روت |
 | `sit` | 6in4 کرنلی: IPv6 روی IPv4؛ آدرس‌های تونل **IPv6** هستند | ماژول `sit`، روت |
 | `l2tp` | L2TPv3 کرنلی روی UDP یا IP | `l2tp_eth`/`l2tp_netlink`، روت |
-| `udp` / `icmp` | TUN روی UDP ساده / ICMP echo؛ پیش‌فرض با IP واقعی | روت |
-| `spoof` | **در این نسخه غیرفعال است**، همین‌طور جعل IP مبدأ روی `udp`/`icmp` | — |
+| `udp` / `icmp` | TUN روی UDP ساده / ICMP echo بین IP واقعی دو سرور | روت |
 
 منو این دو را جدا از هم می‌پرسد: اول ترنسپورت را انتخاب می‌کنی، بعد می‌پرسد
 رمزگذاری شود یا نه.
@@ -566,12 +564,14 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 تونل نقطه‌به‌نقطه را نمی‌شود درجا به ترنسپورت جریانی تبدیل کرد (و برعکس) —
 فیلدهای کانفیگشان فرق دارد. به‌جایش یک تونل جدید بساز.
 
-ترنسپورت‌های `spoof`، `udp` و `icmp` حامل بسته‌اند: هر دیتاگرام را جداگانه مهر و موم می‌کند
-(XChaCha20-Poly1305 با nonce تصادفی برای هر بسته) و `aead` یا `none` می‌پذیرد،
-ولی `obfs` را نه. حتماً رمزگذاری کن — این ترنسپورت هر بسته‌ای را که IP مبدأ جعلی
-مورد انتظار را داشته باشد قبول می‌کند، و هر کسی در مسیر می‌تواند چنین بسته‌ای
+ترنسپورت‌های `udp` و `icmp` حامل بسته‌اند: هر دیتاگرام جداگانه مهر و موم می‌شود
+(XChaCha20-Poly1305 با nonce تصادفی برای هر بسته)، پس `aead` یا `none` می‌پذیرند،
+ولی `obfs` را نه. حتماً رمزگذاری کن — حامل هر بسته‌ای را که IP مبدأ طرف مقابل
+را داشته باشد قبول می‌کند، و هر کسی در مسیر می‌تواند چنین بسته‌ای جعل کند و
 بفرستد؛ پس بدون تگ احراز اصالت، هیچ چیزی جلوی تزریق ترافیک دلخواه به دستگاه TUN
 تو را نمی‌گیرد.
+با `aead` هر دو سرور باید 2.3.12 یا جدیدتر باشند (کلیدهایش در 2.3.12 عوض شد)؛
+`udp`/`icmp` بدون رمزنگاری هنوز با نسخه‌های قدیمی‌تر کار می‌کند.
 
 **نام‌های قدیمی هنوز کار می‌کنند.** `tcpobf`، `mtcpobf`، `wsobf` و `rawmux`
 به‌طور خودکار ترجمه می‌شوند (`tcpobf` می‌شود `tcp` + `obfs`)، پس تونل‌های موجود
@@ -590,7 +590,6 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 | `ipip`، `sit` | **نه** — کرنل برای هر جفت IP فقط یکی را اجازه می‌دهد | — |
 | `l2tp` | بله | tunnel/session id جدا و روی udp یک `l2tp_port` جدا |
 | `udp`، `icmp` | بله | `carrier_port` جدا (در icmp همان شناسهٔ echo) |
-| `spoof` روی `gre` | **نه** — GRE پورت ندارد | از حامل udp، tcp یا icmp استفاده کن |
 | ترنسپورت‌های جریانی | بله | پورت جدا |
 
 روی هر دو سرور همان مقادیر را وارد کن؛ منیجر سرور ایران آن‌ها را نشان می‌دهد.
@@ -603,7 +602,7 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 تانل چقدر اضافه می‌کند، و هر نتیجه را نگه می‌دارد: جدول آخر، آخرین اجراهای همهٔ
 تانل‌ها را کنار هم نشان می‌دهد — این‌طوری ترنسپورت‌ها را روی مسیر خودت مقایسه
 می‌کنی. برای ترنسپورت‌های جریانی روی سرور ایران اجرا کن؛ برای `gre`، `ipip`،
-`l2tp`، `udp`، `icmp` و `spoof` روی هر کدام. هر دو سرور باید 2.3.9 یا جدیدتر باشند.
+`l2tp`، `udp` و `icmp` روی هر کدام. هر دو سرور باید 2.3.9 یا جدیدتر باشند.
 
 **آمار زنده** (← ۸) سرعت همین لحظه، بیشینه، تاریخچهٔ ۴۰ ثانیه، لینک‌های وصل و
 کاربرهای متصل را روی هر دو سرور و برای همهٔ ترنسپورت‌ها نشان می‌دهد. هر ثانیه
@@ -683,7 +682,7 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
   پس کسی در مسیر نمی‌تواند بیتی را برگرداند تا قابلیتی را حذف کند یا قالبی را
   تحمیل کند که طرف مقابل نمی‌فهمد. **توکن هرگز ارسال نمی‌شود**، پس
   حتی روی یک ترنسپورت بدون رمزنگاری هم نمی‌توان آن را از روی شبکه برداشت.
-- در `spoof` هر جهت کلید جداگانه دارد، بنابراین یک بستهٔ ضبط‌شده را نمی‌توان به
+- در `udp` و `icmp` هر جهت کلید جداگانه دارد، بنابراین یک بستهٔ ضبط‌شده را نمی‌توان به
   خود فرستنده‌اش بازتاب داد.
 
 ## بدون هیچ محدودیت مصنوعی
@@ -744,8 +743,7 @@ brokennode version
 تونل‌های نقطه‌به‌نقطه: `local_ip`، `remote_ip` (IPv4 واقعی دو سرور)،
 `tun_local`، `tun_remote` (جفت آدرس روی تونل — برای `sit` از نوع IPv6)،
 `tun_name`، `mtu`، `tun_ttl`، `gre_key`، `l2tp_tunnel_id`، `l2tp_session_id`،
-`l2tp_encap` (`udp`|`ip`)، `l2tp_port`. (`spoof_src`/`spoof_dst`، یعنی جعل روی
-`udp`/`icmp`، در این نسخه غیرفعال است.) پورت‌های `ports` سرور از روی تونل NAT می‌شوند و `target_host`
+`l2tp_encap` (`udp`|`ip`)، `l2tp_port`، `carrier_port` (`udp`/`icmp`). پورت‌های `ports` سرور از روی تونل NAT می‌شوند و `target_host`
 کلاینت مقصد نهایی آن‌هاست.
 
 دو طرف تونل باید روی ترنسپورت، لایهٔ رمزنگاری و تنظیمات سطح ترنسپورت توافق
