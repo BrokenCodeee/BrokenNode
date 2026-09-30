@@ -4,7 +4,7 @@
 
 **Multi-protocol tunnel, reverse or direct — compiled and ready to run.**
 
-`v2.3.19`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
+`v2.3.20`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
 
 **[English](#english)**  ·  **[فارسی](#فارسی)**
 
@@ -192,6 +192,11 @@ peer's source IP, which anyone on the path can fake, so without a tag there is
 nothing to stop arbitrary traffic being injected into your TUN device.
 With `aead`, both servers need 2.3.12 or newer (its keys changed in 2.3.12);
 unencrypted `udp`/`icmp` still work with older releases.
+
+**Update both servers together.** Since 2.3.20 a stream tunnel with
+encryption `none`, or on `quic`, connects only when the other server proves it
+holds the token too, which needs 2.3.14 or newer on both ends. Against an older
+server the log says so and the tunnel stays down.
 
 **Old names still work.** `tcpobf`, `mtcpobf`, `wsobf` and `rawmux` are
 translated automatically (`tcpobf` becomes `tcp` + `obfs`), so existing tunnels
@@ -572,6 +577,11 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 تو را نمی‌گیرد.
 با `aead` هر دو سرور باید 2.3.12 یا جدیدتر باشند (کلیدهایش در 2.3.12 عوض شد)؛
 `udp`/`icmp` بدون رمزنگاری هنوز با نسخه‌های قدیمی‌تر کار می‌کند.
+
+**هر دو سرور را با هم به‌روز کن.** از 2.3.20 تانل جریانی با رمزنگاری `none`،
+یا روی `quic`، فقط وقتی وصل می‌شود که سرور مقابل هم ثابت کند توکن را دارد؛ این
+یعنی هر دو طرف باید 2.3.14 یا جدیدتر باشند. با سرور قدیمی‌تر، لاگ همین را می‌گوید
+و تانل وصل نمی‌شود.
 
 **نام‌های قدیمی هنوز کار می‌کنند.** `tcpobf`، `mtcpobf`، `wsobf` و `rawmux`
 به‌طور خودکار ترجمه می‌شوند (`tcpobf` می‌شود `tcp` + `obfs`)، پس تونل‌های موجود

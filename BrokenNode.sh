@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.3.19"
+VERSION="2.3.20"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -806,7 +806,16 @@ pick_preset(){
   echo    "   3) Stable       tolerate high packet loss" >&2
   echo    "   4) Low-Latency  gaming / VoIP" >&2
   echo    "   5) Eco          low CPU/RAM, weak VPS" >&2
-  local n; n=$(ask "Choice [1-5]" "1")
+  # "cancel" as $1 (a running tunnel): offer 0) Cancel as the default and print
+  # nothing for it, so Enter never silently overwrites the current settings.
+  local n
+  if [ "${1:-}" = cancel ]; then
+    echo    "   0) Cancel       keep the current settings" >&2
+    n=$(ask "Choice [0-5]" "0")
+    case "$n" in 1|2|3|4|5) : ;; *) return 0 ;; esac
+  else
+    n=$(ask "Choice [1-5]" "1")
+  fi
   case "$n" in 2) echo "15 turbo 10 2";; 3) echo "8 normal 10 4";; 4) echo "5 gaming 10 4";; 5) echo "20 normal 10 1";; *) echo "10 fast 10 3";; esac
 }
 
@@ -2036,8 +2045,10 @@ apply_preset(){
     read -t 30 -rp "  ▶ press ENTER to continue... " _; return
   fi
   echo; echo -e "${C_B}  Apply a preset to '$n'${C_N}  ${C_D}($tr) — sets keepalive and the kcp profile${C_N}"
-  local ka kmode kdata kparity
-  read -r ka kmode kdata kparity <<< "$(pick_preset)"
+  local ka kmode kdata kparity choice
+  choice="$(pick_preset cancel)"
+  if [ -z "$choice" ]; then info "cancelled — nothing changed"; return; fi
+  read -r ka kmode kdata kparity <<< "$choice"
   jset "$cfg" keepalive "$ka" int
   jset "$cfg" kcp_mode "$kmode"
   jset "$cfg" kcp_data "$kdata" int
@@ -2060,6 +2071,26 @@ d=json.load(open(f))
 d["ports"]=specs
 json.dump(d,open(f,"w"),indent=2); open(f,"a").write("\n")
 PYEOF
+}
+
+# ports_apply CFG NAME SPEC... writes the new list to a copy of the config and
+# has the core validate it (brokennode -check) before putting it in place. A
+# list the core would refuse — a port listed twice, the tunnel's own listen
+# port — is rejected with the core's reason and the running tunnel is left
+# untouched; written straight to the config it made the relay crash-loop.
+ports_apply(){
+  local cfg="$1" n="$2"; shift 2
+  local tmp out rc
+  tmp="$(dirname "$cfg")/.check-$n.json"
+  install -m 600 "$cfg" "$tmp" || return 1
+  ports_set "$tmp" "$@"
+  out="$("$BIN" -check -c "$tmp" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ] && ! grep -q 'flag provided but not defined' <<<"$out"; then
+    rm -f "$tmp"
+    err "Not applied: $(printf '%s\n' "$out" | sed -n 's/^config error: //p' | tail -n 1)"
+    return 1
+  fi
+  mv -f "$tmp" "$cfg"
 }
 
 # manage_ports adds and removes user port-forwards on a RUNNING relay without
@@ -2090,7 +2121,7 @@ PYEOF
       local i; for i in "${!ports[@]}"; do printf "   %2d) %s\n" "$((i+1))" "${ports[$i]}"; done
     fi
     echo -e "  ${C_D}──────────────────────────────────────────────${C_N}"
-    echo "   a) add a port     r) remove by number(s)     c) clear ALL     0) done"
+    echo "   a) add a port     r) remove by number(s)     c) replace the whole list     0) done"
     local act; act=$(menu_ask 'Choice')
     case "$act" in
       a|A)
@@ -2102,15 +2133,15 @@ PYEOF
         [ "$okp" = 0 ] && { warn "'$spec' is not a port mapping — use 443 or 8443=443 (1-65535)."; continue; }
         local proto sfx; proto=$(ask "Protocol  1)tcp 2)udp 3)both" "3")
         case "$proto" in 1) sfx="";; 2) sfx="/udp";; *) sfx="/both";; esac
-        ports+=("${spec}${sfx}")
-        ports_set "$cfg" "${ports[@]}"
-        info "added ${spec}${sfx}"; service_check "$n"
+        warn_port_clash "\"${spec}${sfx}\"" "$n"
+        if ports_apply "$cfg" "$n" "${ports[@]}" "${spec}${sfx}"; then
+          info "added ${spec}${sfx}"; service_check "$n"
+        fi
         ;;
       r|R)
         [ "${#ports[@]}" -eq 0 ] && { warn "nothing to remove"; continue; }
-        echo -e "  ${C_D}Enter numbers to remove: e.g. 1 3, or a range 2-4, or 'all'.${C_N}"
+        echo -e "  ${C_D}Enter numbers to remove: e.g. 1 3, or a range 2-4.${C_N}"
         local rsel; rsel=$(ask "Remove which" ""); [ -z "$rsel" ] && continue
-        if [ "$rsel" = all ]; then rsel="1-${#ports[@]}"; fi
         # Expand numbers and N-M ranges into a set of 1-based indices.
         local drop=() tok a b j
         for tok in $rsel; do
@@ -2128,13 +2159,36 @@ PYEOF
           if [ "$hit" = 1 ]; then removed=$((removed+1)); else keep+=("${ports[$i]}"); fi
         done
         [ "$removed" = 0 ] && { warn "no matching entries"; continue; }
-        ports_set "$cfg" "${keep[@]}"
-        info "removed $removed port-forward(s)"; service_check "$n"
+        if [ "${#keep[@]}" -eq 0 ]; then
+          warn "A relay needs at least one port. Use c) to replace the whole list instead."
+          continue
+        fi
+        if ports_apply "$cfg" "$n" "${keep[@]}"; then
+          info "removed $removed port-forward(s)"; service_check "$n"
+        fi
         ;;
       c|C)
-        [ "${#ports[@]}" -eq 0 ] && { warn "already empty"; continue; }
-        local yn; yn=$(ask "Remove ALL ${#ports[@]} port-forward(s)? y/N" "N")
-        case "$yn" in y|Y) ports_set "$cfg"; info "all port-forwards removed"; service_check "$n";; *) : ;; esac
+        # Replace the whole list. The old list stays until at least one new
+        # port has been entered — an empty list would stop the relay.
+        echo -e "  ${C_D}Enter the new ports; the old list is replaced only when you add at least one.${C_N}"
+        local newl=() s2 p2 okp2 pr2 sfx2 part2
+        while true; do
+          s2=$(ask "Port (443 or 8443=443, blank = done)" ""); s2="${s2// /}"
+          [ -z "$s2" ] && break
+          okp2=1
+          if [[ "$s2" =~ ^[0-9]+(=[0-9]+)?$ ]]; then
+            for part2 in ${s2//=/ }; do [ "$part2" -ge 1 ] && [ "$part2" -le 65535 ] || okp2=0; done
+          else okp2=0; fi
+          [ "$okp2" = 0 ] && { warn "'$s2' is not a port mapping — use 443 or 8443=443 (1-65535)."; continue; }
+          pr2=$(ask "Protocol  1)tcp 2)udp 3)both" "3")
+          case "$pr2" in 1) sfx2="";; 2) sfx2="/udp";; *) sfx2="/both";; esac
+          newl+=("${s2}${sfx2}"); echo -e "  ${C_G}  + ${s2}${sfx2}${C_N}"
+        done
+        if [ "${#newl[@]}" -eq 0 ]; then info "cancelled — the list is unchanged"; continue; fi
+        warn_port_clash "$(printf '"%s",' "${newl[@]}")" "$n"
+        if ports_apply "$cfg" "$n" "${newl[@]}"; then
+          info "port list replaced (${#newl[@]} port(s))"; service_check "$n"
+        fi
         ;;
       0|"") return ;;
       __eof__) return ;;
@@ -2314,12 +2368,12 @@ manage_tunnels(){
       echo -e "   ${C_G}12) Duplicate UDP packets${C_N}  ${C_D}[$(udp_dup_state "$n")]${C_N}   ${C_G}13) Change direction${C_N}  ${C_D}[$(tunnel_direction "$CFG_DIR/$n.json")]${C_N}"
       echo -e "   ${C_G}14) Pairing code${C_N}  ${C_D}(for setting up the foreign server)${C_N}"
       echo -e "   ${C_G}15) Speed test${C_N}  ${C_D}(download/upload/ping through this tunnel)${C_N}"
-      echo -e "   ${C_G}16) Apply preset${C_N}  ${C_D}(Optimized/High-Speed/Stable/Low-Latency/Eco)${C_N}   ${C_G}17) Port-forwards${C_N}  ${C_D}(add / remove / clear)${C_N}"
+      echo -e "   ${C_G}16) Apply preset${C_N}  ${C_D}(Optimized/High-Speed/Stable/Low-Latency/Eco)${C_N}   ${C_G}17) Port-forwards${C_N}  ${C_D}(add / remove / replace)${C_N}"
       echo "   0) Back"
       case "$(menu_ask 'Choice')" in
         1) systemctl enable --now "brokennode@$n" >/dev/null 2>&1; systemctl start "brokennode@$n"; info "started";;
-        2) systemctl stop "brokennode@$n"; info "stopped";;
-        3) systemctl restart "brokennode@$n"; info "restarted";;
+        2) systemctl disable --now "brokennode@$n" >/dev/null 2>&1; info "stopped — stays down until you start it (the health check leaves it alone)";;
+        3) systemctl enable "brokennode@$n" >/dev/null 2>&1; systemctl restart "brokennode@$n"; info "restarted";;
         4) live_logs "$n";;
         5) echo; cat "$CFG_DIR/$n.json"; echo; read -t 30 -rp "  ▶ press ENTER to continue... " _;;
         6) "${EDITOR:-$ED}" "$CFG_DIR/$n.json"; systemctl restart "brokennode@$n"; info "saved & restarted";;
@@ -2354,16 +2408,29 @@ manage_tunnels(){
 # A systemd timer runs `health-check` every couple of minutes.
 HEALTH_SVC=/etc/systemd/system/brokennode-health.service
 HEALTH_TMR=/etc/systemd/system/brokennode-health.timer
+# The check runs from a small standalone script at a fixed path, generated from
+# health_check below. It used to run the manager itself as "bash $SELF", but
+# the installer starts the manager as "bash BrokenNode.sh", so $SELF was a bare
+# relative name: systemd runs units from /, the unit failed every time, and no
+# tunnel was ever restarted. It also broke whenever the download folder moved.
+HEALTH_SH=/usr/local/lib/brokennode/health.sh
 
 install_health(){
   [ "$(id -u)" -eq 0 ] || return 0
+  mkdir -p "${HEALTH_SH%/*}" || return 0
+  {
+    echo '#!/bin/bash'
+    echo '# Generated by the BrokenNode manager (install_health) — rewritten on every update.'
+    printf 'CFG_DIR=%q\n' "$CFG_DIR"
+    declare -f health_check
+    echo 'health_check'
+  } > "$HEALTH_SH.tmp" && chmod 755 "$HEALTH_SH.tmp" && mv -f "$HEALTH_SH.tmp" "$HEALTH_SH"
   cat > "$HEALTH_SVC" <<EOF
 [Unit]
 Description=BrokenNode tunnel health check
-After=network-online.target
 [Service]
 Type=oneshot
-ExecStart=/bin/bash $SELF _health
+ExecStart=/bin/bash $HEALTH_SH
 EOF
   cat > "$HEALTH_TMR" <<EOF
 [Unit]
@@ -2379,37 +2446,50 @@ EOF
   systemctl enable --now brokennode-health.timer >/dev/null 2>&1
 }
 
-# health_check is the timer's body: restart any tunnel that is enabled but not
-# active, or that has reported its peer DOWN with no recovery for a few minutes.
-# It is deliberately conservative — it never restarts a tunnel that is merely
-# idle — so it cannot turn into a restart loop on a healthy link.
+# health_check is the timer's body. It must stand alone (it is copied into
+# $HEALTH_SH with declare -f): no calls to other functions of this script.
+#
+# A tunnel counts as wanted only while its unit is ENABLED — the menu's Stop and
+# stop-all disable it, so a tunnel taken down on purpose stays down. For each
+# wanted tunnel:
+#   - not running (inactive/failed) → restart it;
+#   - running, but the LAST link event of THIS run is a drop with no link left,
+#     at least 3 minutes old → restart it once.
+# Only the current run's journal is read (its invocation id): a disconnect from
+# before the last restart must not trigger another one. A drop that leaves
+# links up ("· N link(s) left", N > 0) is a healthy multi-link tunnel shedding
+# one link, not an outage. A fresh start gets 3 minutes to connect first.
 health_check(){
-  local f n st
+  local f n st now started inv last ts
+  now="$(date +%s)"
   for f in "$CFG_DIR"/*.json; do
     [ -e "$f" ] || continue
     n="$(basename "$f" .json)"
-    # Only look at tunnels the operator wants running.
     systemctl is-enabled "brokennode@$n" >/dev/null 2>&1 || continue
     st="$(systemctl is-active "brokennode@$n" 2>/dev/null)"
-    if [ "$st" != active ]; then
-      logger -t brokennode-health "restarting brokennode@$n (state: $st)" 2>/dev/null
-      systemctl restart "brokennode@$n" 2>/dev/null
+    case "$st" in
+      active) : ;;
+      activating|reloading|deactivating) continue ;;   # systemd is already on it
+      *) logger -t brokennode-health "restarting brokennode@$n (state: $st)" 2>/dev/null
+         systemctl restart "brokennode@$n" 2>/dev/null
+         continue ;;
+    esac
+    started="$(date -d "$(systemctl show -p ActiveEnterTimestamp --value "brokennode@$n" 2>/dev/null)" +%s 2>/dev/null)"
+    case "$started" in ''|*[!0-9]*) started=0 ;; esac
+    [ $((now - started)) -lt 180 ] && continue
+    inv="$(systemctl show -p InvocationID --value "brokennode@$n" 2>/dev/null)"
+    [ -n "$inv" ] || continue
+    last="$(journalctl _SYSTEMD_INVOCATION_ID="$inv" -o short-unix --no-pager 2>/dev/null \
+            | grep -E '🟢 Connected|peer CONNECTED|🔴 Disconnected|TUNNEL IS DOWN|peer timeout' | tail -1)"
+    [ -n "$last" ] || continue
+    case "$last" in *"🟢 Connected"*|*"peer CONNECTED"*) continue ;; esac
+    if [[ "$last" =~ ·\ ([0-9]+)\ link\(s\)\ left ]] && [ "${BASH_REMATCH[1]}" -gt 0 ]; then
       continue
     fi
-    # Active process, but has the peer link been down for a while? Compare the
-    # unix time of the last "down" line with the last "up" line in the recent
-    # journal. A quiet, healthy tunnel logs neither and is left alone; a tunnel
-    # whose most recent event is a disconnect older than the threshold is
-    # restarted. Timestamps are integers (seconds); the fractional part is cut.
-    local jr down up now
-    jr="$(journalctl -u "brokennode@$n" --since '-10min' -n 400 --no-pager -o short-unix 2>/dev/null)"
-    down="$(printf '%s\n' "$jr" | grep -E '🔴 Disconnected|TUNNEL IS DOWN|peer timeout' | tail -1 | awk '{print int($1)}')"
-    [ -z "$down" ] && continue                       # never went down recently
-    up="$(printf '%s\n' "$jr" | grep -E '🟢 Connected|peer CONNECTED' | tail -1 | awk '{print int($1)}')"
-    [ -n "$up" ] && [ "$up" -ge "$down" ] && continue # it came back after the last drop
-    now="$(date +%s)"
-    if [ $((now - down)) -ge 180 ]; then
-      logger -t brokennode-health "restarting brokennode@$n (peer link down ~$((now - down))s)" 2>/dev/null
+    ts="${last%%.*}"
+    case "$ts" in ''|*[!0-9]*) continue ;; esac
+    if [ $((now - ts)) -ge 180 ]; then
+      logger -t brokennode-health "restarting brokennode@$n (no link to the other end for $((now - ts))s)" 2>/dev/null
       systemctl restart "brokennode@$n" 2>/dev/null
     fi
   done
@@ -2514,7 +2594,7 @@ uninstall_all(){
   systemctl list-units --all --no-legend 2>/dev/null | grep -o 'brokennode@[^ ]*\.service' | sort -u | while read -r u; do systemctl disable --now "$u" >/dev/null 2>&1; done
   systemctl disable --now brokennode-autoupdate.timer >/dev/null 2>&1
   systemctl disable --now brokennode-health.timer >/dev/null 2>&1
-  rm -f "$AU_SVC" "$AU_TIMER" "$HEALTH_SVC" "$HEALTH_TMR" "$TPL"
+  rm -f "$AU_SVC" "$AU_TIMER" "$HEALTH_SVC" "$HEALTH_TMR" "$TPL"; rm -rf "${HEALTH_SH%/*}"
   systemctl daemon-reload 2>/dev/null; systemctl reset-failed 2>/dev/null
   rm -f "$BIN" "$BIN.bak"
   rm -rf "$CFG_DIR"
@@ -2721,6 +2801,9 @@ tune_network(){
 
 main_menu(){
   auto_apply_bundled
+  # Repair a health-check unit written by 2.3.16–2.3.19, whose ExecStart
+  # pointed at a relative path and never ran. Cheap and idempotent.
+  [ -f "$HEALTH_SVC" ] && ! grep -q "$HEALTH_SH" "$HEALTH_SVC" 2>/dev/null && install_health
   while true; do
     banner
     echo
@@ -2758,8 +2841,14 @@ case "${1:-}" in
     for f in "$CFG_DIR"/*.json; do [ -e "$f" ] || continue; n=$(basename "$f" .json); units="$units brokennode@$n"; done
     if [ -z "$units" ]; then echo "no tunnels found in $CFG_DIR"; exit 0; fi
     echo "${action}ing:$units"
+    # Enabled means "wanted running": stop disables (so the health check and a
+    # reboot leave the tunnels down), start and restart enable.
     # shellcheck disable=SC2086
-    systemctl "$action" $units && echo "done." ;;
+    case "$action" in
+      stop)  systemctl disable --now $units >/dev/null 2>&1 ;;
+      start) systemctl enable --now $units >/dev/null 2>&1 ;;
+      *)     systemctl enable $units >/dev/null 2>&1; systemctl restart $units ;;
+    esac && echo "done." ;;
   uninstall|purge) uninstall_all ;;
   version) echo "BrokenNode manager v$VERSION" ;;
   update) update_self ;;
