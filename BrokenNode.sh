@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.3.21"
+VERSION="2.3.22"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -231,7 +231,7 @@ is_tunnel_transport(){
 
 # transport_family groups transports by the config fields they need, which is
 # what decides whether one can replace another in place:
-#   stream  bind_addr / remote_addr         tcp mtcp mptcp ws tcpnomux kcp quic sctp
+#   stream  bind_addr / remote_addr         tcp mtcp mptcp ws tcpnomux kcp sctp
 #   p2p4    local_ip / remote_ip / tun_* v4 gre gretap ipip l2tp udp icmp
 #   sit     the same fields, but an IPv6 tunnel pair
 transport_family(){
@@ -327,7 +327,7 @@ for f in sorted(glob.glob(os.path.join(d, "*.json"))):
         listens = (c.get("mode") == "server") != direct
         b = (c.get("bind_addr") or "") if listens else ""
         if ":" in b:
-            pr = "udp" if c.get("transport") in ("kcp", "quic") else "tcp"
+            pr = "udp" if c.get("transport") == "kcp" else "tcp"
             print(b.rsplit(":", 1)[1] + "/" + pr)
     elif mode == "carriers":
         # key = carrier protocol (udp, icmp, tcp). A carrier port — the echo
@@ -425,7 +425,7 @@ client_from_code(){
   local cfg="$CFG_DIR/$name.json" b
   b="$(jget "$cfg" bind_addr)"
   if [ -n "$b" ]; then
-    local pr=tcp; case "$(jget "$cfg" transport)" in kcp|quic) pr=udp ;; esac
+    local pr=tcp; [ "$(jget "$cfg" transport)" = kcp ] && pr=udp
     echo -e "  ${C_D}Direct mode: the Iran server connects here on ${pr^^} ${b##*:} — allow it in this server's firewall.${C_N}"
   fi
   # Only log lines from THIS start count: an overwritten tunnel of the same
@@ -479,7 +479,7 @@ import base64, glob, json, os, random, re, subprocess, sys, zlib
 
 cfgdir, cmd, args = sys.argv[1], sys.argv[2], sys.argv[3:]
 P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp")
-KNOWN = P2P + ("tcp", "mtcp", "mptcp", "ws", "tcpnomux", "kcp", "quic", "sctp",
+KNOWN = P2P + ("tcp", "mtcp", "mptcp", "ws", "tcpnomux", "kcp", "sctp",
                "tcpobf", "mtcpobf", "wsobf", "rawmux")
 
 def configs(excl=""):
@@ -628,7 +628,7 @@ def conflicts(name, c):
             out.append("udp carrier port %s is already used here" % (c.get("carrier_port") or 6262))
     b = str(c.get("bind_addr") or "")
     if c.get("mode") == "client" and ":" in b:
-        proto = "udp" if t in ("kcp", "quic") else "tcp"
+        proto = "udp" if t == "kcp" else "tcp"
         if int(b.rsplit(":", 1)[1]) in used_ports_(proto, name):
             out.append("port %s/%s (to listen on) is already used here" % (b.rsplit(":", 1)[1], proto))
     return out
@@ -665,6 +665,9 @@ elif cmd == "pair" and args[0] == "apply":
                 int(d["cfg"][k])
     except Exception as e:
         print("ERR the pairing code is damaged or incomplete (%s) — copy the whole line again" % e)
+        sys.exit(2)
+    if d["cfg"].get("transport") == "quic":
+        print("ERR this pairing code is for quic, which 2.3.22 removed — on the Iran server change that tunnel to kcp or mtcp (Manage tunnels → Change transport) and paste its new code")
         sys.exit(2)
     if (d["cfg"].get("transport") or "tcp") not in KNOWN:
         print("ERR this pairing code is for a transport this release does not have — re-create the tunnel on the Iran server with another transport")
@@ -830,7 +833,6 @@ pick_transport(){
   echo    "   3) ws        WebSocket/HTTP + smux    (HTTP mimicry)" >&2
   echo    "   4) tcpnomux  TCP pool, no HoL         (heavy single-flow)" >&2
   echo -e "   5) kcp       KCP/UDP + FEC            ${C_Y}(only if UDP works)${C_N}" >&2
-  echo -e "   6) quic      QUIC/UDP, built-in TLS   ${C_R}(slow on lossy paths — prefer kcp)${C_N}" >&2
   echo -e "   8) mptcp     Multipath TCP (kernel)   ${C_G}(link aggregation, kernel >= 5.6)${C_N}" >&2
   echo -e "   9) sctp      Multi-stream + multihome ${C_Y}(needs kernel sctp module)${C_N}" >&2
   echo -e "  ${C_D}── kernel tunnels (point-to-point, root on both ends) ──${C_N}" >&2
@@ -853,20 +855,10 @@ pick_transport(){
       3|ws) echo ws; return ;;          4|tcpnomux) echo tcpnomux; return ;;
       5|kcp) echo kcp; return ;;
       6|quic)
-        # Measured: with 0.3% packet loss on an 80ms path, quic carried 4-5
-        # Mbit in total and 0.1 Mbit per download, where the TCP carriers
-        # carried 220 (its congestion control backs off on every random loss).
-        # And with NO loss: traffic one way fills the path's queue, the RTT
-        # the other way rises, quic-go's hybrid slow start takes that for
-        # congestion and leaves slow start with a ~40 KB window that then
-        # grows one packet per round trip — about 10 Mbit (measured, 2.3.9).
-        {
-          echo -e "  ${C_Y}[!]${C_N} quic slows to a crawl when the path loses packets — as paths in Iran do"
-          echo -e "      ${C_D}(tested: 0.3% loss → about 5 Mbit in total). mtcp or kcp hold up far better.${C_N}"
-          echo -e "      ${C_D}Even with no loss, while users download, its upload direction stays near 10 Mbit.${C_N}"
-        } >&2
-        local qc; qc=$(ask "Use quic anyway? y/N" "N")
-        case "$qc" in y|Y) echo quic; return ;; *) continue ;; esac ;;
+        # 6 was quic, removed in 2.3.22 (it slowed to a few Mbit/s on lossy
+        # paths). The number stays taken so an old habit never lands on
+        # another transport by accident.
+        err "quic was removed in 2.3.22 — it slowed to a few Mbit/s on lossy paths. Use 5) kcp (UDP) or 2) mtcp (TCP)." ;;
       8|mptcp) echo mptcp; return ;;    9|sctp) echo sctp; return ;;
       10|gre) echo gre; return ;;       11|gretap) echo gretap; return ;;
       12|ipip) echo ipip; return ;;     13|sit) echo sit; return ;;
@@ -877,15 +869,13 @@ pick_transport(){
   done
 }
 
-# pick_encryption asks whether the chosen transport should be encrypted. quic
-# already encrypts with TLS 1.3 and the kernel tunnels carry plain IP, so
-# neither takes a layer and neither is asked.
+# pick_encryption asks whether the chosen transport should be encrypted. The
+# kernel tunnels carry plain IP and take no layer, so they are not asked.
 pick_encryption(){
   local tr="$1"
-  # quic (TLS 1.3) and the kernel tunnels (encrypt at the service) take no
-  # encryption layer, so they are not asked.
+  # The kernel tunnels (encrypt at the service) take no encryption layer.
   case "$tr" in
-    quic|gre|gretap|ipip|sit|l2tp) echo none; return ;;
+    gre|gretap|ipip|sit|l2tp) echo none; return ;;
   esac
   # udp/icmp seal each datagram: offer aead/none (a stream cipher cannot key
   # packets that may be lost or reordered).
@@ -1274,7 +1264,7 @@ create_tunnel(){
     local dir; dir=$(pick_direction)
     read -r ka kmode kdata kparity <<< "$(pick_preset)"; build_extra "$role" "$tr" "$dir"
     local cfg="$CFG_DIR/$name.json"
-    local bproto=tcp; case "$tr" in kcp|quic) bproto=udp ;; esac
+    local bproto=tcp; [ "$tr" = kcp ] && bproto=udp
     if [ "$role" = server ]; then
       local bind="" remote="" addrline ports token qtotal qup qdown
       if [ "$dir" = direct ]; then
@@ -1650,13 +1640,10 @@ speed_test(){
     local extra; extra=$(awk -v a="$tping" -v b="$pavg" 'BEGIN{printf "%.0f", a-b}')
     if [ "$extra" -gt 30 ]; then warnln "The tunnel adds ${extra}ms over the bare path — the tunnel or its links are queueing. Try mtcp or tcpnomux."
     else okln "The tunnel adds ${extra}ms over the bare path."; fi
-    if awk -v l="${ploss:-0}" 'BEGIN{exit !(l > 2)}'; then warnln "The path loses ${ploss}% of packets: kcp or udp copes with loss best; quic suffers most."; fi
+    if awk -v l="${ploss:-0}" 'BEGIN{exit !(l > 2)}'; then warnln "The path loses ${ploss}% of packets: kcp or udp copes with loss best."; fi
   fi
   if awk -v d="$down" 'BEGIN{exit !(d < 20)}'; then
-    case "$tr" in
-      quic) warnln "quic slows down sharply on lossy paths. Compare with mtcp or tcp (option 9 changes the transport)." ;;
-      *) warnln "Low speed: run the test again with another transport (option 9) and compare below." ;;
-    esac
+    warnln "Low speed: run the test again with another transport (option 9) and compare below."
   fi
   if awk -v j="$tjit" 'BEGIN{exit !(j > 20)}'; then warnln "High jitter: games and calls will feel it. Try the udp transport or the gaming profile."; fi
   local dir; dir="$(jget "$cfg" direction)"
@@ -1686,11 +1673,11 @@ doctor_dial(){
   esac
   host="${host#[}"; host="${host%]}"
   [ -z "$host" ] && { warnln "  no remote_addr to check"; warns=$((warns+1)); return; }
-  # A TCP carrier can be probed directly; kcp and quic run over UDP and sctp
+  # A TCP carrier can be probed directly; kcp runs over UDP and sctp
   # over its own protocol, where a TCP probe says nothing, so for them only
   # the ping below speaks.
   case "$trans" in
-  kcp|quic|sctp) : ;;
+  kcp|sctp) : ;;
   *)
     if [ -n "$port" ] && command -v timeout >/dev/null 2>&1; then
       if timeout 5 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null; then
@@ -1906,7 +1893,7 @@ doctor(){
   echo -e "  ${C_D}──────────────────────────────────────────────${C_N}"
   if [ "$warns" -eq 0 ]; then echo -e "  ${C_G}All checks passed.${C_N}"
   else echo -e "  ${C_Y}$warns warning(s) above.${C_N}"; fi
-  echo -e "  ${C_D}Note: UDP transports (kcp/quic) also need UDP open end-to-end;${C_N}"
+  echo -e "  ${C_D}Note: kcp (a UDP transport) also needs UDP open end-to-end;${C_N}"
   echo -e "  ${C_D}test with:  nc -u <relay-ip> <port>  (both sides).${C_N}"
 }
 
@@ -1957,50 +1944,9 @@ except Exception:
 PYEOF
 }
 
-# udp_dup_state reads the switch back. jget prints a JSON bool through Python,
-# so the value is the word True or False.
-udp_dup_state(){
-  [ "$(jget "$CFG_DIR/$1.json" udp_duplicate)" = "True" ] && echo on || echo off
-}
-
-# toggle_udp_duplicate turns duplicate-send on or off for ONE tunnel.
-#
-# Per tunnel and not a global default because it costs exactly double the
-# bandwidth of the UDP it applies to. For a game that is a few hundred kbit and
-# well worth it; for a bulk UDP flow it is not.
-toggle_udp_duplicate(){
-  local n="$1"; local cfg="$CFG_DIR/$n.json" cur
-  cur="$(udp_dup_state "$n")"
-  echo
-  echo -e "${C_B}  Duplicate UDP packets  ${C_D}— currently $cur${C_N}"
-  echo -e "  ${C_D}Sends every UDP datagram twice and drops the copy at the far end,${C_N}"
-  echo -e "  ${C_D}so a packet has to be lost TWICE before the game notices.${C_N}"
-  echo
-  echo -e "  ${C_G}Fixes${C_N} loss that hits the two copies independently: a policer"
-  echo -e "  ${C_D}dropping one packet in a hundred, or a lossy last mile.${C_N}"
-  echo -e "  ${C_Y}Does not fix${C_N} loss from a full queue — both copies sit in that same"
-  echo -e "  ${C_D}queue, so both are dropped. Shape the uplink for that (tune, option 2).${C_N}"
-  echo
-  echo -e "  ${C_D}Costs double this tunnel's UDP bandwidth. Needs quic at both ends,${C_N}"
-  echo -e "  ${C_D}both new enough to negotiate it; otherwise it quietly does nothing.${C_N}"
-  echo
-  local target; target=$([ "$cur" = on ] && echo off || echo on)
-  local want; want="$(ask "Turn it $target? yes/no" "no")"
-  [ "$want" = yes ] || { info "Left it $cur."; return; }
-  if [ "$target" = on ]; then
-    jset "$cfg" udp_duplicate true bool
-    info "Duplicate-send is ON for $n."
-    warn "Set it on the OTHER end too, or only one direction is protected."
-  else
-    jset "$cfg" udp_duplicate false bool
-    info "Duplicate-send is OFF for $n."
-  fi
-  systemctl restart "brokennode@$n" >/dev/null 2>&1
-  info "Restarted brokennode@$n."
-}
 
 # is_udp_transport: carried over UDP, so the relay's firewall must allow UDP.
-is_udp_transport(){ case "$1" in kcp|quic) return 0 ;; *) return 1 ;; esac; }
+is_udp_transport(){ [ "$1" = kcp ]; }
 
 # service_check restarts a tunnel and reports whether it actually came up,
 # with the reason from its log when it did not. "restarted" alone told the
@@ -2059,6 +2005,8 @@ change_transport(){
     *)        jset "$cfg" pool_size "" del; jset "$cfg" links "" del ;;
   esac
   [ "$new" != sctp ] && { jset "$cfg" sctp_streams "" del; jset "$cfg" sctp_multihoming "" del; }
+  # Settings only quic had (removed in 2.3.22).
+  for k in alpn server_name udp_duplicate; do jset "$cfg" "$k" "" del; done
   cfg_commit "$cfg" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
   info "transport: $cur/$curenc -> $new/$newenc"
   if tunnel_listens "$cfg" && is_udp_transport "$new" && ! is_udp_transport "$cur"; then
@@ -2118,7 +2066,7 @@ change_direction(){
   echo -e "  ${C_D}reverse: the foreign server connects to the Iran server.${C_N}"
   echo -e "  ${C_D}direct:  the Iran server connects to the foreign server.${C_N}"
   local c; c=$(ask "Switch to $new? y/N" "N"); case "$c" in y|Y) :;; *) warn "cancelled"; return;; esac
-  local bproto=tcp; case "$tr" in kcp|quic) bproto=udp ;; esac
+  local bproto=tcp; [ "$tr" = kcp ] && bproto=udp
   local bind remote port
   bind="$(jget "$cfg" bind_addr)"; remote="$(jget "$cfg" remote_addr)"
   cfg_begin "$cfg"
@@ -2349,6 +2297,23 @@ PYEOF
 
 # tune_tunnel exposes the per-tunnel network knobs. Blank input keeps the current
 # value, so it doubles as a way to review settings without changing them.
+# tune_apply NAME LIVE WORK — the core checks the edited WORK copy; if it passes
+# it replaces LIVE and the tunnel restarts, otherwise LIVE is left untouched.
+tune_apply(){
+  local n="$1" live="$2" work="$3" out
+  if cmp -s "$live" "$work"; then info "no changes"; return 1; fi
+  out="$("$BIN" -check -c "$work" 2>&1)" || {
+    if ! grep -q 'flag provided but not defined' <<<"$out"; then
+      err "Not applied — the core refuses the change: $(check_reason "$out")"
+      info "The previous settings are kept; the tunnel was not restarted."
+      return 1
+    fi
+  }
+  chmod 600 "$work" 2>/dev/null
+  mv -f "$work" "$live"
+  systemctl restart "brokennode@$n" >/dev/null 2>&1
+}
+
 tune_tunnel(){
   local n="$1"; local cfg="$CFG_DIR/$n.json"
   local tr mode; tr="$(jget "$cfg" transport)"; mode="$(jget "$cfg" mode)"
@@ -2357,24 +2322,30 @@ tune_tunnel(){
 
   local v cur
   local fam; fam=$(transport_family "$tr")
-  cfg_begin "$cfg"
+  # Every edit goes to a working COPY, not the live config. Only at the very
+  # end, if the core accepts it, does it replace the live config. So an input
+  # that ends half-way through the questions (ask stops the manager) leaves the
+  # running tunnel exactly as it was, rather than saving a half-set of changes
+  # that would apply at the next restart.
+  local work; work="$CFG_DIR/.tune-$n.json"
+  cp -p "$cfg" "$work" || { err "Could not prepare the edit."; return; }
+  trap 'rm -f "$work"' RETURN
   if [ "$fam" != stream ]; then
     # Point-to-point tunnels have no smux, bind port or keepalive; what can be
     # tuned is the MTU and the addresses, which live in the config itself.
     cur="$(jget "$cfg" mtu)"
-    v=$(ask "  mtu (0 = default) [${cur:-0}]" ""); [ -n "$v" ] && jset "$cfg" mtu "$v" int
+    v=$(ask "  mtu (0 = default) [${cur:-0}]" ""); [ -n "$v" ] && jset "$work" mtu "$v" int
     if [ "$tr" = gre ] || [ "$tr" = gretap ] || [ "$tr" = ipip ] || [ "$tr" = sit ]; then
       cur="$(jget "$cfg" tun_ttl)"
-      v=$(ask "  tun_ttl (outer TTL, 0 = kernel default) [${cur:-0}]" ""); [ -n "$v" ] && jset "$cfg" tun_ttl "$v" int
+      v=$(ask "  tun_ttl (outer TTL, 0 = kernel default) [${cur:-0}]" ""); [ -n "$v" ] && jset "$work" tun_ttl "$v" int
     fi
     if [ "$mode" = client ]; then
       cur="$(jget "$cfg" target_host)"
-      v=$(ask "  target_host (where traffic is delivered locally) [$cur]" ""); [ -n "$v" ] && jset "$cfg" target_host "$v"
+      v=$(ask "  target_host (where traffic is delivered locally) [$cur]" ""); [ -n "$v" ] && jset "$work" target_host "$v"
     fi
     cur="$(jget "$cfg" log_level)"
-    v=$(ask "  log_level (info/debug/error) [$cur]" ""); [ -n "$v" ] && jset "$cfg" log_level "$v"
-    cfg_commit "$cfg" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
-    systemctl restart "brokennode@$n" >/dev/null 2>&1
+    v=$(ask "  log_level (info/debug/error) [$cur]" ""); [ -n "$v" ] && jset "$work" log_level "$v"
+    tune_apply "$n" "$cfg" "$work" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
     info "settings saved, '$n' restarted"
     warn "mtu should match on both ends."
     read -t 30 -rp "  ▶ press ENTER to continue... " _
@@ -2382,7 +2353,7 @@ tune_tunnel(){
   fi
 
   cur="$(jget "$cfg" keepalive)"
-  v=$(ask "  keepalive seconds (lower = faster dead-peer detection) [$cur]" ""); [ -n "$v" ] && jset "$cfg" keepalive "$v" int
+  v=$(ask "  keepalive seconds (lower = faster dead-peer detection) [$cur]" ""); [ -n "$v" ] && jset "$work" keepalive "$v" int
 
   # Both the current and the legacy transport names are matched here on purpose:
   # this reads whatever is already in the config file, and a tunnel created by an
@@ -2392,81 +2363,80 @@ tune_tunnel(){
     kcp|rawmux)
       cur="$(jget "$cfg" kcp_mode)"
       echo -e "  ${C_D}kcp_mode: gaming = lowest/steadiest latency · fast · turbo = throughput · normal = low CPU${C_N}"
-      v=$(ask "  kcp_mode [$cur]" ""); [ -n "$v" ] && jset "$cfg" kcp_mode "$v"
+      v=$(ask "  kcp_mode [$cur]" ""); [ -n "$v" ] && jset "$work" kcp_mode "$v"
       cur="$(jget "$cfg" kcp_data)"
-      v=$(ask "  kcp_data  (FEC data shards, e.g. 10) [$cur]" ""); [ -n "$v" ] && jset "$cfg" kcp_data "$v" int
+      v=$(ask "  kcp_data  (FEC data shards, e.g. 10) [$cur]" ""); [ -n "$v" ] && jset "$work" kcp_data "$v" int
       cur="$(jget "$cfg" kcp_parity)"
       echo -e "  ${C_D}Higher parity repairs more loss without retransmits (steadier ping) but uses more bandwidth.${C_N}"
-      v=$(ask "  kcp_parity (FEC parity shards, e.g. 4) [$cur]" ""); [ -n "$v" ] && jset "$cfg" kcp_parity "$v" int
+      v=$(ask "  kcp_parity (FEC parity shards, e.g. 4) [$cur]" ""); [ -n "$v" ] && jset "$work" kcp_parity "$v" int
       cur="$(jget "$cfg" kcp_mtu)"
       echo -e "  ${C_D}MTU: 1200 is safe for gaming; raise only if the path has no fragmentation.${C_N}"
-      v=$(ask "  kcp_mtu [${cur:-auto}]" ""); [ -n "$v" ] && jset "$cfg" kcp_mtu "$v" int
+      v=$(ask "  kcp_mtu [${cur:-auto}]" ""); [ -n "$v" ] && jset "$work" kcp_mtu "$v" int
       cur="$(jget "$cfg" kcp_sndwnd)"
-      v=$(ask "  kcp_sndwnd (send window, packets) [${cur:-auto}]" ""); [ -n "$v" ] && jset "$cfg" kcp_sndwnd "$v" int
+      v=$(ask "  kcp_sndwnd (send window, packets) [${cur:-auto}]" ""); [ -n "$v" ] && jset "$work" kcp_sndwnd "$v" int
       cur="$(jget "$cfg" kcp_rcvwnd)"
-      v=$(ask "  kcp_rcvwnd (recv window, packets) [${cur:-auto}]" ""); [ -n "$v" ] && jset "$cfg" kcp_rcvwnd "$v" int
+      v=$(ask "  kcp_rcvwnd (recv window, packets) [${cur:-auto}]" ""); [ -n "$v" ] && jset "$work" kcp_rcvwnd "$v" int
       cur="$(jget "$cfg" links)"
       echo -e "  ${C_D}Parallel kcp links (0 = auto: 4). One kcp link tops out near 120 Mbit/s for all users;${C_N}"
       echo -e "  ${C_D}4 carry about twice as much. 1 gives the steadiest ping under heavy load (gaming).${C_N}"
       echo -e "  ${C_D}Set it on the end that dials (the foreign server, or the relay in direct mode).${C_N}"
-      v=$(ask "  links [${cur:-0}]" ""); [ -n "$v" ] && jset "$cfg" links "$v" int
+      v=$(ask "  links [${cur:-0}]" ""); [ -n "$v" ] && jset "$work" links "$v" int
       ;;
     mtcp|mtcpobf)
       cur="$(jget "$cfg" links)"
       echo -e "  ${C_D}links: 0 = auto-scale with load (recommended)${C_N}"
-      v=$(ask "  links [${cur:-0}]" ""); [ -n "$v" ] && jset "$cfg" links "$v" int
+      v=$(ask "  links [${cur:-0}]" ""); [ -n "$v" ] && jset "$work" links "$v" int
       ;;
     tcpnomux)
       cur="$(jget "$cfg" pool_size)"
       echo -e "  ${C_D}pool_size: 0 = auto-scale with load (recommended)${C_N}"
-      v=$(ask "  pool_size [${cur:-0}]" ""); [ -n "$v" ] && jset "$cfg" pool_size "$v" int
+      v=$(ask "  pool_size [${cur:-0}]" ""); [ -n "$v" ] && jset "$work" pool_size "$v" int
       ;;
     sctp)
       cur="$(jget "$cfg" sctp_streams)"
-      v=$(ask "  sctp_streams (1-65535) [${cur:-8}]" ""); [ -n "$v" ] && jset "$cfg" sctp_streams "$v" int
+      v=$(ask "  sctp_streams (1-65535) [${cur:-8}]" ""); [ -n "$v" ] && jset "$work" sctp_streams "$v" int
       cur="$(jget "$cfg" sctp_multihoming)"
       echo -e "  ${C_D}Extra local IPs for multihoming, comma-separated (blank keeps; '-' clears).${C_N}"
       v=$(ask "  sctp_multihoming [${cur:-none}]" "")
-      if [ "$v" = "-" ]; then jset "$cfg" sctp_multihoming "" del; elif [ -n "$v" ]; then jset "$cfg" sctp_multihoming "$v"; fi
+      if [ "$v" = "-" ]; then jset "$work" sctp_multihoming "" del; elif [ -n "$v" ]; then jset "$work" sctp_multihoming "$v"; fi
       ;;
   esac
 
   cur="$(jget "$cfg" smux_recv_mb)"
-  v=$(ask "  smux_recv_mb (session window MB; larger = more throughput on long links) [${cur:-16}]" ""); [ -n "$v" ] && jset "$cfg" smux_recv_mb "$v" int
+  v=$(ask "  smux_recv_mb (session window MB; larger = more throughput on long links) [${cur:-16}]" ""); [ -n "$v" ] && jset "$work" smux_recv_mb "$v" int
   cur="$(jget "$cfg" smux_stream_mb)"
-  v=$(ask "  smux_stream_mb (per-stream window MB) [${cur:-8}]" ""); [ -n "$v" ] && jset "$cfg" smux_stream_mb "$v" int
+  v=$(ask "  smux_stream_mb (per-stream window MB) [${cur:-8}]" ""); [ -n "$v" ] && jset "$work" smux_stream_mb "$v" int
 
   if [ "$(transport_family "$tr")" = stream ]; then
     if tunnel_listens "$cfg"; then
       cur="$(jget "$cfg" bind_addr)"
       v=$(ask "  bind_addr (listen host:port) [$cur]" "")
-      [ -n "$v" ] && jset "$cfg" bind_addr "$(check_bind "$v")"
+      [ -n "$v" ] && jset "$work" bind_addr "$(check_bind "$v")"
     else
       cur="$(jget "$cfg" remote_addr)"
       v=$(ask "  remote_addr (the other end, IP:port) [$cur]" ""); v="${v// /}"
       if [ -n "$v" ]; then
         case "$v" in *:*) : ;; *) v="$v:${cur##*:}" ;; esac  # IP only: keep the port
-        jset "$cfg" remote_addr "$v"
+        jset "$work" remote_addr "$v"
       fi
     fi
   fi
   if [ "$mode" = server ]; then
     cur="$(jget "$cfg" quota_total_gb)"
-    v=$(ask "  quota_total_gb (0 = unlimited) [${cur:-0}]" ""); [ -n "$v" ] && jset "$cfg" quota_total_gb "$v" float
+    v=$(ask "  quota_total_gb (0 = unlimited) [${cur:-0}]" ""); [ -n "$v" ] && jset "$work" quota_total_gb "$v" float
     cur="$(jget "$cfg" quota_up_gb)"
-    v=$(ask "  quota_up_gb   (0 = unlimited) [${cur:-0}]" ""); [ -n "$v" ] && jset "$cfg" quota_up_gb "$v" float
+    v=$(ask "  quota_up_gb   (0 = unlimited) [${cur:-0}]" ""); [ -n "$v" ] && jset "$work" quota_up_gb "$v" float
     cur="$(jget "$cfg" quota_down_gb)"
-    v=$(ask "  quota_down_gb (0 = unlimited) [${cur:-0}]" ""); [ -n "$v" ] && jset "$cfg" quota_down_gb "$v" float
+    v=$(ask "  quota_down_gb (0 = unlimited) [${cur:-0}]" ""); [ -n "$v" ] && jset "$work" quota_down_gb "$v" float
   else
     cur="$(jget "$cfg" target_host)"
-    v=$(ask "  target_host (where traffic is delivered locally) [$cur]" ""); [ -n "$v" ] && jset "$cfg" target_host "$v"
+    v=$(ask "  target_host (where traffic is delivered locally) [$cur]" ""); [ -n "$v" ] && jset "$work" target_host "$v"
   fi
 
   cur="$(jget "$cfg" log_level)"
-  v=$(ask "  log_level (info/debug/error) [$cur]" ""); [ -n "$v" ] && jset "$cfg" log_level "$v"
+  v=$(ask "  log_level (info/debug/error) [$cur]" ""); [ -n "$v" ] && jset "$work" log_level "$v"
 
-  cfg_commit "$cfg" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
-  systemctl restart "brokennode@$n" >/dev/null 2>&1
+  tune_apply "$n" "$cfg" "$work" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
   info "settings saved, '$n' restarted"
   warn "Transport-level settings (kcp_*, links, smux_*) must MATCH on both sides."
   read -t 30 -rp "  ▶ press ENTER to continue... " _
@@ -2533,7 +2503,7 @@ manage_tunnels(){
       echo "   4) Live logs   5) Show config   6) Edit config (nano)"
       echo "   7) Delete   8) Live stats"
       echo -e "   ${C_G}9) Change transport${C_N}   ${C_G}10) Change peer IP${C_N}   ${C_G}11) Tune settings (MTU/FEC/window...)${C_N}"
-      echo -e "   ${C_G}12) Duplicate UDP packets${C_N}  ${C_D}[$(udp_dup_state "$n")]${C_N}   ${C_G}13) Change direction${C_N}  ${C_D}[$(tunnel_direction "$CFG_DIR/$n.json")]${C_N}"
+      echo -e "   ${C_G}13) Change direction${C_N}  ${C_D}[$(tunnel_direction "$CFG_DIR/$n.json")]${C_N}"
       echo -e "   ${C_G}14) Pairing code${C_N}  ${C_D}(for setting up the foreign server)${C_N}"
       echo -e "   ${C_G}15) Speed test${C_N}  ${C_D}(download/upload/ping through this tunnel)${C_N}"
       echo -e "   ${C_G}16) Apply preset${C_N}  ${C_D}(Optimized/High-Speed/Stable/Low-Latency/Eco)${C_N}   ${C_G}17) Port-forwards${C_N}  ${C_D}(add / remove / replace)${C_N}"
@@ -2555,7 +2525,7 @@ manage_tunnels(){
         9) change_transport "$n";;
         10) change_relay_ip "$n";;
         11) tune_tunnel "$n";;
-        12) toggle_udp_duplicate "$n";;
+        12) warn "Duplicate UDP packets was removed with quic in 2.3.22 (only quic could carry it).";;
         13) change_direction "$n";;
         14) if [ "$(jget "$CFG_DIR/$n.json" mode)" = server ]; then show_pair_code "$CFG_DIR/$n.json"; else warn "Pairing codes come from the Iran (server) side."; fi
             read -t 60 -rp "  ▶ press ENTER to continue... " _;;
@@ -2986,8 +2956,34 @@ tune_network(){
   warn "Run this on the OTHER server too, then restart the tunnels."
 }
 
+# warn_removed_transports names the tunnels still configured for quic, which
+# 2.3.22 removed: their service now stops at start with a message saying so,
+# and this says the same up front, with the way out.
+warn_removed_transports(){
+  local f n list=""
+  for f in "$CFG_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    [ "$(jget "$f" transport)" = quic ] || continue
+    n="$(basename "$f" .json)"; list="$list $n"
+  done
+  [ -n "$list" ] || return 0
+  echo
+  warn "These tunnels use quic, which this release removed:${C_Y}$list${C_N}"
+  echo -e "  ${C_D}They will not start. Switch each to kcp (UDP) or mtcp (TCP) on BOTH servers:${C_N}"
+  echo -e "  ${C_D}Manage tunnels → the tunnel → 9) Change transport.${C_N}"
+  read -t 15 -rp "  ▶ Press ENTER to continue (auto-continuing in 15s)... " _ 2>/dev/null || true
+}
+
+# sweep_temp removes the hidden working files an edit uses (.tune-/.undo-/
+# .pair-/.check-). A clean edit deletes its own; one left behind means the
+# manager was killed mid-edit (input ended at a prompt), so it is stale and
+# safe to drop — the live <name>.json was never touched.
+sweep_temp(){ rm -f "$CFG_DIR"/.tune-*.json "$CFG_DIR"/.undo-*.json "$CFG_DIR"/.pair-*.json "$CFG_DIR"/.check-*.json 2>/dev/null; }
+
 main_menu(){
   auto_apply_bundled
+  sweep_temp
+  warn_removed_transports
   # Repair a health-check unit written by 2.3.16–2.3.19, whose ExecStart
   # pointed at a relative path and never ran. Cheap and idempotent.
   [ -f "$HEALTH_SVC" ] && ! grep -q "$HEALTH_SH" "$HEALTH_SVC" 2>/dev/null && install_health

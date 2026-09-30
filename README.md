@@ -4,7 +4,7 @@
 
 **Multi-protocol tunnel, reverse or direct — compiled and ready to run.**
 
-`v2.3.21`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
+`v`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
 
 **[English](#english)**  ·  **[فارسی](#فارسی)**
 
@@ -99,7 +99,7 @@ direction. The manager asks for it when you create a tunnel, and
 **Manage → Change direction** switches an existing one.
 
 Direction applies to the stream transports (`tcp` `mtcp` `mptcp` `ws`
-`tcpnomux` `kcp` `quic` `sctp`). The point-to-point tunnels (`gre`, `udp`,
+`tcpnomux` `kcp` `sctp`). The point-to-point tunnels (`gre`, `udp`,
 `icmp`, ...) send from both ends at once and have no direction.
 
 Install on **both** servers. Both ends must agree on the transport, the
@@ -120,8 +120,7 @@ it like the token.
 one TCP link waits behind each loss (head-of-line blocking). `mtcp` therefore
 opens one link per concurrent user by default (measured with 40 users, 80 ms,
 0.3 % loss: ping 135 ms instead of 320–410 ms — as good as no tunnel), and
-`tcpnomux` does the same by design. `tcp` and `ws` use a single link. `quic`
-collapses on lossy paths (≈5 Mbit in total at 0.3 % loss) — prefer `mtcp` or `kcp`.
+`tcpnomux` does the same by design. `tcp` and `ws` use a single link.
 
 ## Transports and encryption
 
@@ -129,7 +128,7 @@ Two independent choices. The transport decides how the bytes travel; the
 encryption layer decides what they look like on the way.
 
 **Stream transports** (reverse or direct, see above):
-`tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `quic` · `sctp`
+`tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `sctp`
 
 **Point-to-point tunnels** (both servers' real IPs + a private address pair):
 `gre` · `gretap` · `ipip` · `sit` · `l2tp` (kernel) · `udp` · `icmp` (TUN)
@@ -145,7 +144,6 @@ encryption layer decides what they look like on the way.
 | `ws` | WebSocket, looks like HTTP | — |
 | `tcpnomux` | One pooled TCP connection per user | — |
 | `kcp` | KCP over UDP with FEC; 4 parallel sessions by default (`links`) | usable UDP |
-| `quic` | QUIC, TLS 1.3 built in. **Collapses to ~1 Mbit/s on a lossy path, and its upload stalls near 10 Mbit/s while users download** — use `kcp` or `mtcp` | clean UDP, near-zero loss |
 | `sctp` | Multi-stream, multihomed across several source IPs | kernel `sctp` module |
 | `gre` / `gretap` | Kernel GRE (L3 / L2). Highest throughput | `ip_gre` module, root |
 | `ipip` | Kernel IP-in-IP. Lowest overhead, IPv4 only | `ipip` module, root |
@@ -178,9 +176,14 @@ with 300 users at once, 10 of them downloading and 5 uploading without pause:
 Your path is not this one: run the **speed test** (below) on each candidate
 and keep the one that does best on yours.
 
-`quic` takes no encryption layer — it already uses TLS 1.3 internally. The
-kernel tunnels (`gre`, `gretap`, `ipip`, `sit`, `l2tp`) take none either: the
-kernel moves the packets, so encrypt at the service (TLS) if you need it.
+**`quic` was removed in 2.3.22.** It slowed to a few Mbit/s on lossy paths,
+where `kcp` and `mtcp` carry hundreds. A tunnel still set to `quic` will not
+start: switch it to `kcp` (UDP) or `mtcp` (TCP) on both servers with
+**Manage tunnels → Change transport**. The manager lists such tunnels when it
+opens. *Duplicate UDP packets*, which only `quic` could carry, went with it.
+
+The kernel tunnels (`gre`, `gretap`, `ipip`, `sit`, `l2tp`) take no encryption
+layer: the kernel moves the packets, so encrypt at the service (TLS) if you need it.
 
 A point-to-point tunnel cannot be switched to a stream transport in place (or
 back) — they are configured with different fields. Create a new tunnel instead.
@@ -194,7 +197,7 @@ With `aead`, both servers need 2.3.12 or newer (its keys changed in 2.3.12);
 unencrypted `udp`/`icmp` still work with older releases.
 
 **Update both servers together.** Since 2.3.20 a stream tunnel with
-encryption `none`, or on `quic`, connects only when the other server proves it
+encryption `none` connects only when the other server proves it
 holds the token too, which needs 2.3.14 or newer on both ends. Against an older
 server the log says so and the tunnel stays down.
 
@@ -269,27 +272,6 @@ queue that is sent in one piece whenever its turn comes, and a packet that is
 already half a second late is dropped instead of delivered: measured with the
 same load, loss under 1% and ping 250 ms on tcp, 140 ms on mtcp, 97 ms on
 udp (80 ms path).
-
-## Duplicate UDP packets
-
-Every UDP datagram can be sent **twice**, with the far end throwing the copy
-away. A packet then has to be lost twice before the game notices.
-
-Turn it on per tunnel: **Manage tunnels → 12) Duplicate UDP packets**, on both
-ends.
-
-| | |
-|---|---|
-| **Fixes** | Loss that hits the two copies independently — a policer dropping one packet in a hundred, a lossy last mile, a flaky wireless hop. |
-| **Does not fix** | Loss from a full queue. Both copies are in that same queue, so both are dropped. Shape the uplink instead (`tune` → gaming). |
-| **Costs** | Exactly double the bandwidth of that tunnel's UDP. For a game that is a few hundred kbit. For a bulk UDP flow it is not. |
-
-It needs `quic` on both ends, both new enough to negotiate it. Where that is not
-true it quietly does nothing rather than sending everything twice with no way to
-recognise the copy.
-
-Worth saying plainly: this is insurance against a **lossy** path, not a cure for
-a **congested** one.
 
 ## Security
 
@@ -484,7 +466,7 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 **Manage → Change direction** می‌توان جهت یک تانل موجود را عوض کرد.
 
 جهت فقط برای ترنسپورت‌های جریانی است (`tcp` `mtcp` `mptcp` `ws` `tcpnomux`
-`kcp` `quic` `sctp`). تونل‌های نقطه‌به‌نقطه (`gre`، `udp`، `icmp` و ...) از هر
+`kcp` `sctp`). تونل‌های نقطه‌به‌نقطه (`gre`، `udp`، `icmp` و ...) از هر
 دو طرف هم‌زمان ارسال می‌کنند و جهت ندارند.
 
 روی **هر دو** سرور نصب کن. دو طرف باید روی ترنسپورت، لایهٔ رمزنگاری و توکن
@@ -504,8 +486,7 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 مشترک است پشت هر بستهٔ گم‌شده منتظر می‌ماند. برای همین `mtcp` حالا به‌طور پیش‌فرض
 برای هر کاربر هم‌زمان یک لینک باز می‌کند (با ۴۰ کاربر، ۸۰ms و ۰٫۳٪ گم‌شدن: پینگ
 ۱۳۵ms به‌جای ۳۲۰ تا ۴۱۰ms — هم‌اندازهٔ حالت بدون تانل) و `tcpnomux` هم ذاتاً همین‌طور
-است. `tcp` و `ws` یک لینک دارند. `quic` در مسیر پرافت عملاً از کار می‌افتد (حدود ۵
-مگابیت کل با ۰٫۳٪ افت) — `mtcp` یا `kcp` را انتخاب کن.
+است. `tcp` و `ws` یک لینک دارند.
 
 ## ترنسپورت‌ها و رمزنگاری
 
@@ -513,7 +494,7 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 شوند؛ لایهٔ رمزنگاری تعیین می‌کند در مسیر چه شکلی داشته باشند.
 
 **ترنسپورت‌های جریانی** (ریورس یا دایرکت، بالا را ببین):
-`tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `quic` · `sctp`
+`tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `sctp`
 
 **تونل‌های نقطه‌به‌نقطه** (IP واقعی هر دو سرور + یک جفت آدرس خصوصی):
 `gre` · `gretap` · `ipip` · `sit` · `l2tp` (کرنلی) · `udp` · `icmp` (TUN)
@@ -529,7 +510,6 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 | `ws` | وب‌سوکت، شبیه HTTP | — |
 | `tcpnomux` | برای هر کاربر یک اتصال TCP از استخر | — |
 | `kcp` | KCP روی UDP با FEC؛ به‌طور پیش‌فرض ۴ نشست موازی (`links`) | UDP سالم |
-| `quic` | QUIC با TLS 1.3 داخلی. **روی مسیر پر از loss به حدود ۱ مگابیت سقوط می‌کند، و وقتی کاربرها دانلود می‌کنند آپلودش نزدیک ۱۰ مگابیت گیر می‌کند** — `kcp` یا `mtcp` بزن | UDP تمیز، تقریباً بدون loss |
 | `sctp` | چندجریانی، multihome روی چند IP مبدأ | ماژول `sctp` کرنل |
 | `gre` / `gretap` | GRE کرنلی (L3 / L2)؛ بیشترین سرعت | ماژول `ip_gre`، روت |
 | `ipip` | IP-in-IP کرنلی؛ کمترین سربار، فقط IPv4 | ماژول `ipip`، روت |
@@ -562,8 +542,14 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 مسیر تو همین نیست: روی هر گزینه **تست سرعت** (پایین‌تر) را بزن و بهترینش روی
 مسیر خودت را نگه دار.
 
-ترنسپورت `quic` لایهٔ رمزنگاری نمی‌گیرد — خودش از TLS 1.3 استفاده می‌کند.
-تونل‌های کرنلی (`gre`، `gretap`، `ipip`، `sit`، `l2tp`) هم نمی‌گیرند: بسته‌ها را
+**ترنسپورت `quic` در 2.3.22 حذف شد.** روی مسیرهای پرافت به چند مگابیت سقوط
+می‌کرد، در حالی که `kcp` و `mtcp` صدها مگابیت می‌برند. تونلی که هنوز روی `quic`
+است اجرا نمی‌شود: روی هر دو سرور با **Manage tunnels ← Change transport** آن را
+به `kcp` (UDP) یا `mtcp` (TCP) تغییر بده. منیجر هنگام باز شدن این تونل‌ها را نام
+می‌برد. قابلیت *ارسال دوتایی بسته‌های UDP* هم که فقط با `quic` کار می‌کرد، همراهش
+حذف شد.
+
+تونل‌های کرنلی (`gre`، `gretap`، `ipip`، `sit`، `l2tp`) لایهٔ رمزنگاری نمی‌گیرند: بسته‌ها را
 خود کرنل جابه‌جا می‌کند، پس اگر رمزنگاری لازم است آن را در سرویس (TLS) انجام بده.
 
 تونل نقطه‌به‌نقطه را نمی‌شود درجا به ترنسپورت جریانی تبدیل کرد (و برعکس) —
@@ -578,8 +564,8 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 با `aead` هر دو سرور باید 2.3.12 یا جدیدتر باشند (کلیدهایش در 2.3.12 عوض شد)؛
 `udp`/`icmp` بدون رمزنگاری هنوز با نسخه‌های قدیمی‌تر کار می‌کند.
 
-**هر دو سرور را با هم به‌روز کن.** از 2.3.20 تانل جریانی با رمزنگاری `none`،
-یا روی `quic`، فقط وقتی وصل می‌شود که سرور مقابل هم ثابت کند توکن را دارد؛ این
+**هر دو سرور را با هم به‌روز کن.** از 2.3.20 تانل جریانی با رمزنگاری `none`
+فقط وقتی وصل می‌شود که سرور مقابل هم ثابت کند توکن را دارد؛ این
 یعنی هر دو طرف باید 2.3.14 یا جدیدتر باشند. با سرور قدیمی‌تر، لاگ همین را می‌گوید
 و تانل وصل نمی‌شود.
 
@@ -655,30 +641,6 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 
 سوکت‌های UDP فورواردشده با DSCP EF و اولویت تعاملی علامت می‌خورند، پس یک دانلود
 از همان رله نمی‌تواند جلوی بازی در صف بایستد.
-
-## ارسال دوتایی بسته‌های UDP
-
-</div>
-
-<div dir="rtl">
-
-هر دیتاگرام UDP می‌تواند **دو بار** فرستاده شود و طرف مقابل نسخهٔ تکراری را دور
-بیندازد. آن‌وقت یک بسته باید **دو بار** گم شود تا بازی متوجهش شود.
-
-برای هر تونل جداگانه روشن می‌شود: **Manage tunnels ← 12) Duplicate UDP packets**،
-روی هر دو سر.
-
-| | |
-|---|---|
-| **چه چیزی را حل می‌کند** | لاستی که روی دو نسخه مستقل از هم می‌افتد — پالیسری که یک بسته از هر صد را می‌اندازد، آخرین مایل پرخطا، یا یک پرش وایرلس ناپایدار. |
-| **چه چیزی را حل نمی‌کند** | لاست ناشی از صف پر. هر دو نسخه در همان صف هستند، پس هر دو دور ریخته می‌شوند. برای آن، پهنای باند خروجی را محدود کن (`tune` ← گیمینگ). |
-| **هزینه** | دقیقاً دو برابر پهنای باند UDP همان تونل. برای بازی چند صد کیلوبیت است. برای یک جریان حجیم UDP نه. |
-
-به `quic` روی هر دو سر نیاز دارد، و هر دو باید به‌قدر کافی جدید باشند که سرِ آن
-توافق کنند. جایی که این‌طور نباشد، بی‌صدا کاری نمی‌کند — به‌جای اینکه همه‌چیز را
-دوبار بفرستد بدون اینکه راهی برای تشخیص نسخهٔ تکراری باشد.
-
-صریح بگویم: این بیمه در برابر مسیر **پرخطا** است، نه درمان مسیر **شلوغ**.
 
 ## امنیت
 
