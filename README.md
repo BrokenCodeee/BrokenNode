@@ -4,7 +4,7 @@
 
 **Multi-protocol tunnel, reverse or direct — compiled and ready to run.**
 
-`v2.3.20`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
+`v2.3.21`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
 
 **[English](#english)**  ·  **[فارسی](#فارسی)**
 

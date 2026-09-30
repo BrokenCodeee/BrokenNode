@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.3.20"
+VERSION="2.3.21"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -30,12 +30,29 @@ C_R='\033[0;31m'; C_G='\033[0;32m'; C_Y='\033[1;33m'; C_B='\033[0;36m'; C_M='\03
 info(){ echo -e "${C_G}  [+]${C_N} $*"; }
 warn(){ echo -e "${C_Y}  [!]${C_N} $*"; }
 err(){ echo -e "${C_R}  [x]${C_N} $*" >&2; }
-ask(){ local p="$1" d="${2:-}" a; if [ -n "$d" ]; then read -rp "$(echo -e "${C_B}  ?${C_N} $p [${C_D}$d${C_N}]: ")" a; echo "${a:-$d}"; else read -rp "$(echo -e "${C_B}  ?${C_N} $p: ")" a; echo "$a"; fi; }
+# ask PROMPT [DEFAULT] — one answer. When input has ended (Ctrl+D, a dropped
+# SSH session, a script that ran out of answers) a question WITH a default takes
+# it, as before; one without a default stops the manager instead. Those are the
+# questions that must be answered (the other server's IP, say), and their
+# "ask again" loops otherwise spun for ever at full CPU once stdin was closed.
+ask(){
+  local p="$1" d="${2:-}" a
+  if [ -n "$d" ]; then read -rp "$(echo -e "${C_B}  ?${C_N} $p [${C_D}$d${C_N}]: ")" a; echo "${a:-$d}"; return 0; fi
+  if ! read -rp "$(echo -e "${C_B}  ?${C_N} $p: ")" a && [ -z "$a" ]; then
+    echo >&2; err "Input ended — stopped (nothing was saved from this question on)."
+    kill -TERM "$$" 2>/dev/null; exit 1
+  fi
+  echo "$a"
+}
 # menu_ask PROMPT — a menu choice; "__eof__" once input has ended. The menus
 # loop until a choice exits them, and ask() cannot tell end of input from an
 # empty answer, so a closed stdin (a script feeding the menu, a dropped SSH
 # session) spun them forever printing "Invalid.".
 menu_ask(){ local a; if read -rp "$(echo -e "${C_B}  ?${C_N} $1: ")" a; then echo "$a"; else echo "__eof__"; fi; }
+# is_ipv4 ADDR — a dotted quad, each part 0-255 without leading zeros (the
+# core's parser refuses "01.2.3.4").
+is_ipv4(){ local q='(0|[1-9][0-9]{0,2})'; [[ "$1" =~ ^$q\.$q\.$q\.$q$ ]] || return 1
+  local o; for o in "${BASH_REMATCH[@]:1}"; do [ "$((10#$o))" -le 255 ] || return 1; done; }
 need_root(){ [ "$(id -u)" -eq 0 ] || { err "Run as root: sudo bash $SELF"; exit 1; }; }
 detect_ip(){ ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1 || true; }
 default_iface(){ ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1; }
@@ -116,6 +133,19 @@ bundled_is_older(){
   [ -n "$have" ] && [ -n "$new" ] && version_lt "$new" "$have"
 }
 
+# install_core SRC — put the core SRC in place as $BIN, only if it actually
+# runs here and reports a version: a truncated download or a build for another
+# CPU used to replace a working core, and every tunnel was then restarted onto
+# it. The copy is renamed into place, so a running tunnel's binary is never
+# rewritten underneath it and an interrupted copy leaves the old core.
+install_core(){
+  if [ -z "$(core_version "$1")" ]; then
+    err "The core in this folder ($1) does not run on this machine — not installed; the current one stays."
+    return 1
+  fi
+  install -m0755 "$1" "$BIN.new" && mv -f "$BIN.new" "$BIN" || { rm -f "$BIN.new"; err "Could not install the core to $BIN."; return 1; }
+}
+
 warn_old_folder(){
   warn "This folder ($SRC_DIR) holds an OLDER BrokenNode (core v$(core_version "$1")) than the one installed (v$(core_version "$BIN")) — not downgrading."
   echo -e "  ${C_D}Update this folder: menu option 5, or  cd \"$SRC_DIR\" && bash <(curl -fsSL $INSTALL_URL)${C_N}"
@@ -125,7 +155,10 @@ ensure_core(){
   local src; src="$(detect_bin)"
   if [ -n "$src" ] && [ -f "$src" ]; then
     if bundled_is_older "$src"; then warn_old_folder "$src"; return 0; fi
-    { [ ! -x "$BIN" ] || ! cmp -s "$src" "$BIN"; } && { install -m0755 "$src" "$BIN"; info "Core updated: $("$BIN" version)"; }
+    if [ ! -x "$BIN" ] || ! cmp -s "$src" "$BIN"; then
+      install_core "$src" || { [ -x "$BIN" ] && return 0; return 1; }
+      info "Core updated: $("$BIN" version)"
+    fi
     return 0
   fi
   [ -x "$BIN" ] && return 0
@@ -369,10 +402,20 @@ client_from_code(){
   local name="$1" code="$2" target out line
   target=$(ask "Local services host (Enter = this server)" "")
   local rc=0; out="$(bnpy pair apply "$code" "$name" "$target" 2>&1)" || rc=$?
-  if grep -q '^ERR ' <<<"$out"; then err "$(sed -n 's/^ERR //p' <<<"$out")"; return 1; fi
+  if grep -q '^ERR ' <<<"$out"; then rm -f "$CFG_DIR/.pair-$name.json"; err "$(sed -n 's/^ERR //p' <<<"$out")"; return 1; fi
   if [ "$rc" != 0 ] || ! grep -q '^OK ' <<<"$out"; then
+    rm -f "$CFG_DIR/.pair-$name.json"
     err "Could not build the config from this code:"; echo "$out" | tail -n 3 | sed 's/^/    /'; return 1
   fi
+  local tmp="$CFG_DIR/.pair-$name.json" chk
+  chk="$("$BIN" -check -c "$tmp" 2>&1)" || {
+    if ! grep -q 'flag provided but not defined' <<<"$chk"; then
+      rm -f "$tmp"
+      err "This pairing code gives a config the core refuses: $(check_reason "$chk")"
+      return 1
+    fi
+  }
+  mv -f "$tmp" "$CFG_DIR/$name.json"
   info "Config created from the pairing code: $(sed -n 's/^OK //p' <<<"$out")"
   if grep -q '^CONFLICT ' <<<"$out"; then
     while IFS= read -r line; do warn "${line#CONFLICT }"; done < <(grep '^CONFLICT ' <<<"$out")
@@ -608,7 +651,18 @@ elif cmd == "pair" and args[0] == "apply":
         if not code.startswith("BN1:"):
             raise ValueError("not a pairing code (it starts with BN1:)")
         raw = code[4:] + "=" * (-len(code[4:]) % 4)
-        d = json.loads(zlib.decompress(base64.urlsafe_b64decode(raw)))
+        z = zlib.decompressobj()
+        blob = z.decompress(base64.urlsafe_b64decode(raw), 1 << 20)
+        if z.unconsumed_tail or not z.eof:
+            raise ValueError("incomplete or oversized")
+        d = json.loads(blob)
+        # Well-formed JSON is not yet a pairing code: a hand-edited or
+        # foreign blob used to crash here with a Python traceback.
+        if not isinstance(d, dict) or not isinstance(d.get("cfg"), dict) or not isinstance(d.get("ip", ""), str):
+            raise ValueError("unexpected content")
+        for k in ("gre_key", "l2tp_tunnel_id", "l2tp_session_id", "l2tp_port", "carrier_port", "mtu"):
+            if d["cfg"].get(k) is not None:
+                int(d["cfg"][k])
     except Exception as e:
         print("ERR the pairing code is damaged or incomplete (%s) — copy the whole line again" % e)
         sys.exit(2)
@@ -617,8 +671,13 @@ elif cmd == "pair" and args[0] == "apply":
         sys.exit(2)
     c = mirror(d["cfg"], d.get("ip", ""), target)
     bad = conflicts(name, c)
-    path = os.path.join(cfgdir, name + ".json")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # Written next to the real config under a hidden name; the manager moves
+    # it into place only after the core has accepted it, so a bad code never
+    # replaces a working tunnel's config.
+    path = os.path.join(cfgdir, ".pair-" + name + ".json")
+    if os.path.lexists(path):
+        os.unlink(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(c, f, indent=2); f.write("\n")
     t = c.get("transport")
@@ -701,7 +760,61 @@ warn_port_clash(){
   if [ -n "$clash" ]; then
     warn "Port(s)${C_Y}$clash${C_N} already belong to another tunnel on this server."
     echo -e "  ${C_D}Only one tunnel can receive a given port. Use a different port for this one.${C_N}"
+    return 1
   fi
+  return 0
+}
+
+# ask_ports EXCLUDE — build_ports until none of the user ports is already taken
+# by another tunnel here. Two tunnels on one port cannot both work: the second
+# fails to bind at every start and systemd restarts it for ever.
+ask_ports(){
+  local p
+  while :; do
+    p=$(build_ports)
+    warn_port_clash "$p" "$1" >&2 && break
+    echo -e "  ${C_D}Enter the port list again.${C_N}" >&2
+  done
+  echo "$p"
+}
+
+# cfg_begin CFG / cfg_commit CFG — bracket an edit of a tunnel's config: the
+# core checks the edited file, and a change it refuses is rolled back to the
+# copy cfg_begin kept, so the tunnel is never restarted onto a config it
+# cannot run (a transport switch onto a port a user port already has, a typo
+# in an address, a word where a number goes).
+cfg_begin(){ cp -p "$1" "$(dirname "$1")/.undo-$(basename "$1")"; }
+cfg_commit(){
+  local cfg="$1" undo out rc=0; undo="$(dirname "$1")/.undo-$(basename "$1")"
+  out="$("$BIN" -check -c "$cfg" 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ] && ! grep -q 'flag provided but not defined' <<<"$out"; then
+    [ -f "$undo" ] && mv -f "$undo" "$cfg"
+    err "Not applied — the core refuses the change: $(check_reason "$out")"
+    info "The previous settings are kept; the tunnel was not restarted."
+    return 1
+  fi
+  rm -f "$undo"
+}
+
+# check_reason OUTPUT — the one line of "$BIN -check" output that says what is
+# wrong: its "config error:" line, else (a file that is not valid JSON, say)
+# the last line that is not a log line.
+check_reason(){
+  local r; r="$(printf '%s\n' "$1" | sed -n 's/^config error: //p' | tail -n 1)"
+  [ -n "$r" ] || r="$(printf '%s\n' "$1" | grep -v '\[ERR\]\|\[INF\]\|\[WRN\]' | grep -v '^$' | tail -n 1)"
+  printf '%s' "${r:-unknown error}"
+}
+
+# core_check CFG — have the core validate a config it is about to run. On a
+# refusal: say why, delete the config (nothing was started from it) and fail.
+# A core too old to know -check is not held against the config.
+core_check(){
+  local out
+  out="$("$BIN" -check -c "$1" 2>&1)" && return 0
+  grep -q 'flag provided but not defined' <<<"$out" && return 0
+  err "Not saved — the core refuses this config: $(check_reason "$out")"
+  rm -f "$1"
+  return 1
 }
 
 pick_transport(){
@@ -989,8 +1102,18 @@ write_tunnel_cfg(){
   local go_on; go_on=$(ask "Continue with $tr? Y/n" "Y")
   case "$go_on" in n|N) warn "Cancelled."; return ;; esac
   local lip rip tl trr
-  lip=$(ask "This server's real (public) IP" "$(detect_ip)")
-  rip=$(ask "The OTHER server's real IP" "")
+  # Both are required IPv4 addresses (the core refuses anything else): an
+  # empty or mistyped one used to be saved, and the tunnel then failed at start.
+  while :; do
+    lip=$(ask "This server's real (public) IP" "$(detect_ip)"); lip="${lip// /}"
+    is_ipv4 "$lip" && break; warn "'$lip' is not an IPv4 address (e.g. 203.0.113.5)."
+  done
+  while :; do
+    rip=$(ask "The OTHER server's real IP" ""); rip="${rip// /}"
+    if ! is_ipv4 "$rip"; then warn "'$rip' is not an IPv4 address (e.g. 198.51.100.7)."
+    elif [ "$rip" = "$lip" ]; then warn "That is this server's own IP — give the OTHER server's."
+    else break; fi
+  done
   # ipip and sit carry nothing that tells two tunnels between the same two
   # servers apart, so the kernel allows one of each per pair of IPs; a second
   # fails to start ("File exists"). Say so now rather than after the fact.
@@ -1076,7 +1199,7 @@ write_tunnel_cfg(){
   tokline="\"token\": \"$(jstr "$token")\","
 
   local portsjson=""
-  if [ "$role" = server ]; then portsjson=$(build_ports); warn_port_clash "$portsjson" "$name"; fi
+  if [ "$role" = server ]; then portsjson=$(ask_ports "$name"); fi
 
   new_cfg_file "$cfg"
   if [ "$role" = server ]; then
@@ -1096,6 +1219,7 @@ write_tunnel_cfg(){
   "log_level": "info"
 }
 EOF
+    core_check "$cfg" || return 1
     info "Saved $cfg"
     show_pair_code "$cfg"
   else
@@ -1121,6 +1245,7 @@ EOF
 EOF
     info "Saved $cfg"
   fi
+  core_check "$cfg" || return 1
   install_health
   systemctl enable "brokennode@$name" >/dev/null 2>&1; systemctl restart "brokennode@$name"; sleep 1.5
   if [ "$(systemctl is-active "brokennode@$name" 2>/dev/null)" = active ]; then info "Tunnel '$name' is ${C_G}active${C_N}."
@@ -1168,9 +1293,8 @@ create_tunnel(){
         bind="$(check_bind "$bind")"
         addrline="\"bind_addr\": \"$bind\","
       fi
-      ports=$(build_ports)
-      if [ "$dir" = direct ]; then warn_port_clash "$ports" "$name"
-      else warn_port_clash "$ports" "$name" "${bind##*:}" "$bproto"; fi
+      ports=$(ask_ports "$name")
+      [ "$dir" = direct ] || warn_port_clash "" "$name" "${bind##*:}" "$bproto"
       token=$(ask "Shared token" "$(gen_token)")
       echo -e "  ${C_D}Traffic quota (optional) — leave blank for unlimited. Once reached, the${C_N}"
       echo -e "  ${C_D}tunnel refuses new connections and drops active ones until you raise it.${C_N}"
@@ -1199,6 +1323,7 @@ create_tunnel(){
   "log_level": "info"
 }
 EOF
+      core_check "$cfg" || return 1
       info "Saved $cfg"
       if [ "$dir" = direct ]; then server_summary_direct "$remote" "$ports" "$bproto"
       else server_summary "$bind" "$ports"; fi
@@ -1234,6 +1359,7 @@ EOF
   "log_level": "info"
 }
 EOF
+      core_check "$cfg" || return 1
       info "Saved $cfg"
       if [ "$dir" = direct ]; then
         echo
@@ -1370,9 +1496,15 @@ stats_page(){
     local now; now=$(date +%s)
     declare -A L=()
     if [ -f "$lf" ]; then
-      while IFS='=' read -r k v; do [ -n "$k" ] && L[$k]="$v"; done < "$lf"
+      # Every key but these few is a counter used in $(( )), where bash would
+      # evaluate anything else as an expression: keep only plain numbers.
+      while IFS='=' read -r k v; do
+        [[ "$k" =~ ^[a-z_]+$ ]] || continue
+        case "$k" in dev|role|src|transport) : ;; *) [[ "$v" =~ ^[0-9]+$ ]] || v=0 ;; esac
+        L[$k]="$v"
+      done < "$lf"
     fi
-    local ts="${L[ts]:-0}" age=$(( now - ${L[ts]:-0} ))
+    local ts="${L[ts]:-0}"; case "$ts" in ""|*[!0-9]*) ts=0 ;; esac; local age=$(( now - ts ))
     if [ "$st" != active ]; then
       out+="    Service: ${C_R}${st}${C_N} — the tunnel is not running. Start it from this menu.\n"
       pts=0
@@ -1460,7 +1592,7 @@ stats_page(){
 # Every result is kept in $CFG_DIR/.speedtests, and the last ones are listed
 # side by side for comparison.
 speed_test(){
-  local n="$1" cfg="$CFG_DIR/$1.json" hist="$CFG_DIR/.speedtests"
+  local n="$1" cfg="$CFG_DIR/$1.json" histf="$CFG_DIR/.speedtests"
   local tr role; tr="$(jget "$cfg" transport)"; role="$(jget "$cfg" mode)"
   echo
   echo -e "${C_B}  Speed test: $n  (${tr})${C_N}"
@@ -1529,12 +1661,12 @@ speed_test(){
   if awk -v j="$tjit" 'BEGIN{exit !(j > 20)}'; then warnln "High jitter: games and calls will feel it. Try the udp transport or the gaming profile."; fi
   local dir; dir="$(jget "$cfg" direction)"
   printf '%s %s %s %s down=%s up=%s ping=%s jitter=%s streams=%s\n' "$(date '+%Y-%m-%d %H:%M')" "$n" "$tr" "${dir:-reverse}" \
-    "$down" "$up" "$tping" "$tjit" "$streams" >> "$hist" 2>/dev/null
-  tail -n 200 "$hist" > "$hist.tmp" 2>/dev/null && mv "$hist.tmp" "$hist"
+    "$down" "$up" "$tping" "$tjit" "$streams" >> "$histf" 2>/dev/null
+  tail -n 200 "$histf" > "$histf.tmp" 2>/dev/null && mv "$histf.tmp" "$histf"
   echo
   echo -e "  ${C_B}Recent results${C_N} ${C_D}(all tunnels on this server — compare transports)${C_N}"
   printf "  %-16s %-12s %-9s %9s %9s %8s %7s\n" "when" "tunnel" "transport" "↓ Mbit" "↑ Mbit" "ping" "jitter"
-  tail -n 8 "$hist" | while read -r d t nm tt dir dn u p j st; do
+  tail -n 8 "$histf" | while read -r d t nm tt dir dn u p j st; do
     printf "  %-16s %-12s %-9s %9s %9s %8s %7s\n" "$d $t" "$nm" "$tt" "${dn#down=}" "${u#up=}" "${p#ping=}" "${j#jitter=}"
   done
 }
@@ -1793,14 +1925,23 @@ jset(){
   python3 - "$file" "$key" "$val" "$kind" <<'PYEOF'
 import json,sys
 f,k,v,kind=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]
+import os
 d=json.load(open(f))
-if kind=="int": d[k]=int(v)
-elif kind=="float": d[k]=float(v)
-elif kind=="bool": d[k]=(v.lower() in ("1","true","yes","on"))
-elif kind=="del": d.pop(k,None)
-else: d[k]=v
-json.dump(d,open(f,"w"),indent=2)
-open(f,"a").write("\n")
+try:
+    if kind=="int": d[k]=int(v)
+    elif kind=="float": d[k]=float(v)
+    elif kind=="bool": d[k]=(v.lower() in ("1","true","yes","on"))
+    elif kind=="del": d.pop(k,None)
+    else: d[k]=v
+except ValueError:
+    sys.stderr.write("  [x] %s: %r is not a number — left unchanged\n" % (k, v)); sys.exit(1)
+# Written beside and renamed over the config, keeping its mode: truncating it
+# in place left an empty config if anything failed half-way.
+t=f+".tmp"
+fd=os.open(t,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,os.stat(f).st_mode&0o777)
+with os.fdopen(fd,"w") as o:
+    json.dump(d,o,indent=2); o.write("\n")
+os.replace(t,f)
 PYEOF
 }
 
@@ -1908,6 +2049,7 @@ change_transport(){
   fi
   local newenc; newenc=$(pick_encryption "$new")
   if [ "$new" = "$cur" ] && [ "$newenc" = "$curenc" ]; then info "already $cur/$curenc — nothing to do"; return; fi
+  cfg_begin "$cfg"
   jset "$cfg" transport "$new"
   jset "$cfg" encryption "$newenc"
   # Drop transport-specific leftovers.
@@ -1917,6 +2059,7 @@ change_transport(){
     *)        jset "$cfg" pool_size "" del; jset "$cfg" links "" del ;;
   esac
   [ "$new" != sctp ] && { jset "$cfg" sctp_streams "" del; jset "$cfg" sctp_multihoming "" del; }
+  cfg_commit "$cfg" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
   info "transport: $cur/$curenc -> $new/$newenc"
   if tunnel_listens "$cfg" && is_udp_transport "$new" && ! is_udp_transport "$cur"; then
     local port; port="$(jget "$cfg" bind_addr)"; port="${port##*:}"
@@ -1948,8 +2091,11 @@ change_relay_ip(){
   echo; echo -e "${C_B}  Change $what IP for '$n'${C_N}  ${C_D}(current: $cur)${C_N}"
   newip=$(ask "New $what IP (port $port kept)" "")
   [ -z "$newip" ] && { warn "cancelled"; return; }
-  case "$newip" in *[!0-9.]*) err "Not an IPv4 address."; return;; esac
+  newip="${newip// /}"
+  is_ipv4 "$newip" || { err "'$newip' is not an IPv4 address."; return; }
+  cfg_begin "$cfg"
   jset "$cfg" remote_addr "$newip:$port"
+  cfg_commit "$cfg" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
   info "$what: $cur -> $newip:$port"
   systemctl restart "brokennode@$n" >/dev/null 2>&1
   info "restarted '$n'"
@@ -1975,12 +2121,14 @@ change_direction(){
   local bproto=tcp; case "$tr" in kcp|quic) bproto=udp ;; esac
   local bind remote port
   bind="$(jget "$cfg" bind_addr)"; remote="$(jget "$cfg" remote_addr)"
+  cfg_begin "$cfg"
   # The side that will listen needs bind_addr; the side that will dial needs
   # remote_addr. The tunnel port is the same number either way.
   if { [ "$mode" = server ] && [ "$new" = reverse ]; } || { [ "$mode" = client ] && [ "$new" = direct ]; }; then
     port="${bind##*:}"; [ -z "$bind" ] && port="${remote##*:}"; [ -z "$port" ] && port=8443
     local v; v=$(ask "Listen address (host:port)" "${bind:-0.0.0.0:$port}")
     jset "$cfg" bind_addr "$(check_bind "$v")"
+    jset "$cfg" remote_addr "" del   # this end no longer dials
     port="$(jget "$cfg" bind_addr)"; port="${port##*:}"
     warn_port_clash "$(jq_ports "$cfg")" "$n" "$port" "$bproto"
     warn "This server must now accept ${bproto^^} $port inbound (firewall)."
@@ -1993,8 +2141,10 @@ change_direction(){
       [ -z "$v" ] && warn "Required: the $who's real IP and the port it listens on."
     done
     jset "$cfg" remote_addr "$v"
+    jset "$cfg" bind_addr "" del     # this end no longer listens
   fi
   jset "$cfg" direction "$new"
+  cfg_commit "$cfg" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
   info "direction: $cur -> $new"
   warn "Switch the OTHER server to ${C_Y}$new${C_N} too, or the two will not connect."
   service_check "$n"
@@ -2087,7 +2237,7 @@ ports_apply(){
   out="$("$BIN" -check -c "$tmp" 2>&1)"; rc=$?
   if [ "$rc" -ne 0 ] && ! grep -q 'flag provided but not defined' <<<"$out"; then
     rm -f "$tmp"
-    err "Not applied: $(printf '%s\n' "$out" | sed -n 's/^config error: //p' | tail -n 1)"
+    err "Not applied: $(check_reason "$out")"
     return 1
   fi
   mv -f "$tmp" "$cfg"
@@ -2133,7 +2283,7 @@ PYEOF
         [ "$okp" = 0 ] && { warn "'$spec' is not a port mapping — use 443 or 8443=443 (1-65535)."; continue; }
         local proto sfx; proto=$(ask "Protocol  1)tcp 2)udp 3)both" "3")
         case "$proto" in 1) sfx="";; 2) sfx="/udp";; *) sfx="/both";; esac
-        warn_port_clash "\"${spec}${sfx}\"" "$n"
+        warn_port_clash "\"${spec}${sfx}\"" "$n" || continue
         if ports_apply "$cfg" "$n" "${ports[@]}" "${spec}${sfx}"; then
           info "added ${spec}${sfx}"; service_check "$n"
         fi
@@ -2171,7 +2321,7 @@ PYEOF
         # Replace the whole list. The old list stays until at least one new
         # port has been entered — an empty list would stop the relay.
         echo -e "  ${C_D}Enter the new ports; the old list is replaced only when you add at least one.${C_N}"
-        local newl=() s2 p2 okp2 pr2 sfx2 part2
+        local newl=() s2 okp2 pr2 sfx2 part2
         while true; do
           s2=$(ask "Port (443 or 8443=443, blank = done)" ""); s2="${s2// /}"
           [ -z "$s2" ] && break
@@ -2185,7 +2335,7 @@ PYEOF
           newl+=("${s2}${sfx2}"); echo -e "  ${C_G}  + ${s2}${sfx2}${C_N}"
         done
         if [ "${#newl[@]}" -eq 0 ]; then info "cancelled — the list is unchanged"; continue; fi
-        warn_port_clash "$(printf '"%s",' "${newl[@]}")" "$n"
+        warn_port_clash "$(printf '"%s",' "${newl[@]}")" "$n" || continue
         if ports_apply "$cfg" "$n" "${newl[@]}"; then
           info "port list replaced (${#newl[@]} port(s))"; service_check "$n"
         fi
@@ -2207,6 +2357,7 @@ tune_tunnel(){
 
   local v cur
   local fam; fam=$(transport_family "$tr")
+  cfg_begin "$cfg"
   if [ "$fam" != stream ]; then
     # Point-to-point tunnels have no smux, bind port or keepalive; what can be
     # tuned is the MTU and the addresses, which live in the config itself.
@@ -2222,10 +2373,7 @@ tune_tunnel(){
     fi
     cur="$(jget "$cfg" log_level)"
     v=$(ask "  log_level (info/debug/error) [$cur]" ""); [ -n "$v" ] && jset "$cfg" log_level "$v"
-    if ! python3 -c "import json,sys; json.load(open('$cfg'))" 2>/dev/null; then
-      err "Config is not valid JSON after editing — NOT restarting. Fix it with 'Edit config'."
-      read -t 30 -rp "  ▶ press ENTER to continue... " _; return
-    fi
+    cfg_commit "$cfg" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
     systemctl restart "brokennode@$n" >/dev/null 2>&1
     info "settings saved, '$n' restarted"
     warn "mtu should match on both ends."
@@ -2317,10 +2465,7 @@ tune_tunnel(){
   cur="$(jget "$cfg" log_level)"
   v=$(ask "  log_level (info/debug/error) [$cur]" ""); [ -n "$v" ] && jset "$cfg" log_level "$v"
 
-  if ! python3 -c "import json,sys; json.load(open('$cfg'))" 2>/dev/null; then
-    err "Config is not valid JSON after editing — NOT restarting. Fix it with 'Edit config'."
-    read -t 30 -rp "  ▶ press ENTER to continue... " _; return
-  fi
+  cfg_commit "$cfg" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
   systemctl restart "brokennode@$n" >/dev/null 2>&1
   info "settings saved, '$n' restarted"
   warn "Transport-level settings (kcp_*, links, smux_*) must MATCH on both sides."
@@ -2344,6 +2489,29 @@ delete_all_tunnels(){
   done
   info "all tunnels deleted"
   read -t 30 -rp "  ▶ press ENTER to continue... " _
+}
+
+# edit_config NAME EDITOR — hand-edit a tunnel's config. The result is checked
+# by the core before the tunnel is restarted onto it: a typo used to restart
+# the tunnel straight into a failure. A refused edit can be fixed again or
+# thrown away (the previous config back).
+edit_config(){
+  local n="$1" ed="$2" cfg="$CFG_DIR/$1.json" undo out a
+  [ -n "$ed" ] || { err "No editor found (install nano, or set EDITOR)."; return; }
+  undo="$CFG_DIR/.undo-$n.json"; cp -p "$cfg" "$undo"
+  while :; do
+    "$ed" "$cfg"
+    if cmp -s "$cfg" "$undo"; then rm -f "$undo"; info "no changes"; return; fi
+    out="$("$BIN" -check -c "$cfg" 2>&1)" && break
+    grep -q 'flag provided but not defined' <<<"$out" && break
+    err "The core refuses this config: $(check_reason "$out")"
+    # Discard is the default: with no one at the keyboard (input ended) "edit
+    # again" would reopen the editor for ever.
+    a=$(ask "e = edit again, d = discard the changes" "d")
+    case "$a" in d|D) mv -f "$undo" "$cfg"; info "changes discarded — the tunnel was not restarted"; return ;; esac
+  done
+  rm -f "$undo"; chmod 600 "$cfg" 2>/dev/null
+  systemctl restart "brokennode@$n"; info "saved & restarted"
 }
 
 manage_tunnels(){
@@ -2376,9 +2544,13 @@ manage_tunnels(){
         3) systemctl enable "brokennode@$n" >/dev/null 2>&1; systemctl restart "brokennode@$n"; info "restarted";;
         4) live_logs "$n";;
         5) echo; cat "$CFG_DIR/$n.json"; echo; read -t 30 -rp "  ▶ press ENTER to continue... " _;;
-        6) "${EDITOR:-$ED}" "$CFG_DIR/$n.json"; systemctl restart "brokennode@$n"; info "saved & restarted";;
+        6) edit_config "$n" "${EDITOR:-$ED}";;
         7) local c; c=$(ask "Delete '$n' permanently? yes/no" "no")
-           if [ "$c" = yes ]; then systemctl disable --now "brokennode@$n" >/dev/null 2>&1; rm -f "$CFG_DIR/$n.json"; info "deleted '$n'"; break; fi;;
+           if [ "$c" = yes ]; then
+             systemctl disable --now "brokennode@$n" >/dev/null 2>&1
+             rm -f "$CFG_DIR/$n.json" "$CFG_DIR/.undo-$n.json" "/var/lib/brokennode/$n.stats" "/run/brokennode/$n".*
+             info "deleted '$n'"; break
+           fi;;
         8) stats_page "$n";;
         9) change_transport "$n";;
         10) change_relay_ip "$n";;
@@ -2559,7 +2731,8 @@ auto_apply_bundled(){
   fi
   if [ ! -x "$BIN" ] || ! cmp -s "$src" "$BIN"; then
     warn "New core bundled with this package — applying automatically..."
-    install -m0755 "$src" "$BIN"; info "Core: $("$BIN" version)"
+    install_core "$src" || return 0
+    info "Core: $("$BIN" version)"
     restart_all_tunnels
     info "Auto-update done — configs untouched."
     read -t 15 -rp "  ▶ Press ENTER to continue (auto-continuing in 15s)... " _ 2>/dev/null || true
@@ -2594,11 +2767,14 @@ uninstall_all(){
   systemctl list-units --all --no-legend 2>/dev/null | grep -o 'brokennode@[^ ]*\.service' | sort -u | while read -r u; do systemctl disable --now "$u" >/dev/null 2>&1; done
   systemctl disable --now brokennode-autoupdate.timer >/dev/null 2>&1
   systemctl disable --now brokennode-health.timer >/dev/null 2>&1
+  unshape_egress
   rm -f "$AU_SVC" "$AU_TIMER" "$HEALTH_SVC" "$HEALTH_TMR" "$TPL"; rm -rf "${HEALTH_SH%/*}"
+  rm -rf /run/brokennode /var/lib/brokennode
   systemctl daemon-reload 2>/dev/null; systemctl reset-failed 2>/dev/null
   rm -f "$BIN" "$BIN.bak"
   rm -rf "$CFG_DIR"
   info "BrokenNode fully removed — core, tunnels, configs and units are gone."
+  [ -f /etc/sysctl.d/99-brokennode.conf ] && echo -e "  ${C_D}The network tuning (/etc/sysctl.d/99-brokennode.conf) is kept — other services may rely on it. Delete that file to drop it.${C_N}"
 }
 
 # tune_network: the biggest real throughput lever for a lossy intercontinental
@@ -2723,16 +2899,27 @@ EOF
 # the queue becomes one cake can manage — it keeps it short and lets interactive
 # traffic past. The few percent of bandwidth given up buys back far more in
 # latency under load.
+# unshape_egress removes the shaping shape_egress set up — and only that: "0 =
+# skip" used to delete whatever root qdisc the interface had, ours or not. The
+# unit is disabled BEFORE its file goes (the other order left its enable link
+# dangling), and stopping it runs its ExecStop, which removes the qdisc.
+SHAPE_SVC=/etc/systemd/system/brokennode-shape.service
+unshape_egress(){
+  [ -f "$SHAPE_SVC" ] || return 0
+  local dev; dev="$(sed -n 's/^ExecStart=.* dev \([^ ]*\) root.*/\1/p' "$SHAPE_SVC")"
+  systemctl disable --now brokennode-shape.service >/dev/null 2>&1
+  [ -n "$dev" ] && tc qdisc del dev "$dev" root 2>/dev/null
+  rm -f "$SHAPE_SVC"
+  systemctl daemon-reload >/dev/null 2>&1
+  info "Shaping removed${dev:+ from $dev}."
+}
+
 shape_egress(){
   local mbit="$1" dev; dev="$(default_iface)"
   [ -n "$dev" ] || { err "Could not find the default interface."; return 1; }
   command -v tc >/dev/null 2>&1 || { err "tc is missing (install iproute2)."; return 1; }
   if [ "${mbit:-0}" = 0 ]; then
-    tc qdisc del dev "$dev" root 2>/dev/null
-    rm -f /etc/systemd/system/brokennode-shape.service
-    systemctl disable brokennode-shape.service >/dev/null 2>&1
-    systemctl daemon-reload >/dev/null 2>&1
-    info "Shaping removed from $dev."
+    unshape_egress
     return 0
   fi
   if ! tc qdisc replace dev "$dev" root cake bandwidth "${mbit}mbit" 2>/dev/null; then

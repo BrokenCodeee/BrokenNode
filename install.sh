@@ -70,12 +70,13 @@ if [ "$DIR" = . ]; then info "Updating this folder ($(pwd))"; else info "Downloa
 TMP="$(mktemp -d "$DIR/.download.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
-# checksum_ok FILE PATH-IN-SUMS — FILE matches its line in SHA256SUMS (true
-# when the list has no line for it).
+# checksum_ok FILE PATH-IN-SUMS — FILE matches its line in SHA256SUMS. A list
+# with no line for it (an error page served in its place, a cut-off download)
+# is a failure too: it used to count as verified.
 checksum_ok(){
   local want got
   want="$(awk -v f="$2" '$2 == f || $2 == "*"f {print $1}' "$TMP/SHA256SUMS" | head -1)"
-  [ -z "$want" ] && return 0
+  [[ "$want" =~ ^[0-9a-f]{64}$ ]] || return 1
   got="$(sha256sum "$1" | awk '{print $1}')"
   [ "$want" = "$got" ]
 }
@@ -92,10 +93,13 @@ for attempt in 1 2 3 4; do
   fetch "$BASE/bin/brokennode-linux-${ARCH}$q" "$TMP/brokennode-linux-${ARCH}" \
     || die "Download failed. Check the server's internet access, or grab the file manually from https://github.com/${REPO}"
   fetch "$BASE/BrokenNode.sh$q" "$TMP/BrokenNode.sh" || die "Could not download BrokenNode.sh"
-  if ! fetch "$BASE/SHA256SUMS$q" "$TMP/SHA256SUMS" || ! command -v sha256sum >/dev/null 2>&1; then
-    warn "Could not verify the download (no SHA256SUMS or sha256sum) — continuing unverified"
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    warn "sha256sum is not installed — cannot verify the download, continuing unverified"
     verified=1; break
   fi
+  # No checksum list is treated like a mismatch (retried, then refused): an
+  # unverified binary is exactly what the list is there to prevent.
+  fetch "$BASE/SHA256SUMS$q" "$TMP/SHA256SUMS" || : > "$TMP/SHA256SUMS"
   # A truncated or mixed download produces a binary that fails in confusing
   # ways much later, so it is worth catching here rather than mid-tunnel.
   if checksum_ok "$TMP/brokennode-linux-${ARCH}" "bin/brokennode-linux-${ARCH}" &&
@@ -106,12 +110,16 @@ for attempt in 1 2 3 4; do
   warn "Checksum mismatch — GitHub's cache may still be serving the previous release. Retrying in $((attempt * 10))s..."
   sleep $((attempt * 10))
 done
-[ "$verified" = 1 ] || die "Checksum mismatch — the download is corrupt or tampered with. Nothing was changed; retry in a few minutes."
+[ "$verified" = 1 ] || die "Checksum mismatch (or no checksum list) — the download is corrupt, incomplete or tampered with. Nothing was changed; retry in a few minutes."
 fetch "$BASE/VERSION$q"   "$TMP/VERSION"   || true
 fetch "$BASE/README.md$q" "$TMP/README.md" || true
 
 # --- put in place ------------------------------------------------------------
 chmod +x "$TMP/brokennode-linux-${ARCH}" "$TMP/BrokenNode.sh"
+# A binary this machine cannot run (a CPU that reports itself oddly, a kernel
+# without the needed support) must not replace one that works.
+"$TMP/brokennode-linux-${ARCH}" version >/dev/null 2>&1 \
+  || die "The downloaded core does not run on this machine ($(uname -m) → ${ARCH}). Nothing was changed."
 mv -f "$TMP/brokennode-linux-${ARCH}" "$DIR/bin/brokennode-linux-${ARCH}"
 for f in BrokenNode.sh SHA256SUMS VERSION README.md; do
   if [ -s "$TMP/$f" ]; then mv -f "$TMP/$f" "$DIR/$f"; fi
