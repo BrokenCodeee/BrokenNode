@@ -2,9 +2,9 @@
 
 # BrokenNode
 
-**Multi-protocol reverse tunnel — compiled and ready to run.**
+**Multi-protocol tunnel, reverse or direct — compiled and ready to run.**
 
-`v2.7.3`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
+`v`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
 
 **[English](#english)**  ·  **[فارسی](#فارسی)**
 
@@ -34,6 +34,11 @@ Already have the folder:
 cd BrokenNode
 sudo bash BrokenNode.sh
 ```
+
+**Updating:** menu option **5) Update BrokenNode**, or run the install command
+again from inside the folder (`cd BrokenNode` first) — both update that folder
+in place, and the menu then applies the new core and restarts the tunnels. The
+menu never puts an older core over a newer one; an old folder only says so.
 
 Or take the whole folder at once:
 
@@ -77,71 +82,160 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
          (mode: server)                   (mode: client)     (real service)
 ```
 
-Note the direction. The machine **in Iran** runs `mode: server` — it listens.
-The machine **abroad** runs `mode: client` — it dials in. The tunnel is
-*reverse*: the foreign side initiates the connection.
+The machine **in Iran** runs `mode: server` (the relay: users connect to its
+ports). The machine **abroad** runs `mode: client` (it delivers to the real
+service). Which of the two opens the tunnel is a separate choice, the
+**direction**:
+
+| `direction` | Who connects to whom | Iran server | Foreign server |
+|---|---|---|---|
+| `reverse` (default) | foreign ➜ Iran | `bind_addr` (listens) | `remote_addr` = Iran IP:port |
+| `direct` | Iran ➜ foreign | `remote_addr` = foreign IP:port | `bind_addr` (listens) |
+
+Choose `direct` when connections **into** the Iran server are being blocked or
+cut: the Iran server then only makes outgoing connections. Users, ports,
+encryption and speed are the same either way. Both servers must use the same
+direction. The manager asks for it when you create a tunnel, and
+**Manage → Change direction** switches an existing one.
+
+Direction applies to the stream transports (`tcp` `mtcp` `mptcp` `ws`
+`tcpnomux` `kcp` `sctp`). The point-to-point tunnels (`gre`, `udp`,
+`icmp`, ...) send from both ends at once and have no direction.
 
 Install on **both** servers. Both ends must agree on the transport, the
 encryption layer and the token.
+
+### Pairing code — set up the foreign server without typing anything
+
+Create the tunnel on the **Iran** server first. The manager picks every value
+that must not clash with this server's other tunnels by itself — tunnel subnet,
+gre key, l2tp ids and port, carrier ports, listen port — and prints a one-line
+**pairing code** (`BN1:…`). On the **foreign** server choose *Create CLIENT
+tunnel* and paste it: the whole config is built from it, checked against what
+that server already uses, started, and the manager waits until it connects.
+*Manage → 14) Pairing code* shows it again. The code contains the token — share
+it like the token.
+
+**Which transport under load?** On a path that loses packets, every user sharing
+one TCP link waits behind each loss (head-of-line blocking). `mtcp` therefore
+opens one link per concurrent user by default (measured with 40 users, 80 ms,
+0.3 % loss: ping 135 ms instead of 320–410 ms — as good as no tunnel), and
+`tcpnomux` does the same by design. `tcp` and `ws` use a single link.
 
 ## Transports and encryption
 
 Two independent choices. The transport decides how the bytes travel; the
 encryption layer decides what they look like on the way.
 
-**Transports:** `tcp` · `mtcp` · `ws` · `tcpnomux` · `kcp` · `quic` · `spoof`
+**Stream transports** (reverse or direct, see above):
+`tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `sctp`
+
+**Point-to-point tunnels** (both servers' real IPs + a private address pair):
+`gre` · `gretap` · `ipip` · `sit` · `l2tp` (kernel) · `udp` · `icmp` (TUN)
 
 **Encryption:** `none` · `obfs` (AES-CTR keystream) · `aead`
-(ChaCha20-Poly1305, authenticated — recommended) · `tls` (real HTTPS with a
-CA-signed certificate)
+(ChaCha20-Poly1305, authenticated — recommended)
+
+| Transport | What it is | Needs |
+|---|---|---|
+| `tcp` | TCP + smux. The stable baseline | — |
+| `mtcp` | Several TCP links bonded; survives per-connection throttling | — |
+| `mptcp` | *Experimental.* Kernel Multipath TCP: one connection across every path. Prefer `mtcp` | Linux ≥ 5.6, `net.mptcp.enabled=1` on both |
+| `ws` | WebSocket, looks like HTTP | — |
+| `tcpnomux` | One pooled TCP connection per user | — |
+| `kcp` | KCP over UDP with FEC; 4 parallel sessions by default (`links`) | usable UDP |
+| `sctp` | Multi-stream, multihomed across several source IPs | kernel `sctp` module |
+| `gre` / `gretap` | Kernel GRE (L3 / L2). Highest throughput | `ip_gre` module, root |
+| `ipip` | Kernel IP-in-IP. Lowest overhead, IPv4 only | `ipip` module, root |
+| `sit` | Kernel 6in4: IPv6 over IPv4. Tunnel addresses are **IPv6** | `sit` module, root |
+| `l2tp` | Kernel L2TPv3 over UDP or IP | `l2tp_eth`/`l2tp_netlink`, root |
+| `udp` / `icmp` | TUN over plain UDP / ICMP echo between the two servers' real IPs | root; an `icmp` server stops answering normal pings while it runs |
 
 The manager asks for them separately: pick a transport, then answer whether it
 should be encrypted.
 
 | Situation | Use |
 |---|---|
-| Maximum bandwidth | `mtcp` + `aead` |
-| Gaming, low and stable ping | `kcp` or `quic` |
+| Maximum bandwidth | `udp`/`icmp` (if UDP or ping passes), else `mtcp` + `aead` |
+| Gaming, low and stable ping | `kcp` with `kcp_mode` gaming, or `udp` |
 | One heavy stream (backup, large file) | `tcpnomux` |
-| Deep packet inspection resetting or throttling the tunnel | `mtcp` + `tls` (looks like HTTPS), or `ws` + `aead` |
+| Deep packet inspection blocking everything | `ws` + `aead` |
 
-### tls — a real HTTPS carrier
+Measured in 2.3.9 on an emulated Iran-like path (80 ms, 0.3% loss, 500 Mbit/s)
+with 300 users at once, 10 of them downloading and 5 uploading without pause:
 
-`tls` wraps a stream transport (`tcp`, `mtcp`, `mptcp`, `ws`, `tcpnomux`, `kcp`,
-`sctp`) in a genuine TLS session to the domain in `server_name`, with a **real,
-CA-signed certificate** the client verifies — so to a censor it is an ordinary
-HTTPS connection it has no reason to reset or throttle.
+| | ↓ Mbit/s | ↑ Mbit/s | ping, median | ping, 95% |
+|---|---|---|---|---|
+| no tunnel at all | 460 | 425 | 144 ms | 489 ms |
+| `udp`, `icmp` | 453 | 402 | 145 ms | 490 ms |
+| `mtcp` | 449 | 446 | 102 ms | 293 ms |
+| `tcpnomux` | 458 | 399 | 142 ms | 495 ms |
+| `kcp` (4 links) | 160 | 256 | 369 ms | 690 ms |
+| `tcp`, `ws` (one link) | 140 | 136 | 240 ms | 340 ms |
 
-```json
-{ "transport": "mtcp", "encryption": "tls", "server_name": "tunnel.example.com" }
-```
+Your path is not this one: run the **speed test** (below) on each candidate
+and keep the one that does best on yours.
 
-The side that LISTENS (`mode: server`) presents the certificate; the side that
-DIALS (`mode: client`) verifies it against the system root CAs using
-`server_name` — the SNI it sends and the name on the certificate, the **same on
-both ends**, pointing at the listener. The listener gets its certificate either:
+**`quic` was removed in 2.3.22.** It slowed to a few Mbit/s on lossy paths,
+where `kcp` and `mtcp` carry hundreds. A tunnel still set to `quic` will not
+start: switch it to `kcp` (UDP) or `mtcp` (TCP) on both servers with
+**Manage tunnels → Change transport**. The manager lists such tunnels when it
+opens. *Duplicate UDP packets*, which only `quic` could carry, went with it.
 
-- **from files** — `tls_cert` (full-chain PEM) and `tls_key` (private key), e.g.
-  a certificate from `certbot`; or
-- **automatically** — set neither and the core obtains and renews a free Let's
-  Encrypt certificate (ACME). The domain must resolve to the listener and the
-  tunnel must listen on `:443` (the challenge is answered on the same socket).
+The kernel tunnels (`gre`, `gretap`, `ipip`, `sit`, `l2tp`) take no encryption
+layer: the kernel moves the packets, so encrypt at the service (TLS) if you need it.
 
-`alpn` defaults to `h2,http/1.1`. `tls_insecure` on the client accepts a
-self-signed certificate on a trusted path. The tunnel is still authenticated by
-the token, which runs inside the TLS session.
+A point-to-point tunnel cannot be switched to a stream transport in place (or
+back) — they are configured with different fields. Create a new tunnel instead.
 
-`quic` takes no encryption layer — it already uses TLS 1.3 internally.
-
-`spoof` is a packet carrier: it seals each datagram on its own
-(XChaCha20-Poly1305, random per-packet nonce) and accepts `aead` or `none`, but
-not `obfs`. Encrypt it — the transport accepts any packet carrying the expected
-forged source IP, which anyone on the path can send, so without a tag there is
+`udp` and `icmp` are packet carriers: each datagram is sealed on its own
+(XChaCha20-Poly1305, random per-packet nonce), so they accept `aead` or `none`,
+but not `obfs`. Encrypt them — the carrier accepts any packet carrying the
+peer's source IP, which anyone on the path can fake, so without a tag there is
 nothing to stop arbitrary traffic being injected into your TUN device.
+With `aead`, both servers need 2.3.12 or newer (its keys changed in 2.3.12);
+unencrypted `udp`/`icmp` still work with older releases.
+
+**Update both servers together.** Since 2.3.20 a stream tunnel with
+encryption `none` connects only when the other server proves it
+holds the token too, which needs 2.3.14 or newer on both ends. Against an older
+server the log says so and the tunnel stays down.
 
 **Old names still work.** `tcpobf`, `mtcpobf`, `wsobf` and `rawmux` are
 translated automatically (`tcpobf` becomes `tcp` + `obfs`), so existing tunnels
 keep running untouched.
+
+## Several tunnels between the same two servers
+
+Different types run side by side between the same pair of servers — `gre`,
+`gretap`, `ipip`, `sit`, `l2tp`, `udp`, `icmp` and the stream transports — each
+with its own tunnel subnet and its own user ports (the manager picks free ones
+on the Iran server). Two of the **same** type:
+
+| Type | A second one to the same server | What keeps them apart |
+|---|---|---|
+| `gre`, `gretap` | yes | a different `gre_key` each (the manager offers one) |
+| `ipip`, `sit` | **no** — the kernel allows one per pair of IPs | — |
+| `l2tp` | yes | its own tunnel/session id, and over udp its own `l2tp_port` |
+| `udp`, `icmp` | yes | its own `carrier_port` (for icmp: the echo identifier) |
+| stream transports | yes | its own port |
+
+Use the same values on both servers; the Iran server's manager prints them.
+
+## Speed test and live stats
+
+**Speed test** (Manage tunnels → a tunnel → 15) measures ping, jitter,
+download and upload *through the tunnel*, with its own transport and
+encryption, so the numbers are what your users get. It first pings the other
+server outside the tunnel, so you see what the tunnel adds, and it keeps every
+result: the table at the end lists the last runs of all tunnels side by side,
+which is how you compare transports on your own path. Stream transports run it
+on the Iran server; `gre`, `ipip`, `l2tp`, `udp` and `icmp` on either.
+Both servers need 2.3.9 or newer.
+
+**Live stats** (→ 8) shows the speed right now, the peak, a 40-second
+history, the links that are up and the users connected, on both servers and for
+every transport. It updates in place once a second; any key goes back.
 
 ## Tuning for games
 
@@ -170,26 +264,14 @@ it, and give up a few percent of bandwidth to get far more back in latency.
 Forwarded UDP sockets are marked DSCP EF and given interactive priority, so a
 download through the same relay cannot queue in front of a game.
 
-## Duplicate UDP packets
-
-Every UDP datagram can be sent **twice**, with the far end throwing the copy
-away. A packet then has to be lost twice before the game notices.
-
-Turn it on per tunnel: **Manage tunnels → 12) Duplicate UDP packets**, on both
-ends.
-
-| | |
-|---|---|
-| **Fixes** | Loss that hits the two copies independently — a policer dropping one packet in a hundred, a lossy last mile, a flaky wireless hop. |
-| **Does not fix** | Loss from a full queue. Both copies are in that same queue, so both are dropped. Shape the uplink instead (`tune` → gaming). |
-| **Costs** | Exactly double the bandwidth of that tunnel's UDP. For a game that is a few hundred kbit. For a bulk UDP flow it is not. |
-
-It needs `quic` on both ends, both new enough to negotiate it. Where that is not
-true it quietly does nothing rather than sending everything twice with no way to
-recognise the copy.
-
-Worth saying plainly: this is insurance against a **lossy** path, not a cure for
-a **congested** one.
+**Games next to busy users (2.3.10).** On the stream transports a game's UDP
+packets used to wait behind everyone else's downloads inside the tunnel;
+with 100 people browsing over one tcp link, games lost 72% of their packets
+and the rest arrived 11-20 seconds late. Each UDP session now has its own
+queue that is sent in one piece whenever its turn comes, and a packet that is
+already half a second late is dropped instead of delivered: measured with the
+same load, loss under 1% and ping 250 ms on tcp, 140 ms on mtcp, 97 ms on
+udp (80 ms path).
 
 ## Security
 
@@ -202,7 +284,7 @@ a **congested** one.
   same MAC — so a device on the path cannot flip a bit to strip a capability or
   force a format the peer will not parse. **The token is never transmitted**, so it cannot be lifted off the wire even on an unencrypted
   transport.
-- `spoof` keys each direction separately, so a captured packet cannot be
+- `udp` and `icmp` key each direction separately, so a captured packet cannot be
   reflected back at its own sender.
 
 ## No artificial limits
@@ -216,6 +298,15 @@ pool grows and shrinks with live load.
 The traffic **quota** is opt-in and unlimited by default. It does nothing at all
 unless you set one.
 
+Tested in 2.3.9: 18,000 users at once on one tunnel, 80 of them moving data
+flat out (about 6 Gbit/s down and 5 Gbit/s up on a 4-core machine), for 5
+minutes without a single dropped user and with steady latency; memory settled
+near 1 GB and fell back when the users left. What decides how many users one
+server holds is its RAM (about 30 KB per idle user, more while they move data)
+and its file limit, which the service raises. On the foreign server, when every
+source port toward a local service (`127.0.0.1:port`) is taken — about 64,000
+users — new users are dialed from another `127.x` address instead of failing.
+
 ## Command line
 
 The manager covers everything, but the core takes commands directly:
@@ -225,6 +316,7 @@ brokennode -c /etc/brokennode/main.json   # run a tunnel from a config
 brokennode -gen server                    # print a sample server config
 brokennode -gen client                    # print a sample client config
 brokennode -transports                    # list transports and encryption layers
+brokennode speedtest -c /etc/brokennode/main.json [-t 10] [-p 4]
 brokennode version
 ```
 
@@ -232,14 +324,26 @@ brokennode version
 
 Common: `mode`, `transport`, `encryption`, `token`, `keepalive`, `log_level`
 
-Server: `bind_addr`, `ports` (`"2052"`, `"2052/udp"`, `"2052/both"`,
+Server: `ports` (`"2052"`, `"2052/udp"`, `"2052/both"`,
 `"8443=443"`), `quota_total_gb`, `quota_up_gb`, `quota_down_gb`
 
-Client: `remote_addr`, `target_host`
+Client: `target_host`
 
-Per-transport: `pool_size`, `pool_min_idle`, `links`, `links_max`,
+Stream transports: `direction` (`reverse` default, or `direct`); the end that
+listens sets `bind_addr`, the end that connects sets `remote_addr` — the relay
+listens in reverse mode, the foreign server in direct mode.
+
+Per-transport: `pool_size`, `pool_min_idle`, `links` (mtcp; for kcp the
+number of parallel sessions, default 4, 1 in gaming mode), `links_max`,
 `links_per_link`, `kcp_mode`, `kcp_data`, `kcp_parity`, `kcp_mtu`, `kcp_sndwnd`,
-`kcp_rcvwnd`, `smux_recv_mb`, `smux_stream_mb`, `server_name`, `alpn`
+`kcp_rcvwnd`, `smux_recv_mb`, `smux_stream_mb`, `smux_frame_kb`, `server_name`, `alpn`,
+`sctp_streams`, `sctp_multihoming`
+
+Point-to-point tunnels: `local_ip`, `remote_ip` (the two servers' real IPv4
+addresses), `tun_local`, `tun_remote` (the pair on the tunnel — IPv6 for `sit`),
+`tun_name`, `mtu`, `tun_ttl`, `gre_key`, `l2tp_tunnel_id`, `l2tp_session_id`,
+`l2tp_encap` (`udp`|`ip`), `l2tp_port`, `carrier_port` (`udp`/`icmp`). The server's `ports` are NATed across the tunnel; the client's
+`target_host` is where they land.
 
 Both ends must agree on the transport, the encryption layer and the
 transport-level settings.
@@ -274,6 +378,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/BrokenCodeee/BrokenNode/main
 
 این دستور یک پوشهٔ `BrokenNode` می‌سازد، نسخهٔ مناسب پردازندهٔ سرورت را داخلش
 می‌گذارد و منو را باز می‌کند. با کاربر root اجرا کن.
+
+**به‌روزرسانی:** گزینهٔ **5) Update BrokenNode** در منو، یا اجرای دوبارهٔ دستور نصب
+از **داخل** همان پوشه (اول `cd BrokenNode`) — هر دو همان پوشه را به‌روز می‌کنند و
+منو هستهٔ جدید را اعمال و تانل‌ها را ری‌استارت می‌کند. منو هیچ‌وقت هستهٔ قدیمی‌تر
+را روی جدیدتر نمی‌گذارد؛ پوشهٔ قدیمی فقط هشدار می‌دهد.
 
 اگر پوشه را از قبل داری:
 
@@ -340,77 +449,173 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 
 <div dir="rtl">
 
-به جهت دقت کن. سرور **داخل ایران** با `mode: server` اجرا می‌شود — یعنی گوش
-می‌دهد. سرور **خارج** با `mode: client` اجرا می‌شود — یعنی وصل می‌شود. تونل
-*معکوس* است: طرف خارجی اتصال را آغاز می‌کند.
+سرور **داخل ایران** با `mode: server` اجرا می‌شود (کاربران به پورت‌های آن وصل
+می‌شوند). سرور **خارج** با `mode: client` اجرا می‌شود (ترافیک را به سرویس اصلی
+می‌رساند). این‌که کدام طرف تونل را باز کند انتخاب جداگانه‌ای است به نام
+**جهت** (`direction`):
+
+| `direction` | چه کسی به چه کسی وصل می‌شود | سرور ایران | سرور خارج |
+|---|---|---|---|
+| `reverse` (پیش‌فرض، ریورس) | خارج ⬅ به ایران | `bind_addr` (گوش می‌دهد) | `remote_addr` = آی‌پی:پورت ایران |
+| `direct` (دایرکت) | ایران ⬅ به خارج | `remote_addr` = آی‌پی:پورت خارج | `bind_addr` (گوش می‌دهد) |
+
+وقتی اتصال‌های **ورودی** به سرور ایران بسته یا قطع می‌شوند `direct` را انتخاب
+کن: در این حالت سرور ایران فقط اتصال خروجی می‌سازد. کاربران، پورت‌ها،
+رمزنگاری و سرعت در هر دو حالت یکسان است. هر دو سرور باید جهت یکسان داشته
+باشند. منیجر هنگام ساخت تانل این را می‌پرسد و با
+**Manage → Change direction** می‌توان جهت یک تانل موجود را عوض کرد.
+
+جهت فقط برای ترنسپورت‌های جریانی است (`tcp` `mtcp` `mptcp` `ws` `tcpnomux`
+`kcp` `sctp`). تونل‌های نقطه‌به‌نقطه (`gre`، `udp`، `icmp` و ...) از هر
+دو طرف هم‌زمان ارسال می‌کنند و جهت ندارند.
 
 روی **هر دو** سرور نصب کن. دو طرف باید روی ترنسپورت، لایهٔ رمزنگاری و توکن
 یکسان توافق داشته باشند.
+
+### کد جفت‌سازی — راه‌اندازی سرور خارج بدون تایپ هیچ تنظیمی
+
+اول تانل را روی سرور **ایران** بساز. منیجر هر مقداری را که نباید با تانل‌های دیگر
+این سرور تداخل کند خودش انتخاب می‌کند — زیرشبکهٔ تانل، کلید gre، شناسه و پورت
+l2tp، پورت حامل، پورت شنود — و در آخر یک **کد جفت‌سازی** یک‌خطی (`BN1:…`) نشان
+می‌دهد. روی سرور **خارج** گزینهٔ *Create CLIENT tunnel* را بزن و کد را بچسبان:
+کل کانفیگ از روی آن ساخته می‌شود، با چیزهایی که آن سرور از قبل استفاده می‌کند
+مقایسه می‌شود، اجرا می‌شود و منیجر تا وصل شدن صبر می‌کند. در *Manage → 14) Pairing
+code* دوباره نمایش داده می‌شود. کد شامل توکن است — مثل توکن از آن محافظت کن.
+
+**زیر بار کدام ترنسپورت؟** در مسیری که بسته گم می‌کند، هر کاربری که روی یک لینک TCP
+مشترک است پشت هر بستهٔ گم‌شده منتظر می‌ماند. برای همین `mtcp` حالا به‌طور پیش‌فرض
+برای هر کاربر هم‌زمان یک لینک باز می‌کند (با ۴۰ کاربر، ۸۰ms و ۰٫۳٪ گم‌شدن: پینگ
+۱۳۵ms به‌جای ۳۲۰ تا ۴۱۰ms — هم‌اندازهٔ حالت بدون تانل) و `tcpnomux` هم ذاتاً همین‌طور
+است. `tcp` و `ws` یک لینک دارند.
 
 ## ترنسپورت‌ها و رمزنگاری
 
 این دو انتخاب **مستقل** از هم هستند. ترنسپورت تعیین می‌کند بایت‌ها چطور منتقل
 شوند؛ لایهٔ رمزنگاری تعیین می‌کند در مسیر چه شکلی داشته باشند.
 
-**ترنسپورت‌ها:** `tcp` · `mtcp` · `ws` · `tcpnomux` · `kcp` · `quic` · `spoof`
+**ترنسپورت‌های جریانی** (ریورس یا دایرکت، بالا را ببین):
+`tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `sctp`
+
+**تونل‌های نقطه‌به‌نقطه** (IP واقعی هر دو سرور + یک جفت آدرس خصوصی):
+`gre` · `gretap` · `ipip` · `sit` · `l2tp` (کرنلی) · `udp` · `icmp` (TUN)
 
 **رمزنگاری:** `none` · `obfs` (کی‌استریم AES-CTR) · `aead`
-(ChaCha20-Poly1305 با احراز اصالت — پیشنهادی) · `tls` (HTTPS واقعی با گواهی معتبر CA)
+(ChaCha20-Poly1305 با احراز اصالت — پیشنهادی)
+
+| ترنسپورت | چیست | پیش‌نیاز |
+|---|---|---|
+| `tcp` | TCP + smux؛ پایهٔ پایدار | — |
+| `mtcp` | چند لینک TCP موازی؛ در برابر محدودسازی هر اتصال مقاوم | — |
+| `mptcp` | *آزمایشی.* Multipath TCP کرنل: یک اتصال روی همهٔ مسیرها. `mtcp` بهتر است | لینوکس ≥ 5.6 و `net.mptcp.enabled=1` روی هر دو سرور |
+| `ws` | وب‌سوکت، شبیه HTTP | — |
+| `tcpnomux` | برای هر کاربر یک اتصال TCP از استخر | — |
+| `kcp` | KCP روی UDP با FEC؛ به‌طور پیش‌فرض ۴ نشست موازی (`links`) | UDP سالم |
+| `sctp` | چندجریانی، multihome روی چند IP مبدأ | ماژول `sctp` کرنل |
+| `gre` / `gretap` | GRE کرنلی (L3 / L2)؛ بیشترین سرعت | ماژول `ip_gre`، روت |
+| `ipip` | IP-in-IP کرنلی؛ کمترین سربار، فقط IPv4 | ماژول `ipip`، روت |
+| `sit` | 6in4 کرنلی: IPv6 روی IPv4؛ آدرس‌های تونل **IPv6** هستند | ماژول `sit`، روت |
+| `l2tp` | L2TPv3 کرنلی روی UDP یا IP | `l2tp_eth`/`l2tp_netlink`، روت |
+| `udp` / `icmp` | TUN روی UDP ساده / ICMP echo بین IP واقعی دو سرور | روت؛ سرورِ `icmp` تا وقتی بالاست به پینگ معمولی جواب نمی‌دهد |
 
 منو این دو را جدا از هم می‌پرسد: اول ترنسپورت را انتخاب می‌کنی، بعد می‌پرسد
 رمزگذاری شود یا نه.
 
 | وضعیت | انتخاب |
 |---|---|
-| بیشترین پهنای باند | `mtcp` + `aead` |
-| بازی، پینگ پایین و پایدار | `kcp` یا `quic` |
+| بیشترین پهنای باند | `udp`/`icmp` (اگر UDP یا پینگ رد می‌شود)، وگرنه `mtcp` + `aead` |
+| بازی، پینگ پایین و پایدار | `kcp` با `kcp_mode` gaming، یا `udp` |
 | یک جریان سنگین (بکاپ، فایل بزرگ) | `tcpnomux` |
-| DPI که تونل را ریست یا throttle می‌کند | `mtcp` + `tls` (شبیه HTTPS) یا `ws` + `aead` |
+| DPI که همه‌چیز را می‌بندد | `ws` + `aead` |
 
-### tls — حامل HTTPS واقعی
+اندازه‌گیری نسخهٔ 2.3.9 روی مسیر شبیه‌سازی‌شدهٔ ایران (۸۰ میلی‌ثانیه، ۰٫۳٪ loss،
+۵۰۰ مگابیت) با ۳۰۰ کاربر هم‌زمان که ۱۰ نفرشان بی‌وقفه دانلود و ۵ نفر آپلود می‌کنند:
 
-`tls` یک ترنسپورت استریم (`tcp`، `mtcp`، `mptcp`، `ws`، `tcpnomux`، `kcp`،
-`sctp`) را در یک جلسهٔ TLS واقعی به دامنهٔ `server_name` می‌پیچد، با یک **گواهی
-واقعیِ امضاشده توسط CA** که کلاینت اعتبارسنجی‌اش می‌کند — پس برای سانسورچی یک
-اتصال HTTPS معمولی است که دلیلی برای ریست یا throttle کردنش ندارد.
+| | ↓ مگابیت | ↑ مگابیت | پینگ میانه | پینگ ۹۵٪ |
+|---|---|---|---|---|
+| بدون تانل | 460 | 425 | 144 ms | 489 ms |
+| `udp`، `icmp` | 453 | 402 | 145 ms | 490 ms |
+| `mtcp` | 449 | 446 | 102 ms | 293 ms |
+| `tcpnomux` | 458 | 399 | 142 ms | 495 ms |
+| `kcp` (۴ لینک) | 160 | 256 | 369 ms | 690 ms |
+| `tcp`، `ws` (یک لینک) | 140 | 136 | 240 ms | 340 ms |
 
-```json
-{ "transport": "mtcp", "encryption": "tls", "server_name": "tunnel.example.com" }
-```
+مسیر تو همین نیست: روی هر گزینه **تست سرعت** (پایین‌تر) را بزن و بهترینش روی
+مسیر خودت را نگه دار.
 
-سمتی که گوش می‌دهد (`mode: server`) گواهی را ارائه می‌دهد؛ سمتی که وصل می‌شود
-(`mode: client`) آن را با ریشه‌های معتبر سیستم و `server_name` اعتبارسنجی می‌کند.
-`server_name` همان SNI ارسالی و نام روی گواهی است، روی **هر دو سر یکسان** و
-اشاره‌کننده به سمت listener. listener گواهی‌اش را یکی از دو راه می‌گیرد:
+**ترنسپورت `quic` در 2.3.22 حذف شد.** روی مسیرهای پرافت به چند مگابیت سقوط
+می‌کرد، در حالی که `kcp` و `mtcp` صدها مگابیت می‌برند. تونلی که هنوز روی `quic`
+است اجرا نمی‌شود: روی هر دو سرور با **Manage tunnels ← Change transport** آن را
+به `kcp` (UDP) یا `mtcp` (TCP) تغییر بده. منیجر هنگام باز شدن این تونل‌ها را نام
+می‌برد. قابلیت *ارسال دوتایی بسته‌های UDP* هم که فقط با `quic` کار می‌کرد، همراهش
+حذف شد.
 
-- **از فایل** — `tls_cert` (زنجیرهٔ کامل PEM) و `tls_key` (کلید خصوصی)، مثلاً از
-  `certbot`؛ یا
-- **خودکار** — هیچ‌کدام را نده تا هسته خودش گواهی رایگان Let's Encrypt (ACME)
-  بگیرد و تمدید کند. دامنه باید به listener اشاره کند و تونل روی `:443` گوش بدهد
-  (چالش روی همان سوکت پاسخ داده می‌شود).
+تونل‌های کرنلی (`gre`، `gretap`، `ipip`، `sit`، `l2tp`) لایهٔ رمزنگاری نمی‌گیرند: بسته‌ها را
+خود کرنل جابه‌جا می‌کند، پس اگر رمزنگاری لازم است آن را در سرویس (TLS) انجام بده.
 
-`alpn` پیش‌فرض `h2,http/1.1` است. `tls_insecure` روی کلاینت گواهی self-signed را
-روی مسیر مطمئن می‌پذیرد. تونل همچنان با توکن احراز می‌شود، که داخل جلسهٔ TLS اجرا
-می‌شود.
+تونل نقطه‌به‌نقطه را نمی‌شود درجا به ترنسپورت جریانی تبدیل کرد (و برعکس) —
+فیلدهای کانفیگشان فرق دارد. به‌جایش یک تونل جدید بساز.
 
-ترنسپورت `quic` لایهٔ رمزنگاری نمی‌گیرد — خودش از TLS 1.3 استفاده می‌کند.
-
-ترنسپورت `spoof` حامل بسته است: هر دیتاگرام را جداگانه مهر و موم می‌کند
-(XChaCha20-Poly1305 با nonce تصادفی برای هر بسته) و `aead` یا `none` می‌پذیرد،
-ولی `obfs` را نه. حتماً رمزگذاری کن — این ترنسپورت هر بسته‌ای را که IP مبدأ جعلی
-مورد انتظار را داشته باشد قبول می‌کند، و هر کسی در مسیر می‌تواند چنین بسته‌ای
+ترنسپورت‌های `udp` و `icmp` حامل بسته‌اند: هر دیتاگرام جداگانه مهر و موم می‌شود
+(XChaCha20-Poly1305 با nonce تصادفی برای هر بسته)، پس `aead` یا `none` می‌پذیرند،
+ولی `obfs` را نه. حتماً رمزگذاری کن — حامل هر بسته‌ای را که IP مبدأ طرف مقابل
+را داشته باشد قبول می‌کند، و هر کسی در مسیر می‌تواند چنین بسته‌ای جعل کند و
 بفرستد؛ پس بدون تگ احراز اصالت، هیچ چیزی جلوی تزریق ترافیک دلخواه به دستگاه TUN
 تو را نمی‌گیرد.
+با `aead` هر دو سرور باید 2.3.12 یا جدیدتر باشند (کلیدهایش در 2.3.12 عوض شد)؛
+`udp`/`icmp` بدون رمزنگاری هنوز با نسخه‌های قدیمی‌تر کار می‌کند.
+
+**هر دو سرور را با هم به‌روز کن.** از 2.3.20 تانل جریانی با رمزنگاری `none`
+فقط وقتی وصل می‌شود که سرور مقابل هم ثابت کند توکن را دارد؛ این
+یعنی هر دو طرف باید 2.3.14 یا جدیدتر باشند. با سرور قدیمی‌تر، لاگ همین را می‌گوید
+و تانل وصل نمی‌شود.
 
 **نام‌های قدیمی هنوز کار می‌کنند.** `tcpobf`، `mtcpobf`، `wsobf` و `rawmux`
 به‌طور خودکار ترجمه می‌شوند (`tcpobf` می‌شود `tcp` + `obfs`)، پس تونل‌های موجود
 بدون هیچ تغییری به کار خود ادامه می‌دهند.
+
+## چند تانل بین همان دو سرور
+
+انواع مختلف کنار هم بین یک جفت سرور کار می‌کنند — `gre`، `gretap`، `ipip`، `sit`،
+`l2tp`، `udp`، `icmp` و ترنسپورت‌های جریانی — هر کدام با زیرشبکهٔ تانل و
+پورت‌های کاربر جداگانه (منیجر روی سرور ایران مقادیر آزاد را پیشنهاد می‌دهد). دو
+تانل از **یک** نوع:
+
+| نوع | دومی به همان سرور | چه چیزی جدایشان می‌کند |
+|---|---|---|
+| `gre`، `gretap` | بله | هر کدام `gre_key` جدا (منیجر پیشنهاد می‌دهد) |
+| `ipip`، `sit` | **نه** — کرنل برای هر جفت IP فقط یکی را اجازه می‌دهد | — |
+| `l2tp` | بله | tunnel/session id جدا و روی udp یک `l2tp_port` جدا |
+| `udp`، `icmp` | بله | `carrier_port` جدا (در icmp همان شناسهٔ echo) |
+| ترنسپورت‌های جریانی | بله | پورت جدا |
+
+روی هر دو سرور همان مقادیر را وارد کن؛ منیجر سرور ایران آن‌ها را نشان می‌دهد.
+
+## تست سرعت و آمار زنده
+
+**تست سرعت** (مدیریت تانل‌ها ← یک تانل ← ۱۵) پینگ، جیتر، دانلود و آپلود را
+*از داخل خود تانل* و با همان ترنسپورت و رمزنگاری می‌سنجد؛ پس عددها همان چیزی است
+که کاربرهایت می‌گیرند. اول سرور مقابل را بیرون از تانل پینگ می‌کند تا ببینی
+تانل چقدر اضافه می‌کند، و هر نتیجه را نگه می‌دارد: جدول آخر، آخرین اجراهای همهٔ
+تانل‌ها را کنار هم نشان می‌دهد — این‌طوری ترنسپورت‌ها را روی مسیر خودت مقایسه
+می‌کنی. برای ترنسپورت‌های جریانی روی سرور ایران اجرا کن؛ برای `gre`، `ipip`،
+`l2tp`، `udp` و `icmp` روی هر کدام. هر دو سرور باید 2.3.9 یا جدیدتر باشند.
+
+**آمار زنده** (← ۸) سرعت همین لحظه، بیشینه، تاریخچهٔ ۴۰ ثانیه، لینک‌های وصل و
+کاربرهای متصل را روی هر دو سرور و برای همهٔ ترنسپورت‌ها نشان می‌دهد. هر ثانیه
+درجا به‌روز می‌شود (بدون پرش صفحه)؛ با زدن هر کلیدی برمی‌گردی.
 
 ## تنظیم برای بازی
 
 </div>
 
 <div dir="rtl">
+
+**بازی کنار کاربرهای پرمصرف (2.3.10).** روی ترنسپورت‌های جریانی، بسته‌های UDP
+بازی داخل تانل پشت دانلود بقیه منتظر می‌ماندند؛ با ۱۰۰ نفر در حال وب‌گردی روی یک
+لینک tcp، بازی‌ها ۷۲٪ بسته‌ها را از دست می‌دادند و بقیه ۱۱ تا ۲۰ ثانیه دیر
+می‌رسید. حالا هر نشست UDP صف خودش را دارد که هر نوبت یک‌جا فرستاده می‌شود، و بسته‌ای
+که نیم ثانیه دیر شده به‌جای رسیدن دیرهنگام دور ریخته می‌شود: با همان بار، loss زیر
+۱٪ و پینگ ۲۵۰ میلی‌ثانیه روی tcp، ۱۴۰ روی mtcp و ۹۷ روی udp (مسیر ۸۰ میلی‌ثانیه).
 
 بخش **Health check** در منو حالا **جیتر** را هم گزارش می‌کند، نه فقط میانگین
 پینگ. عددی که باید نگاه کنی همین است: ۸۰ میلی‌ثانیهٔ ثابت بهتر از ۶۰ است که
@@ -437,30 +642,6 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 سوکت‌های UDP فورواردشده با DSCP EF و اولویت تعاملی علامت می‌خورند، پس یک دانلود
 از همان رله نمی‌تواند جلوی بازی در صف بایستد.
 
-## ارسال دوتایی بسته‌های UDP
-
-</div>
-
-<div dir="rtl">
-
-هر دیتاگرام UDP می‌تواند **دو بار** فرستاده شود و طرف مقابل نسخهٔ تکراری را دور
-بیندازد. آن‌وقت یک بسته باید **دو بار** گم شود تا بازی متوجهش شود.
-
-برای هر تونل جداگانه روشن می‌شود: **Manage tunnels ← 12) Duplicate UDP packets**،
-روی هر دو سر.
-
-| | |
-|---|---|
-| **چه چیزی را حل می‌کند** | لاستی که روی دو نسخه مستقل از هم می‌افتد — پالیسری که یک بسته از هر صد را می‌اندازد، آخرین مایل پرخطا، یا یک پرش وایرلس ناپایدار. |
-| **چه چیزی را حل نمی‌کند** | لاست ناشی از صف پر. هر دو نسخه در همان صف هستند، پس هر دو دور ریخته می‌شوند. برای آن، پهنای باند خروجی را محدود کن (`tune` ← گیمینگ). |
-| **هزینه** | دقیقاً دو برابر پهنای باند UDP همان تونل. برای بازی چند صد کیلوبیت است. برای یک جریان حجیم UDP نه. |
-
-به `quic` روی هر دو سر نیاز دارد، و هر دو باید به‌قدر کافی جدید باشند که سرِ آن
-توافق کنند. جایی که این‌طور نباشد، بی‌صدا کاری نمی‌کند — به‌جای اینکه همه‌چیز را
-دوبار بفرستد بدون اینکه راهی برای تشخیص نسخهٔ تکراری باشد.
-
-صریح بگویم: این بیمه در برابر مسیر **پرخطا** است، نه درمان مسیر **شلوغ**.
-
 ## امنیت
 
 - **توکن** همان کلید از پیش اشتراکی است. تونل را احراز هویت می‌کند و همهٔ
@@ -473,7 +654,7 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
   پس کسی در مسیر نمی‌تواند بیتی را برگرداند تا قابلیتی را حذف کند یا قالبی را
   تحمیل کند که طرف مقابل نمی‌فهمد. **توکن هرگز ارسال نمی‌شود**، پس
   حتی روی یک ترنسپورت بدون رمزنگاری هم نمی‌توان آن را از روی شبکه برداشت.
-- در `spoof` هر جهت کلید جداگانه دارد، بنابراین یک بستهٔ ضبط‌شده را نمی‌توان به
+- در `udp` و `icmp` هر جهت کلید جداگانه دارد، بنابراین یک بستهٔ ضبط‌شده را نمی‌توان به
   خود فرستنده‌اش بازتاب داد.
 
 ## بدون هیچ محدودیت مصنوعی
@@ -487,6 +668,15 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 **سهمیهٔ ترافیک** اختیاری است و به‌صورت پیش‌فرض نامحدود. تا وقتی خودت مقداری
 تنظیم نکنی، هیچ کاری انجام نمی‌دهد.
 
+تست‌شده در 2.3.9: ۱۸٬۰۰۰ کاربر هم‌زمان روی یک تانل، ۸۰ نفرشان با تمام سرعت در
+حال جابه‌جایی داده (حدود ۶ گیگابیت دانلود و ۵ گیگابیت آپلود روی یک ماشین ۴ هسته‌ای)،
+۵ دقیقه بدون قطع شدن حتی یک کاربر و با تأخیر ثابت؛ حافظه حدود ۱ گیگابایت ماند و
+بعد از رفتن کاربرها پایین آمد. تعداد کاربری که یک سرور نگه می‌دارد را RAM آن
+(حدود ۳۰ کیلوبایت برای هر کاربر بیکار، بیشتر وقتی داده جابه‌جا می‌کند) و سقف
+فایل‌های باز تعیین می‌کند که سرویس بالا می‌برد. روی سرور خارج، وقتی همهٔ پورت‌های
+مبدأ به سمت سرویس محلی (`127.0.0.1:port`) پر شود — حدود ۶۴٬۰۰۰ کاربر — کاربر
+جدید از یک آدرس دیگر `127.x` وصل می‌شود به‌جای اینکه قطع شود.
+
 ## خط فرمان
 
 منو همهٔ کارها را پوشش می‌دهد، ولی هستهٔ برنامه دستورها را مستقیم هم می‌پذیرد:
@@ -498,6 +688,7 @@ brokennode -c /etc/brokennode/main.json   # اجرای تونل از روی کا
 brokennode -gen server                    # چاپ یک کانفیگ نمونهٔ سرور
 brokennode -gen client                    # چاپ یک کانفیگ نمونهٔ کلاینت
 brokennode -transports                    # فهرست ترنسپورت‌ها و لایه‌های رمزنگاری
+brokennode speedtest -c /etc/brokennode/main.json [-t 10] [-p 4]   # تست سرعت از داخل تانل
 brokennode version
 ```
 
@@ -507,15 +698,25 @@ brokennode version
 
 مشترک: `mode`، `transport`، `encryption`، `token`، `keepalive`، `log_level`
 
-سرور: `bind_addr`، `ports` (به شکل `"2052"`، `"2052/udp"`، `"2052/both"`،
+سرور: `ports` (به شکل `"2052"`، `"2052/udp"`، `"2052/both"`،
 `"8443=443"`)، `quota_total_gb`، `quota_up_gb`، `quota_down_gb`
 
-کلاینت: `remote_addr`، `target_host`
+کلاینت: `target_host`
+
+ترنسپورت‌های جریانی: `direction` (پیش‌فرض `reverse`، یا `direct`)؛ طرفی که گوش
+می‌دهد `bind_addr` و طرفی که وصل می‌شود `remote_addr` می‌گیرد — در ریورس سرور
+ایران گوش می‌دهد و در دایرکت سرور خارج.
 
 مخصوص هر ترنسپورت: `pool_size`، `pool_min_idle`، `links`، `links_max`،
 `links_per_link`، `kcp_mode`، `kcp_data`، `kcp_parity`، `kcp_mtu`،
-`kcp_sndwnd`، `kcp_rcvwnd`، `smux_recv_mb`، `smux_stream_mb`، `server_name`،
-`alpn`
+`kcp_sndwnd`، `kcp_rcvwnd`، `smux_recv_mb`، `smux_stream_mb`، `smux_frame_kb`، `server_name`،
+`alpn`، `sctp_streams`، `sctp_multihoming`
+
+تونل‌های نقطه‌به‌نقطه: `local_ip`، `remote_ip` (IPv4 واقعی دو سرور)،
+`tun_local`، `tun_remote` (جفت آدرس روی تونل — برای `sit` از نوع IPv6)،
+`tun_name`، `mtu`، `tun_ttl`، `gre_key`، `l2tp_tunnel_id`، `l2tp_session_id`،
+`l2tp_encap` (`udp`|`ip`)، `l2tp_port`، `carrier_port` (`udp`/`icmp`). پورت‌های `ports` سرور از روی تونل NAT می‌شوند و `target_host`
+کلاینت مقصد نهایی آن‌هاست.
 
 دو طرف تونل باید روی ترنسپورت، لایهٔ رمزنگاری و تنظیمات سطح ترنسپورت توافق
 داشته باشند.
