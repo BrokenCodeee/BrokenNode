@@ -4,7 +4,7 @@
 
 **Multi-protocol reverse tunnel — compiled and ready to run.**
 
-`v2.7.1`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
+`v2.3.0`  ·  Core in **Go**, manager in **Bash**  ·  [t.me/BrokenNode](https://t.me/BrokenNode)
 
 **[English](#english)**  ·  **[فارسی](#فارسی)**
 
@@ -89,11 +89,11 @@ encryption layer and the token.
 Two independent choices. The transport decides how the bytes travel; the
 encryption layer decides what they look like on the way.
 
-**Transports:** `tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `sctp` · `gre` · `gretap` · `ipip` · `sit` · `l2tp` · `udp` · `icmp`
+**Transports:** `tcp` · `mtcp` · `ws` · `tcpnomux` · `kcp` · `quic` · `spoof`
 
 **Encryption:** `none` · `obfs` (AES-CTR keystream) · `aead`
-(ChaCha20-Poly1305, authenticated — recommended) · `tls` (Chrome-fingerprinted
-TLS that makes the carrier look like HTTPS)
+(ChaCha20-Poly1305, authenticated — recommended) · `tls` (real HTTPS with a
+CA-signed certificate)
 
 The manager asks for them separately: pick a transport, then answer whether it
 should be encrypted.
@@ -101,27 +101,43 @@ should be encrypted.
 | Situation | Use |
 |---|---|
 | Maximum bandwidth | `mtcp` + `aead` |
-| Gaming, low and stable ping | `kcp` |
+| Gaming, low and stable ping | `kcp` or `quic` |
 | One heavy stream (backup, large file) | `tcpnomux` |
-| Deep packet inspection blocking everything | `mtcp` + `tls` (looks like HTTPS), or `ws` + `aead` |
+| Deep packet inspection resetting or throttling the tunnel | `mtcp` + `tls` (looks like HTTPS), or `ws` + `aead` |
 
-`tls` is an encryption layer, not a transport, so it rides on any stream
-transport: `mtcp` + `tls` gives several bonded links that each look like an
-HTTPS connection. The client speaks TLS 1.3 with a Chrome ClientHello
-fingerprint (uTLS) to the domain in `server_name` (the SNI and the self-signed
-certificate's name; the same domain on both ends, pointing at the Iran relay).
-`tls_fingerprint` picks a different browser; `alpn` defaults to `h2,http/1.1`.
+### tls — a real HTTPS carrier
+
+`tls` wraps a stream transport (`tcp`, `mtcp`, `mptcp`, `ws`, `tcpnomux`, `kcp`,
+`sctp`) in a genuine TLS session to the domain in `server_name`, with a **real,
+CA-signed certificate** the client verifies — so to a censor it is an ordinary
+HTTPS connection it has no reason to reset or throttle.
 
 ```json
-{ "transport": "mtcp", "encryption": "tls", "server_name": "cdn.example.com" }
+{ "transport": "mtcp", "encryption": "tls", "server_name": "tunnel.example.com" }
 ```
 
-`udp` and `icmp` are packet carriers: they wrap raw IP in a TUN device over a
-plain UDP or ICMP-echo carrier using the server's real source IP, seal each
-datagram on its own (XChaCha20-Poly1305, random per-packet nonce) and accept
-`aead` or `none`, but not `obfs`. Encrypt them — the carrier accepts any packet
-from the expected source, which anyone on the path can send, so without a tag
-there is nothing to stop arbitrary traffic being injected into your TUN device.
+The side that LISTENS (`mode: server`) presents the certificate; the side that
+DIALS (`mode: client`) verifies it against the system root CAs using
+`server_name` — the SNI it sends and the name on the certificate, the **same on
+both ends**, pointing at the listener. The listener gets its certificate either:
+
+- **from files** — `tls_cert` (full-chain PEM) and `tls_key` (private key), e.g.
+  a certificate from `certbot`; or
+- **automatically** — set neither and the core obtains and renews a free Let's
+  Encrypt certificate (ACME). The domain must resolve to the listener and the
+  tunnel must listen on `:443` (the challenge is answered on the same socket).
+
+`alpn` defaults to `h2,http/1.1`. `tls_insecure` on the client accepts a
+self-signed certificate on a trusted path. The tunnel is still authenticated by
+the token, which runs inside the TLS session.
+
+`quic` takes no encryption layer — it already uses TLS 1.3 internally.
+
+`spoof` is a packet carrier: it seals each datagram on its own
+(XChaCha20-Poly1305, random per-packet nonce) and accepts `aead` or `none`, but
+not `obfs`. Encrypt it — the transport accepts any packet carrying the expected
+forged source IP, which anyone on the path can send, so without a tag there is
+nothing to stop arbitrary traffic being injected into your TUN device.
 
 **Old names still work.** `tcpobf`, `mtcpobf`, `wsobf` and `rawmux` are
 translated automatically (`tcpobf` becomes `tcp` + `obfs`), so existing tunnels
@@ -168,9 +184,9 @@ ends.
 | **Does not fix** | Loss from a full queue. Both copies are in that same queue, so both are dropped. Shape the uplink instead (`tune` → gaming). |
 | **Costs** | Exactly double the bandwidth of that tunnel's UDP. For a game that is a few hundred kbit. For a bulk UDP flow it is not. |
 
-It needs a datagram-capable transport on both ends. This build ships none (the
-quic transport was removed), so it is inert for now and quietly does nothing
-rather than sending everything twice with no way to recognise the copy.
+It needs `quic` on both ends, both new enough to negotiate it. Where that is not
+true it quietly does nothing rather than sending everything twice with no way to
+recognise the copy.
 
 Worth saying plainly: this is insurance against a **lossy** path, not a cure for
 a **congested** one.
@@ -186,8 +202,8 @@ a **congested** one.
   same MAC — so a device on the path cannot flip a bit to strip a capability or
   force a format the peer will not parse. **The token is never transmitted**, so it cannot be lifted off the wire even on an unencrypted
   transport.
-- the `udp`/`icmp` packet sealer keys each direction separately, so a captured
-  packet cannot be reflected back at its own sender.
+- `spoof` keys each direction separately, so a captured packet cannot be
+  reflected back at its own sender.
 
 ## No artificial limits
 
@@ -336,11 +352,10 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 این دو انتخاب **مستقل** از هم هستند. ترنسپورت تعیین می‌کند بایت‌ها چطور منتقل
 شوند؛ لایهٔ رمزنگاری تعیین می‌کند در مسیر چه شکلی داشته باشند.
 
-**ترنسپورت‌ها:** `tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `sctp` · `gre` · `gretap` · `ipip` · `sit` · `l2tp` · `udp` · `icmp`
+**ترنسپورت‌ها:** `tcp` · `mtcp` · `ws` · `tcpnomux` · `kcp` · `quic` · `spoof`
 
 **رمزنگاری:** `none` · `obfs` (کی‌استریم AES-CTR) · `aead`
-(ChaCha20-Poly1305 با احراز اصالت — پیشنهادی) · `tls` (TLS با فینگرپرینت کروم؛
-حامل مثل HTTPS دیده می‌شود)
+(ChaCha20-Poly1305 با احراز اصالت — پیشنهادی) · `tls` (HTTPS واقعی با گواهی معتبر CA)
 
 منو این دو را جدا از هم می‌پرسد: اول ترنسپورت را انتخاب می‌کنی، بعد می‌پرسد
 رمزگذاری شود یا نه.
@@ -348,27 +363,44 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 | وضعیت | انتخاب |
 |---|---|
 | بیشترین پهنای باند | `mtcp` + `aead` |
-| بازی، پینگ پایین و پایدار | `kcp` |
+| بازی، پینگ پایین و پایدار | `kcp` یا `quic` |
 | یک جریان سنگین (بکاپ، فایل بزرگ) | `tcpnomux` |
-| DPI که همه‌چیز را می‌بندد | `mtcp` + `tls` (شبیه HTTPS) یا `ws` + `aead` |
+| DPI که تونل را ریست یا throttle می‌کند | `mtcp` + `tls` (شبیه HTTPS) یا `ws` + `aead` |
 
-`tls` یک **لایهٔ رمزنگاری** است، نه ترنسپورت؛ پس روی هر ترنسپورت جریانی سوار
-می‌شود: `mtcp` + `tls` یعنی چند لینک موازی که هرکدام مثل یک اتصال HTTPS دیده
-می‌شوند. کلاینت با فینگرپرینت ClientHello کروم (uTLS) به دامنه‌ای که در
-`server_name` می‌دهی (همان SNI و نام گواهی self-signed؛ روی هر دو سر یکسان و
-اشاره‌کننده به IP سرور ایران) هندشیک TLS 1.3 می‌زند. `tls_fingerprint` مرورگر
-دیگری را انتخاب می‌کند و `alpn` پیش‌فرض `h2,http/1.1` است.
+### tls — حامل HTTPS واقعی
+
+`tls` یک ترنسپورت استریم (`tcp`، `mtcp`، `mptcp`، `ws`، `tcpnomux`، `kcp`،
+`sctp`) را در یک جلسهٔ TLS واقعی به دامنهٔ `server_name` می‌پیچد، با یک **گواهی
+واقعیِ امضاشده توسط CA** که کلاینت اعتبارسنجی‌اش می‌کند — پس برای سانسورچی یک
+اتصال HTTPS معمولی است که دلیلی برای ریست یا throttle کردنش ندارد.
 
 ```json
-{ "transport": "mtcp", "encryption": "tls", "server_name": "cdn.example.com" }
+{ "transport": "mtcp", "encryption": "tls", "server_name": "tunnel.example.com" }
 ```
 
-ترنسپورت‌های `udp` و `icmp` حامل بسته‌اند: IP خام را در یک دستگاه TUN روی یک حامل
-سادهٔ UDP یا ICMP-echo با IP مبدأ واقعیِ سرور می‌پیچند، هر دیتاگرام را جداگانه مهر و
-موم می‌کنند (XChaCha20-Poly1305 با nonce تصادفی برای هر بسته) و `aead` یا `none`
-می‌پذیرند، ولی `obfs` را نه. حتماً رمزگذاری کن — حامل هر بسته‌ای را که از مبدأ مورد
-انتظار بیاید قبول می‌کند، و هر کسی در مسیر می‌تواند چنین بسته‌ای بفرستد؛ پس بدون تگ
-احراز اصالت، هیچ چیزی جلوی تزریق ترافیک دلخواه به دستگاه TUN تو را نمی‌گیرد.
+سمتی که گوش می‌دهد (`mode: server`) گواهی را ارائه می‌دهد؛ سمتی که وصل می‌شود
+(`mode: client`) آن را با ریشه‌های معتبر سیستم و `server_name` اعتبارسنجی می‌کند.
+`server_name` همان SNI ارسالی و نام روی گواهی است، روی **هر دو سر یکسان** و
+اشاره‌کننده به سمت listener. listener گواهی‌اش را یکی از دو راه می‌گیرد:
+
+- **از فایل** — `tls_cert` (زنجیرهٔ کامل PEM) و `tls_key` (کلید خصوصی)، مثلاً از
+  `certbot`؛ یا
+- **خودکار** — هیچ‌کدام را نده تا هسته خودش گواهی رایگان Let's Encrypt (ACME)
+  بگیرد و تمدید کند. دامنه باید به listener اشاره کند و تونل روی `:443` گوش بدهد
+  (چالش روی همان سوکت پاسخ داده می‌شود).
+
+`alpn` پیش‌فرض `h2,http/1.1` است. `tls_insecure` روی کلاینت گواهی self-signed را
+روی مسیر مطمئن می‌پذیرد. تونل همچنان با توکن احراز می‌شود، که داخل جلسهٔ TLS اجرا
+می‌شود.
+
+ترنسپورت `quic` لایهٔ رمزنگاری نمی‌گیرد — خودش از TLS 1.3 استفاده می‌کند.
+
+ترنسپورت `spoof` حامل بسته است: هر دیتاگرام را جداگانه مهر و موم می‌کند
+(XChaCha20-Poly1305 با nonce تصادفی برای هر بسته) و `aead` یا `none` می‌پذیرد،
+ولی `obfs` را نه. حتماً رمزگذاری کن — این ترنسپورت هر بسته‌ای را که IP مبدأ جعلی
+مورد انتظار را داشته باشد قبول می‌کند، و هر کسی در مسیر می‌تواند چنین بسته‌ای
+بفرستد؛ پس بدون تگ احراز اصالت، هیچ چیزی جلوی تزریق ترافیک دلخواه به دستگاه TUN
+تو را نمی‌گیرد.
 
 **نام‌های قدیمی هنوز کار می‌کنند.** `tcpobf`، `mtcpobf`، `wsobf` و `rawmux`
 به‌طور خودکار ترجمه می‌شوند (`tcpobf` می‌شود `tcp` + `obfs`)، پس تونل‌های موجود
@@ -423,9 +455,9 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 | **چه چیزی را حل نمی‌کند** | لاست ناشی از صف پر. هر دو نسخه در همان صف هستند، پس هر دو دور ریخته می‌شوند. برای آن، پهنای باند خروجی را محدود کن (`tune` ← گیمینگ). |
 | **هزینه** | دقیقاً دو برابر پهنای باند UDP همان تونل. برای بازی چند صد کیلوبیت است. برای یک جریان حجیم UDP نه. |
 
-به یک ترنسپورت دیتاگرام‌پشتیبان روی هر دو سر نیاز دارد. این نسخه هیچ‌کدام را ندارد
-(ترنسپورت quic حذف شده)، پس فعلاً بی‌اثر است و بی‌صدا کاری نمی‌کند — به‌جای اینکه
-همه‌چیز را دوبار بفرستد بدون راهی برای تشخیص نسخهٔ تکراری.
+به `quic` روی هر دو سر نیاز دارد، و هر دو باید به‌قدر کافی جدید باشند که سرِ آن
+توافق کنند. جایی که این‌طور نباشد، بی‌صدا کاری نمی‌کند — به‌جای اینکه همه‌چیز را
+دوبار بفرستد بدون اینکه راهی برای تشخیص نسخهٔ تکراری باشد.
 
 صریح بگویم: این بیمه در برابر مسیر **پرخطا** است، نه درمان مسیر **شلوغ**.
 
@@ -441,8 +473,8 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
   پس کسی در مسیر نمی‌تواند بیتی را برگرداند تا قابلیتی را حذف کند یا قالبی را
   تحمیل کند که طرف مقابل نمی‌فهمد. **توکن هرگز ارسال نمی‌شود**، پس
   حتی روی یک ترنسپورت بدون رمزنگاری هم نمی‌توان آن را از روی شبکه برداشت.
-- در `udp`/`icmp` سیلر هر جهت کلید جداگانه دارد، بنابراین یک بستهٔ ضبط‌شده را
-  نمی‌توان به خود فرستنده‌اش بازتاب داد.
+- در `spoof` هر جهت کلید جداگانه دارد، بنابراین یک بستهٔ ضبط‌شده را نمی‌توان به
+  خود فرستنده‌اش بازتاب داد.
 
 ## بدون هیچ محدودیت مصنوعی
 
