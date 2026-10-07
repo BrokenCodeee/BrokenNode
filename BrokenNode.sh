@@ -8,7 +8,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.7.2"
+VERSION="2.7.3"
 BIN="/usr/local/bin/brokennode"
 CFG_DIR="/etc/brokennode"
 TPL="/etc/systemd/system/brokennode@.service"
@@ -262,37 +262,52 @@ build_ports(){
 }
 
 # tls_extra collects the fields for the tls encryption layer into TLSJSON (the
-# server/client config blocks splice it in). server_name is the domain on the
-# certificate and the SNI the client sends — it must be the SAME on both ends.
-# The listener (server) presents a REAL certificate; the dialer (client) verifies
-# it against the public CAs, exactly as a browser does.
+# server/client config blocks splice it in). server_name is the SNI the client
+# sends and the name on the certificate; setting the SAME value on both ends
+# makes the handshake look like ordinary HTTPS. Only the automatic Let's Encrypt
+# mode needs a reachable :80/:443 — self-signed and cert-file modes run on ANY
+# port, which is what lets the tunnel port and the user ports be anything.
 tls_extra(){
   local role="$1" dom alpn
-  dom=$(ask 'Domain for TLS (SNI + certificate, e.g. tunnel.example.com)' '')
-  while [ -z "$dom" ]; do warn "tls needs a domain — the same on both ends." >&2; dom=$(ask 'Domain for TLS' ''); done
-  TLSJSON="\"server_name\":\"$dom\","
-  alpn=$(ask 'ALPN (blank = h2,http/1.1, which looks like a browser)' '')
-  [ -n "$alpn" ] && TLSJSON="$TLSJSON\"alpn\":\"$alpn\","
   if [ "$role" = server ]; then
     echo >&2
-    echo -e "${C_B}  TLS certificate for $dom:${C_N}" >&2
-    echo -e "   1) Automatic — obtain a free Let's Encrypt certificate ${C_G}(recommended)${C_N}" >&2
-    echo    "   2) I already have certificate files (e.g. from certbot)" >&2
-    local cs; cs=$(ask 'Choice [1-2]' '1')
-    if [ "$cs" = 2 ]; then
-      local cert key
-      cert=$(ask 'Path to certificate (full chain)' "/etc/letsencrypt/live/$dom/fullchain.pem")
-      key=$(ask 'Path to private key' "/etc/letsencrypt/live/$dom/privkey.pem")
-      TLSJSON="$TLSJSON\"tls_cert\":\"$cert\",\"tls_key\":\"$key\","
-    else
-      local em; em=$(ask "Email for the Let's Encrypt account (blank = none)" '')
-      [ -n "$em" ] && TLSJSON="$TLSJSON\"tls_auto_email\":\"$em\","
-      warn "Automatic certificate: '$dom' must resolve to THIS server, and this tunnel must listen on port 443." >&2
-    fi
+    echo -e "${C_B}  TLS certificate — how should this server get one?${C_N}" >&2
+    echo -e "   1) Self-signed        ${C_G}(ANY port, no domain needed — easiest)${C_N}" >&2
+    echo    "   2) Let's Encrypt auto (real CA; needs a domain + port 80/443 reachable)" >&2
+    echo    "   3) Certificate files  (e.g. from certbot; any port)" >&2
+    local cs; cs=$(ask 'Choice [1-3]' '1')
+    case "$cs" in
+      2)
+        dom=$(ask 'Domain (SNI + certificate, e.g. tunnel.example.com)' '')
+        while [ -z "$dom" ]; do warn "Let's Encrypt auto needs a domain." >&2; dom=$(ask 'Domain' ''); done
+        TLSJSON="\"server_name\":\"$dom\","
+        local em; em=$(ask "Email for the Let's Encrypt account (blank = none)" '')
+        [ -n "$em" ] && TLSJSON="$TLSJSON\"tls_auto_email\":\"$em\","
+        warn "Automatic certificate: '$dom' must resolve to THIS server and this tunnel must listen on port 443." >&2
+        ;;
+      3)
+        dom=$(ask 'Domain on the certificate (SNI; blank = none)' '')
+        [ -n "$dom" ] && TLSJSON="\"server_name\":\"$dom\","
+        local cert key
+        cert=$(ask 'Path to certificate (full chain)' "/etc/letsencrypt/live/${dom:-example.com}/fullchain.pem")
+        key=$(ask 'Path to private key' "/etc/letsencrypt/live/${dom:-example.com}/privkey.pem")
+        TLSJSON="$TLSJSON\"tls_cert\":\"$cert\",\"tls_key\":\"$key\","
+        ;;
+      *)
+        dom=$(ask 'SNI name to present (blank = default; a real-looking name blends in)' '')
+        [ -n "$dom" ] && TLSJSON="\"server_name\":\"$dom\","
+        TLSJSON="$TLSJSON\"tls_selfsigned\":true,"
+        info "Self-signed: this tunnel works on ANY port. On the CLIENT, keep the self-signed answer as yes." >&2
+        ;;
+    esac
   else
-    local si; si=$(ask 'Is the server certificate self-signed (NOT from a real CA)? y/N' 'N')
-    case "$si" in y|Y) TLSJSON="$TLSJSON\"tls_insecure\":true," ;; esac
+    dom=$(ask 'TLS SNI / domain (same as the server; blank = none)' '')
+    [ -n "$dom" ] && TLSJSON="\"server_name\":\"$dom\","
+    local si; si=$(ask 'Is the server certificate self-signed (not a public CA)? Y/n' 'Y')
+    case "$si" in n|N) : ;; *) TLSJSON="$TLSJSON\"tls_insecure\":true," ;; esac
   fi
+  alpn=$(ask 'ALPN (blank = h2,http/1.1, looks like a browser)' '')
+  [ -n "$alpn" ] && TLSJSON="$TLSJSON\"alpn\":\"$alpn\","
 }
 
 build_extra(){ local role="$1" tr="$2" enc="${3:-}"; EXTRA=""; TLSJSON=""
