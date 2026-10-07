@@ -3,12 +3,12 @@
 #  BrokenNode Tunnel - Manager (prebuilt core, no build / no internet)
 #  Multi-instance | presets | per-port tcp/udp/both | systemd
 #  Transport and encryption are chosen separately (see pick_transport /
-#  pick_encryption). The udp/icmp carriers are built into the core and use the
-#  same config/unit as every other transport.
+#  pick_encryption). ip-spoofing is built into the core and uses the same
+#  config/unit as every other transport.
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.7.1"
+VERSION="2.7.2"
 BIN="/usr/local/bin/brokennode"
 CFG_DIR="/etc/brokennode"
 TPL="/etc/systemd/system/brokennode@.service"
@@ -27,15 +27,7 @@ C_R='\033[0;31m'; C_G='\033[0;32m'; C_Y='\033[1;33m'; C_B='\033[0;36m'; C_M='\03
 info(){ echo -e "${C_G}  [+]${C_N} $*"; }
 warn(){ echo -e "${C_Y}  [!]${C_N} $*"; }
 err(){ echo -e "${C_R}  [x]${C_N} $*" >&2; }
-ask(){ local p="$1" d="${2:-}" a
-  if [ -n "$d" ]; then read -rp "$(echo -e "${C_B}  ?${C_N} $p [${C_D}$d${C_N}]: ")" a; a="${a:-$d}"
-  else read -rp "$(echo -e "${C_B}  ?${C_N} $p: ")" a; fi
-  # Strip control characters before returning. An arrow/Page key sends an escape
-  # sequence (ESC = \x1b) that read stores verbatim; landing that in a JSON field
-  # like the token produced an unparseable config ("invalid character '\x1b' in
-  # string literal") and a tunnel that would not start. tr removes all C0
-  # controls and DEL, so a stray keypress can no longer corrupt a config.
-  printf '%s' "$a" | tr -d '\000-\037\177'; }
+ask(){ local p="$1" d="${2:-}" a; if [ -n "$d" ]; then read -rp "$(echo -e "${C_B}  ?${C_N} $p [${C_D}$d${C_N}]: ")" a; echo "${a:-$d}"; else read -rp "$(echo -e "${C_B}  ?${C_N} $p: ")" a; echo "$a"; fi; }
 need_root(){ [ "$(id -u)" -eq 0 ] || { err "Run as root: sudo bash $SELF"; exit 1; }; }
 detect_ip(){ ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1 || true; }
 default_iface(){ ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1; }
@@ -178,37 +170,39 @@ pick_transport(){
   echo    "   4) ws        WebSocket/HTTP + smux    (HTTP mimicry)" >&2
   echo    "   5) tcpnomux  TCP pool, no HoL         (heavy single-flow)" >&2
   echo -e "   6) kcp       KCP/UDP + FEC            ${C_Y}(only if UDP works)${C_N}" >&2
-  echo -e "   7) sctp      Multi-stream + multihome ${C_Y}(needs kernel sctp)${C_N}" >&2
+  echo -e "   7) quic      QUIC/UDP, built-in TLS   ${C_Y}(only if UDP works)${C_N}" >&2
+  echo -e "   8) sctp      Multi-stream + multihome ${C_Y}(needs kernel sctp)${C_N}" >&2
   echo -e "  ${C_D}── kernel tunnels (point-to-point, highest throughput) ─${C_N}" >&2
-  echo    "   8) gre       GRE, L3, offload" >&2
-  echo    "   9) gretap    GRETAP, L2/ethernet" >&2
-  echo    "  10) ipip      IP-in-IP, lowest overhead" >&2
-  echo    "  11) sit       6in4 (IPv6 over IPv4)" >&2
-  echo    "  12) l2tp      L2TPv3 tunnel+session" >&2
+  echo    "   9) gre       GRE, L3, offload" >&2
+  echo    "  10) gretap    GRETAP, L2/ethernet" >&2
+  echo    "  11) ipip      IP-in-IP, lowest overhead" >&2
+  echo    "  12) sit       6in4 (IPv6 over IPv4)" >&2
+  echo    "  13) l2tp      L2TPv3 tunnel+session" >&2
   echo -e "  ${C_D}── raw carriers (TUN over a protocol) ────────${C_N}" >&2
-  echo    "  13) udp       TUN over UDP" >&2
-  echo    "  14) icmp      TUN over ICMP echo" >&2
+  echo    "  14) udp       TUN over UDP" >&2
+  echo    "  15) icmp      TUN over ICMP echo" >&2
+  echo -e "  16) ip-spoofing  Spoofed-IP TUN        ${C_M}(blackout / national whitelist)${C_N}" >&2
   echo -e "  ${C_D}──────────────────────────────────────────────${C_N}" >&2
-  local n; n=$(ask "Choice [1-14]" "1")
+  local n; n=$(ask "Choice [1-16]" "1")
   case "$n" in
     1) echo tcp ;; 2) echo mtcp ;; 3) echo mptcp ;; 4) echo ws ;; 5) echo tcpnomux ;;
-    6) echo kcp ;; 7) echo sctp ;;
-    8) echo gre ;; 9) echo gretap ;; 10) echo ipip ;; 11) echo sit ;; 12) echo l2tp ;;
-    13) echo udp ;; 14) echo icmp ;; *) echo tcp ;;
+    6) echo kcp ;; 7) echo quic ;; 8) echo sctp ;;
+    9) echo gre ;; 10) echo gretap ;; 11) echo ipip ;; 12) echo sit ;; 13) echo l2tp ;;
+    14) echo udp ;; 15) echo icmp ;; 16) echo spoof ;; *) echo tcp ;;
   esac
 }
 
-# pick_encryption asks how the chosen transport's carrier should be wrapped:
-# aead/obfs/none, or tls — a Chrome-fingerprinted TLS session that makes any
-# stream transport (tcp, mtcp, ws, ...) look like ordinary HTTPS. The kernel
-# tunnels encrypt at the service and are not asked.
+# pick_encryption asks whether the chosen transport should be encrypted. quic
+# already encrypts with TLS 1.3 and spoof is a packet carrier, so neither takes a
+# layer and neither is asked.
 pick_encryption(){
   local tr="$1"
-  # The kernel tunnels (encrypt at the service) take no encryption layer.
+  # quic (TLS 1.3) and the kernel tunnels (encrypt at the service) take no
+  # encryption layer, so they are not asked.
   case "$tr" in
-    gre|gretap|ipip|sit|l2tp) echo none; return ;;
+    quic|gre|gretap|ipip|sit|l2tp) echo none; return ;;
   esac
-  # udp/icmp seal each datagram independently, so they offer aead/none only.
+  # udp/icmp seal each datagram, exactly like spoof: offer aead/none.
   case "$tr" in
     udp|icmp)
       echo >&2
@@ -222,9 +216,20 @@ pick_encryption(){
   echo >&2
   echo -e "${C_B}  Encrypt this '$tr' tunnel?${C_N}" >&2
   echo -e "  ${C_D}──────────────────────────────────────────────${C_N}" >&2
+  if [ "$tr" = spoof ]; then
+    # spoof seals each datagram; a stream cipher cannot key reorderable packets.
+    echo -e "   1) aead   ChaCha20-Poly1305   ${C_G}(encrypted + tamper-proof, Recommended)${C_N}" >&2
+    echo    "   2) none   No encryption (what older builds did)" >&2
+    echo -e "  ${C_D}──────────────────────────────────────────────${C_N}" >&2
+    echo -e "  ${C_D}Without this, anyone who can forge the whitelisted source IP can${C_N}" >&2
+    echo -e "  ${C_D}inject packets straight into your TUN device.${C_N}" >&2
+    local n; n=$(ask "Choice [1-2]" "1")
+    case "$n" in 2) echo none ;; *) echo aead ;; esac
+    return
+  fi
   echo -e "   1) aead   ChaCha20-Poly1305   ${C_G}(encrypted + tamper-proof, Recommended)${C_N}" >&2
   echo -e "   2) obfs   AES-CTR obfuscation ${C_G}(anti-DPI, matches older builds)${C_N}" >&2
-  echo -e "   3) tls    TLS + Chrome fingerprint ${C_G}(looks like HTTPS to DPI, needs a domain)${C_N}" >&2
+  echo -e "   3) tls    Real HTTPS + CA certificate ${C_G}(looks like HTTPS to DPI, needs a domain)${C_N}" >&2
   echo    "   4) none   No encryption layer (lowest overhead)" >&2
   echo -e "  ${C_D}──────────────────────────────────────────────${C_N}" >&2
   echo -e "  ${C_D}Both ends of the tunnel must use the SAME choice.${C_N}" >&2
@@ -256,24 +261,42 @@ build_ports(){
   [ ${#arr[@]} -eq 0 ] && arr+=("\"443/both\""); ( IFS=,; echo "${arr[*]}" )
 }
 
-# tls_extra prints the server_name/alpn/tls_fingerprint JSON fields for the tls
-# encryption layer. The domain is the SNI the client sends and the name on the
-# server's certificate, so both ends need the SAME one.
-tls_extra(){ local role="$1" dom al fp out
-  dom=$(ask 'Domain for TLS (SNI + certificate, e.g. network.example.com)' '')
-  while [ -z "$dom" ]; do warn "tls needs a domain." >&2; dom=$(ask 'Domain for TLS' ''); done
-  out="\"server_name\":\"$dom\","
-  al=$(ask 'ALPN (blank = h2,http/1.1)' '')
-  [ -n "$al" ] && out="$out\"alpn\":\"$al\","
-  if [ "$role" = client ]; then
-    fp=$(ask 'TLS fingerprint  chrome/firefox/safari/edge/ios (blank = chrome)' '')
-    [ -n "$fp" ] && out="$out\"tls_fingerprint\":\"$fp\","
+# tls_extra collects the fields for the tls encryption layer into TLSJSON (the
+# server/client config blocks splice it in). server_name is the domain on the
+# certificate and the SNI the client sends — it must be the SAME on both ends.
+# The listener (server) presents a REAL certificate; the dialer (client) verifies
+# it against the public CAs, exactly as a browser does.
+tls_extra(){
+  local role="$1" dom alpn
+  dom=$(ask 'Domain for TLS (SNI + certificate, e.g. tunnel.example.com)' '')
+  while [ -z "$dom" ]; do warn "tls needs a domain — the same on both ends." >&2; dom=$(ask 'Domain for TLS' ''); done
+  TLSJSON="\"server_name\":\"$dom\","
+  alpn=$(ask 'ALPN (blank = h2,http/1.1, which looks like a browser)' '')
+  [ -n "$alpn" ] && TLSJSON="$TLSJSON\"alpn\":\"$alpn\","
+  if [ "$role" = server ]; then
+    echo >&2
+    echo -e "${C_B}  TLS certificate for $dom:${C_N}" >&2
+    echo -e "   1) Automatic — obtain a free Let's Encrypt certificate ${C_G}(recommended)${C_N}" >&2
+    echo    "   2) I already have certificate files (e.g. from certbot)" >&2
+    local cs; cs=$(ask 'Choice [1-2]' '1')
+    if [ "$cs" = 2 ]; then
+      local cert key
+      cert=$(ask 'Path to certificate (full chain)' "/etc/letsencrypt/live/$dom/fullchain.pem")
+      key=$(ask 'Path to private key' "/etc/letsencrypt/live/$dom/privkey.pem")
+      TLSJSON="$TLSJSON\"tls_cert\":\"$cert\",\"tls_key\":\"$key\","
+    else
+      local em; em=$(ask "Email for the Let's Encrypt account (blank = none)" '')
+      [ -n "$em" ] && TLSJSON="$TLSJSON\"tls_auto_email\":\"$em\","
+      warn "Automatic certificate: '$dom' must resolve to THIS server, and this tunnel must listen on port 443." >&2
+    fi
+  else
+    local si; si=$(ask 'Is the server certificate self-signed (NOT from a real CA)? y/N' 'N')
+    case "$si" in y|Y) TLSJSON="$TLSJSON\"tls_insecure\":true," ;; esac
   fi
-  printf '%s' "$out"
 }
 
 build_extra(){ local role="$1" tr="$2" enc="${3:-}"; EXTRA=""; TLSJSON=""
-  [ "$enc" = tls ] && TLSJSON="$(tls_extra "$role")"
+  [ "$enc" = tls ] && tls_extra "$role"
   case "$tr" in
     ws)
       EXTRA="\"ws_path\":\"$(ask 'WebSocket path' '/')\","
@@ -295,6 +318,110 @@ build_extra(){ local role="$1" tr="$2" enc="${3:-}"; EXTRA=""; TLSJSON=""
       [ -n "$mh" ] && EXTRA="$EXTRA\"sctp_multihoming\":\"$mh\","
       ;;
   esac
+}
+
+# spoof transport: collect spoof_* fields, write a NORMAL JSON config (transport=spoof)
+write_spoof_cfg(){
+  # NOTE: these must be SEPARATE 'local' statements. Bash does not make an
+  # earlier assignment visible to a later one in the same 'local', so
+  #   local name="$2" cfg="$CFG_DIR/$name.json"
+  # silently produced "/etc/brokennode/.json" (name empty) and every
+  # ip-spoofing tunnel was written to the wrong path.
+  local role="$1"
+  local name="$2"
+  local enc="${3:-none}"
+  local cfg="$CFG_DIR/$name.json"
+  # An encrypted spoof tunnel needs a shared token: it keys the per-packet
+  # sealer. Both ends must use the SAME one, exactly like every other transport.
+  local token="" tokline=""
+  if [ "$enc" != none ]; then
+    if [ "$role" = server ]; then
+      token=$(ask "Shared token (for encryption)" "$(gen_token)")
+    else
+      token=$(ask "Shared token (same as the other side)" "")
+    fi
+    tokline="
+  \"token\": \"$token\","
+  fi
+  echo -e "${C_B}  Spoof carrier protocol:${C_N}" >&2
+  echo    "   1) udp    (tested, recommended)" >&2
+  echo -e "   2) tcp    fake-TCP ${C_Y}(untested)${C_N}" >&2
+  echo -e "   3) icmp   echo      ${C_Y}(untested)${C_N}" >&2
+  echo -e "   4) gre    IP proto 47 ${C_Y}(untested; often whitelisted)${C_N}" >&2
+  local pn cproto; pn=$(ask "Choice [1-4]" "1"); case "$pn" in 2) cproto=tcp;; 3) cproto=icmp;; 4) cproto=gre;; *) cproto=udp;; esac
+  echo -e "  ${C_D}Enter the SAME IPs on BOTH servers; cross-over is automatic.${C_N}" >&2
+  local det iran foreign w1 w2; det=$(detect_ip)
+  if [ "$role" = server ]; then
+    iran=$(ask "Iran IP    (this machine, real)" "$det")
+    foreign=$(ask "Foreign IP (peer, real)" "")
+  else
+    foreign=$(ask "Foreign IP (this machine, real)" "$det")
+    iran=$(ask "Iran IP    (peer, real)" "")
+  fi
+  w1=$(ask "White IP #1 — the one IRAN sends as source" "")
+  w2=$(ask "White IP #2 — the one FOREIGN sends as source" "")
+  local cport mtu jit jjson; cport=$(ask "Carrier port (udp/tcp)" "6262"); mtu=$(ask "MTU" "1320")
+  jit=$(ask "TTL jitter? (anti-fingerprint) y/N" "N")
+  local jline jtail; case "$jit" in y|Y) jline='
+  "ttl_jitter": true,'; jtail=',
+  "ttl_jitter": true';; *) jline=''; jtail='';; esac
+  local lip pip ssrc sdst tl trr
+  if [ "$role" = server ]; then
+    lip="$iran"; pip="$foreign"; ssrc="$w1"; sdst="$w2"; tl=10.10.20.1; trr=10.10.20.2
+  else
+    lip="$foreign"; pip="$iran"; ssrc="$w2"; sdst="$w1"; tl=10.10.20.2; trr=10.10.20.1
+  fi
+  local portsjson=""
+  if [ "$role" = server ]; then
+    portsjson=$(build_ports)
+  fi
+  if [ "$role" = server ]; then
+    new_cfg_file "$cfg"
+    cat > "$cfg" <<EOF
+{
+  "mode": "server",
+  "transport": "spoof",
+  "encryption": "$enc",$tokline
+  "log_level": "info",
+  "spoof_local_ip": "$lip",
+  "spoof_peer_ip": "$pip",
+  "spoof_src": "$ssrc",
+  "spoof_dst": "$sdst",
+  "carrier_proto": "$cproto",
+  "carrier_port": $cport,
+  "tun_name": "spoof0",
+  "tun_local": "$tl",
+  "tun_remote": "$trr",
+  "mtu": $mtu,$jline
+  "ports": [$portsjson]
+}
+EOF
+  else
+    new_cfg_file "$cfg"
+    cat > "$cfg" <<EOF
+{
+  "mode": "client",
+  "transport": "spoof",
+  "encryption": "$enc",$tokline
+  "log_level": "info",
+  "spoof_local_ip": "$lip",
+  "spoof_peer_ip": "$pip",
+  "spoof_src": "$ssrc",
+  "spoof_dst": "$sdst",
+  "carrier_proto": "$cproto",
+  "carrier_port": $cport,
+  "tun_name": "spoof0",
+  "tun_local": "$tl",
+  "tun_remote": "$trr",
+  "mtu": $mtu$jtail
+}
+EOF
+  fi
+  info "Saved $cfg"
+  echo -e "  ${C_D}  proto=$cproto  spoof_src=$ssrc  spoof_dst=$sdst  encryption=$enc${C_N}"
+  if [ "$enc" != none ] && [ "$role" = server ]; then
+    warn "Token for the other side: ${C_Y}$token${C_N}"
+  fi
 }
 
 # check_bind warns when bind_addr names an address this machine does not have.
@@ -399,8 +526,13 @@ write_tunnel_cfg(){
       extra="\"l2tp_tunnel_id\": ${tid:-1000}, \"l2tp_session_id\": ${sid:-1000}, \"l2tp_encap\": \"$en\","
       ;;
     udp|icmp)
-      # The udp/icmp carriers use the server's real source IP — nothing to ask.
-      : ;;
+      echo -e "  ${C_D}By default the real source IP is used (no forging). To forge a${C_N}"
+      echo -e "  ${C_D}whitelisted source for a blackout, answer the next two; blank = no forging.${C_N}"
+      local ssrc sdst; ssrc=$(ask "Forge source IP (blank = real)" "")
+      sdst=$(ask "Expected peer source IP (blank = real)" "")
+      [ -n "$ssrc" ] && extra="$extra\"spoof_src\": \"$ssrc\","
+      [ -n "$sdst" ] && extra="$extra\"spoof_dst\": \"$sdst\","
+      ;;
   esac
 
   local tokline=""; local token
@@ -464,7 +596,9 @@ create_tunnel(){
   tr=$(pick_transport)
   enc=$(pick_encryption "$tr")
 
-  if is_tunnel_transport "$tr"; then
+  if [ "$tr" = spoof ]; then
+    write_spoof_cfg "$role" "$name" "$enc"
+  elif is_tunnel_transport "$tr"; then
     write_tunnel_cfg "$role" "$name" "$tr" "$enc"
   else
     read -r ka kmode kdata kparity <<< "$(pick_preset)"; build_extra "$role" "$tr" "$enc"
@@ -697,8 +831,8 @@ doctor(){
       if [ -n "$port" ]; then
         ss -ltnup 2>/dev/null | grep -q ":$port " && okln "  listening on port $port" || { warnln "  port $port not listening"; warns=$((warns+1)); }
       fi
-      # Traffic quota status (only meaningful for the stream transports — see
-      # quota_test.go / the stats system; the udp/icmp carriers don't route through it).
+      # Traffic quota status (only meaningful for non-spoof transports — see
+      # quota_test.go / the stats system; ip-spoofing doesn't route through it).
       local qtot qup qdown
       qtot="$(sed -n 's/.*"quota_total_gb"[ ]*:[ ]*\([0-9.]*\).*/\1/p' "$cf")"
       qup="$(sed -n 's/.*"quota_up_gb"[ ]*:[ ]*\([0-9.]*\).*/\1/p' "$cf")"
@@ -766,7 +900,7 @@ doctor(){
   echo -e "  ${C_D}──────────────────────────────────────────────${C_N}"
   if [ "$warns" -eq 0 ]; then echo -e "  ${C_G}All checks passed.${C_N}"
   else echo -e "  ${C_Y}$warns warning(s) above.${C_N}"; fi
-  echo -e "  ${C_D}Note: UDP transports (kcp) also need UDP open end-to-end;${C_N}"
+  echo -e "  ${C_D}Note: UDP transports (kcp/quic) also need UDP open end-to-end;${C_N}"
   echo -e "  ${C_D}test with:  nc -u <relay-ip> <port>  (both sides).${C_N}"
 }
 
@@ -832,8 +966,8 @@ toggle_udp_duplicate(){
   echo -e "  ${C_Y}Does not fix${C_N} loss from a full queue — both copies sit in that same"
   echo -e "  ${C_D}queue, so both are dropped. Shape the uplink for that (tune, option 2).${C_N}"
   echo
-  echo -e "  ${C_D}Costs double this tunnel's UDP bandwidth. Needs a datagram-capable${C_N}"
-  echo -e "  ${C_D}transport at both ends; this build ships none, so it is inert for now.${C_N}"
+  echo -e "  ${C_D}Costs double this tunnel's UDP bandwidth. Needs quic at both ends,${C_N}"
+  echo -e "  ${C_D}both new enough to negotiate it; otherwise it quietly does nothing.${C_N}"
   echo
   local target; target=$([ "$cur" = on ] && echo off || echo on)
   local want; want="$(ask "Turn it $target? yes/no" "no")"
@@ -871,15 +1005,18 @@ change_transport(){
     mtcp)     jset "$cfg" pool_size "" del ;;
     *)        jset "$cfg" pool_size "" del; jset "$cfg" links "" del ;;
   esac
-  # The tls layer needs a domain; ask for one if this config has none, and drop
-  # the tls fields when leaving tls so a stale server_name/alpn cannot linger.
+  # The tls layer needs a domain; ask for one if the config has none. When
+  # leaving tls, drop its fields so a stale server_name/cert path cannot linger.
   if [ "$newenc" = tls ]; then
     if [ -z "$(jget "$cfg" server_name)" ]; then
       local dom; dom=$(ask 'Domain for TLS (SNI + certificate, same on both ends)' '')
-      jset "$cfg" server_name "$dom"
+      [ -n "$dom" ] && jset "$cfg" server_name "$dom"
     fi
-  else
-    jset "$cfg" server_name "" del; jset "$cfg" alpn "" del; jset "$cfg" tls_fingerprint "" del
+    warn "On the server end set a certificate (Create tunnel asks), and on the client end point server_name at the same domain."
+  elif [ "$curenc" = tls ]; then
+    jset "$cfg" server_name "" del; jset "$cfg" alpn "" del
+    jset "$cfg" tls_cert "" del; jset "$cfg" tls_key "" del
+    jset "$cfg" tls_auto_email "" del; jset "$cfg" tls_insecure "" del
   fi
   info "transport: $cur/$curenc -> $new/$newenc"
   warn "The OTHER side of this tunnel must use '$new' with encryption '$newenc' too, or it will not connect."
