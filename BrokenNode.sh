@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.2"
+VERSION="2.8.3"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -820,7 +820,7 @@ pick_preset(){
   else
     n=$(ask "Choice [1-5]" "1")
   fi
-  case "$n" in 2) echo "15 turbo 10 2";; 3) echo "8 normal 10 4";; 4) echo "5 gaming 10 4";; 5) echo "20 normal 10 1";; *) echo "10 fast 10 3";; esac
+  case "$n" in 2) echo "15 turbo 10 2";; 3) echo "8 fast 10 4";; 4) echo "5 gaming 10 4";; 5) echo "20 normal 10 1";; *) echo "10 fast 10 3";; esac
 }
 
 build_ports(){
@@ -873,7 +873,7 @@ build_extra(){ local role="$1" tr="$2" dir="${3:-reverse}" enc="${4:-}"; EXTRA="
       fi ;;
     tcpnomux) EXTRA="\"pool_size\":$(jint "$(ask 'Connection pool size (0 = AUTO, scales with load — recommended)' '0')" 0),";;
     kcp)
-      local w; w=$(ask 'KCP window (send/recv, empty=1024)' '')
+      local w; w=$(ask 'KCP window for the whole tunnel, split across its links (packets, empty=1024)' '')
       w=$(jint "$w" ""); [ -n "$w" ] && EXTRA="\"kcp_sndwnd\":$w,\"kcp_rcvwnd\":$w," ;;
     mtcp) [ "$dials" = 1 ] && EXTRA="\"links\":$(jint "$(ask 'Parallel links (0 = AUTO, scales with load — recommended)' '0')" 0),";;
     sctp)
@@ -2292,7 +2292,7 @@ tune_tunnel(){
   case "$tr" in
     kcp|rawmux)
       cur="$(jget "$cfg" kcp_mode)"
-      echo -e "  ${C_D}kcp_mode: gaming = lowest/steadiest latency · fast · turbo = throughput · normal = low CPU${C_N}"
+      echo -e "  ${C_D}kcp_mode: gaming = lowest/steadiest latency · fast · turbo = throughput · normal = low CPU (slows sharply under packet loss)${C_N}"
       v=$(ask "  kcp_mode [$cur]" ""); [ -n "$v" ] && jset "$work" kcp_mode "$v"
       cur="$(jget "$cfg" kcp_data)"
       v=$(ask "  kcp_data  (FEC data shards, e.g. 10) [$cur]" ""); [ -n "$v" ] && jset "$work" kcp_data "$v" int
