@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.0"
+VERSION="2.8.1"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -760,10 +760,10 @@ pick_encryption(){
 # ordinary HTTPS. Only the automatic Let's Encrypt mode needs a reachable
 # :80/:443 — self-signed and cert-file modes run on ANY port.
 tls_extra(){
-  local role="$1" dom alpn
-  if [ "$role" = server ]; then
+  local listens="$1" dom alpn
+  if [ "$listens" = 1 ]; then
     echo >&2
-    echo -e "${C_B}  TLS certificate — how should this server get one?${C_N}" >&2
+    echo -e "${C_B}  TLS certificate — how should this (listening) end get one?${C_N}" >&2
     echo -e "   1) Self-signed        ${C_G}(ANY port, no domain needed — easiest)${C_N}" >&2
     echo    "   2) Let's Encrypt auto (real CA; needs a domain + port 80/443 reachable)" >&2
     echo    "   3) Certificate files  (e.g. from certbot; any port)" >&2
@@ -789,11 +789,11 @@ tls_extra(){
         dom=$(ask 'SNI name to present (blank = default; a real-looking name blends in)' '')
         [ -n "$dom" ] && TLSJSON="\"server_name\":\"$(jstr "$dom")\","
         TLSJSON="$TLSJSON\"tls_selfsigned\":true,"
-        info "Self-signed: this tunnel works on ANY port. On the CLIENT, keep the self-signed answer as yes." >&2
+        info "Self-signed: this tunnel works on ANY port. On the OTHER end (the one that dials), keep the self-signed answer as yes." >&2
         ;;
     esac
   else
-    dom=$(ask 'TLS SNI / domain (same as the server; blank = none)' '')
+    dom=$(ask 'TLS SNI / domain (same as the other end; blank = none)' '')
     [ -n "$dom" ] && TLSJSON="\"server_name\":\"$(jstr "$dom")\","
     local si; si=$(ask 'Is the server certificate self-signed (not a public CA)? Y/n' 'Y')
     case "$si" in n|N) : ;; *) TLSJSON="$TLSJSON\"tls_insecure\":true," ;; esac
@@ -854,9 +854,14 @@ jint(){ case "$1" in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$((10#$1))
 # Those that belong to the end that DIALS (ws request headers, the mtcp link
 # count) go to the client in reverse mode and to the relay in direct mode.
 build_extra(){ local role="$1" tr="$2" dir="${3:-reverse}" enc="${4:-}"; EXTRA=""; TLSJSON=""
-  [ "$enc" = tls ] && tls_extra "$role"
+  # Who dials vs. listens depends on BOTH mode and direction. The TLS certificate
+  # belongs to the end that LISTENS (it presents it); the dialing end verifies it.
+  # In reverse mode the server listens; in direct mode the client listens — so the
+  # cert questions must follow who-listens, not the mode (this was the direct-mode
+  # "tunnel won't connect" bug: the listening end got no certificate).
   local dials=0
   { [ "$role" = client ] && [ "$dir" = reverse ]; } || { [ "$role" = server ] && [ "$dir" = direct ]; } && dials=1
+  if [ "$enc" = tls ]; then local lis=1; [ "$dials" = 1 ] && lis=0; tls_extra "$lis"; fi
   case "$tr" in
     ws)
       EXTRA="\"ws_path\":\"$(jstr "$(ask 'WebSocket path' '/')")\","
