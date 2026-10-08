@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.1"
+VERSION="2.8.2"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -1830,6 +1830,20 @@ os.replace(t,f)
 PYEOF
 }
 
+# jmerge FILE JSON — merge a JSON object's keys into the config (the fields
+# tls_extra collects as a fragment), written the same safe way as jset.
+jmerge(){
+  python3 - "$1" "$2" <<'PYEOF'
+import json,os,sys
+f=sys.argv[1]; d=json.load(open(f)); d.update(json.loads(sys.argv[2]))
+t=f+".tmp"
+fd=os.open(t,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,os.stat(f).st_mode&0o777)
+with os.fdopen(fd,"w") as o:
+    json.dump(d,o,indent=2); o.write("\n")
+os.replace(t,f)
+PYEOF
+}
+
 # jget reads one value back (empty string when the key is absent).
 jget(){
   python3 - "$1" "$2" <<'PYEOF'
@@ -1903,8 +1917,19 @@ change_transport(){
     *)        jset "$cfg" pool_size "" del; jset "$cfg" links "" del ;;
   esac
   [ "$new" != sctp ] && { jset "$cfg" sctp_streams "" del; jset "$cfg" sctp_multihoming "" del; }
-  # Settings only quic had (removed in 2.3.22).
-  for k in alpn server_name udp_duplicate; do jset "$cfg" "$k" "" del; done
+  # Settings only quic had (removed in 2.3.22). alpn and server_name now
+  # belong to the tls layer, so they stay while the tunnel keeps tls.
+  jset "$cfg" udp_duplicate "" del
+  if [ "$newenc" != tls ]; then
+    for k in alpn server_name tls_cert tls_key tls_selfsigned tls_insecure tls_auto_email tls_auto_cache tls_fingerprint; do jset "$cfg" "$k" "" del; done
+  elif [ "$curenc" != tls ]; then
+    # Switching TO tls: ask the certificate questions for this end's role
+    # (the listening end presents a certificate, the dialing end verifies it).
+    # Without them the config said "tls" with no certificate and never started.
+    local lis=0; tunnel_listens "$cfg" && lis=1
+    TLSJSON=""; tls_extra "$lis"
+    jmerge "$cfg" "{${TLSJSON%,}}"
+  fi
   cfg_commit "$cfg" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
   info "transport: $cur/$curenc -> $new/$newenc"
   if tunnel_listens "$cfg" && is_udp_transport "$new" && ! is_udp_transport "$cur"; then
@@ -1992,6 +2017,13 @@ change_direction(){
   jset "$cfg" direction "$new"
   cfg_commit "$cfg" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
   info "direction: $cur -> $new"
+  # The certificate belongs to the end that LISTENS, and the flip moves that
+  # role. Self-signed carries over by itself (either tls flag works on either
+  # end); a certificate from files or Let's Encrypt lives on the OTHER server.
+  if [ "$(jget "$cfg" encryption)" = tls ] && [ "$(jget "$cfg" tls_selfsigned)" != True ] && [ "$(jget "$cfg" tls_insecure)" != True ]; then
+    warn "This tunnel uses tls with a real certificate, and the flip moved the listening role to the other end."
+    warn "That end now needs the certificate (tls_cert/tls_key, or Let's Encrypt on :443) — or switch both ends to self-signed."
+  fi
   warn "Switch the OTHER server to ${C_Y}$new${C_N} too, or the two will not connect."
   service_check "$n"
   read -t 30 -rp "  ▶ press ENTER to continue... " _
