@@ -28,7 +28,17 @@ bash <(curl -fsSL https://raw.githubusercontent.com/BrokenCodeee/BrokenNode/main
 This creates a `BrokenNode` folder, puts the build for your CPU inside it and
 opens the manager. Run it as root.
 
-Already have the folder:
+**After the first run, open the menu from anywhere** — no `cd` needed:
+
+```bash
+BrokenNode
+```
+
+`brokennode` works too, in any mix of upper and lower case (`BROKENNODE`,
+`Brokennode`...). The first run of the menu sets this up; a new SSH session
+picks up the other spellings.
+
+Or from the folder, as before:
 
 ```bash
 cd BrokenNode
@@ -384,7 +394,19 @@ bash <(curl -fsSL https://raw.githubusercontent.com/BrokenCodeee/BrokenNode/main
 منو هستهٔ جدید را اعمال و تانل‌ها را ری‌استارت می‌کند. منو هیچ‌وقت هستهٔ قدیمی‌تر
 را روی جدیدتر نمی‌گذارد؛ پوشهٔ قدیمی فقط هشدار می‌دهد.
 
-اگر پوشه را از قبل داری:
+**بعد از اولین اجرا، منو را از هر جایی باز کن** (بدون `cd`):
+
+</div>
+
+```bash
+BrokenNode
+```
+
+<div dir="rtl">
+
+`brokennode` هم کار می‌کند، و بزرگ یا کوچک بودن حروف فرقی ندارد (`BROKENNODE`، `Brokennode` و...). این میانبر در اولین اجرای منو ساخته می‌شود. برای حالت‌های دیگر حروف، یک بار SSH را از نو باز کن.
+
+یا مثل قبل از داخل پوشه:
 
 </div>
 

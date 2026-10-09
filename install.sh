@@ -141,4 +141,5 @@ if [ ! -t 0 ]; then
   echo -e "${C_D}    cd $DIR && bash BrokenNode.sh${C_N}"
   exit 0
 fi
+info "From now on, type ${C_Y}BrokenNode${C_N} anywhere to open the menu."
 exec bash BrokenNode.sh

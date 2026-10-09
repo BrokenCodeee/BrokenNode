@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.3"
+VERSION="2.8.4"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -2669,6 +2669,7 @@ uninstall_all(){
   rm -rf /run/brokennode /var/lib/brokennode
   systemctl daemon-reload 2>/dev/null; systemctl reset-failed 2>/dev/null
   rm -f "$BIN" "$BIN.bak"
+  remove_command
   rm -rf "$CFG_DIR"
   info "BrokenNode fully removed — core, tunnels, configs and units are gone."
   [ -f /etc/sysctl.d/99-brokennode.conf ] && echo -e "  ${C_D}The network tuning (/etc/sysctl.d/99-brokennode.conf) is kept — other services may rely on it. Delete that file to drop it.${C_N}"
@@ -2905,10 +2906,80 @@ warn_removed_transports(){
 # .pair-/.check-). A clean edit deletes its own; one left behind means the
 # manager was killed mid-edit (input ended at a prompt), so it is stale and
 # safe to drop — the live <name>.json was never touched.
+# The menu shortcut: "BrokenNode" (or "brokennode", in any mix of upper and
+# lower case) typed anywhere opens this menu, from the folder it lives in, so
+# nobody has to "cd BrokenNode && bash BrokenNode.sh" every time.
+#   - MENU_CMD is a small launcher that cd's into this folder and runs it here
+#     (the update and the bundled core both work from this folder).
+#   - "brokennode" is the core itself: run with no arguments it opens the menu
+#     through MENU_CMD (the tunnel services always pass -c).
+#   - Any other spelling (Brokennode, BROKENNODE...) goes through bash's
+#     command_not_found_handle, wrapping the distribution's own handler.
+MENU_CMD="/usr/local/bin/BrokenNode"
+MENU_HOOK="/etc/profile.d/brokennode.sh"
+MENU_MARK="# brokennode-menu-launcher"
+
+install_command(){
+  [ "$(id -u)" -eq 0 ] || return 0
+  # On a case-insensitive filesystem the launcher would BE the core: skip.
+  [ -e "$MENU_CMD" ] && [ -e "$BIN" ] && [ "$MENU_CMD" -ef "$BIN" ] && return 0
+  # A file with that name that we did not write is left alone.
+  if [ -e "$MENU_CMD" ] && ! grep -q "$MENU_MARK" "$MENU_CMD" 2>/dev/null; then return 0; fi
+  local dir="${SRC_DIR//\'/\'\\\'\'}" self; self="$(basename "$SELF")"
+  local want
+  want="#!/bin/sh
+$MENU_MARK — written by BrokenNode.sh: opens the menu from the folder
+# BrokenNode was installed into. Run the menu once from a moved folder to
+# point this at it again.
+DIR='$dir'
+if [ ! -f \"\$DIR/$self\" ]; then
+  echo \"BrokenNode: the menu is no longer in \$DIR — open it once from its new folder: bash $self\" >&2
+  exit 1
+fi
+cd \"\$DIR\" || exit 1
+if [ \"\$(id -u)\" -ne 0 ] && command -v sudo >/dev/null 2>&1; then exec sudo bash \"./$self\" \"\$@\"; fi
+exec bash \"./$self\" \"\$@\""
+  local new=0
+  [ -f "$MENU_CMD" ] || new=1
+  if [ "$(cat "$MENU_CMD" 2>/dev/null)" != "$want" ]; then
+    printf '%s\n' "$want" > "$MENU_CMD.new" && chmod 755 "$MENU_CMD.new" && mv -f "$MENU_CMD.new" "$MENU_CMD" || { rm -f "$MENU_CMD.new"; return 0; }
+  fi
+  # Written to stay valid in every shell that reads /etc/profile.d (dash
+  # included): bash-only syntax sits behind the BASH_VERSION check.
+  local hook
+  hook="$MENU_MARK — written by BrokenNode.sh
+# Any spelling of \"brokennode\" (BrokenNode, BROKENNODE...) opens the menu.
+if [ -n \"\${BASH_VERSION:-}\" ]; then
+  if declare -f command_not_found_handle >/dev/null 2>&1 && ! declare -f _bn_orig_cnfh >/dev/null 2>&1; then
+    eval \"_bn_orig_cnfh() \$(declare -f command_not_found_handle | tail -n +2)\"
+  fi
+  command_not_found_handle() {
+    case \"\$(printf '%s' \"\$1\" | tr 'A-Z' 'a-z')\" in
+      brokennode) shift; $MENU_CMD \"\$@\"; return \$? ;;
+    esac
+    if declare -f _bn_orig_cnfh >/dev/null 2>&1; then _bn_orig_cnfh \"\$@\"; return \$?; fi
+    printf 'bash: %s: command not found\\n' \"\$1\" >&2
+    return 127
+  }
+fi"
+  if [ "$(cat "$MENU_HOOK" 2>/dev/null)" != "$hook" ]; then
+    printf '%s\n' "$hook" > "$MENU_HOOK.new" && chmod 644 "$MENU_HOOK.new" && mv -f "$MENU_HOOK.new" "$MENU_HOOK" || rm -f "$MENU_HOOK.new"
+  fi
+  [ "$new" = 1 ] && info "Shortcut installed: type ${C_Y}BrokenNode${C_N} (or brokennode) anywhere to open this menu."
+  return 0
+}
+
+remove_command(){
+  grep -q "$MENU_MARK" "$MENU_CMD" 2>/dev/null && rm -f "$MENU_CMD"
+  grep -q "$MENU_MARK" "$MENU_HOOK" 2>/dev/null && rm -f "$MENU_HOOK"
+  return 0
+}
+
 sweep_temp(){ rm -f "$CFG_DIR"/.tune-*.json "$CFG_DIR"/.undo-*.json "$CFG_DIR"/.pair-*.json "$CFG_DIR"/.check-*.json 2>/dev/null; }
 
 main_menu(){
   auto_apply_bundled
+  install_command
   sweep_temp
   warn_removed_transports
   # Repair a health-check unit written by 2.3.16–2.3.19, whose ExecStart
