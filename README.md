@@ -198,6 +198,11 @@ layer: the kernel moves the packets, so encrypt at the service (TLS) if you need
 A point-to-point tunnel cannot be switched to a stream transport in place (or
 back) — they are configured with different fields. Create a new tunnel instead.
 
+On `udp` and `icmp` the foreign server delivers to `target_host` like the
+kernel tunnels do (since 2.8.6). Before, a service had to listen on `0.0.0.0`
+or on the tunnel address: one bound to `127.0.0.1` got nothing while the tunnel
+showed connected.
+
 `udp` and `icmp` are packet carriers: each datagram is sealed on its own
 (XChaCha20-Poly1305, random per-packet nonce), so they accept `aead` or `none`,
 but not `obfs`. Encrypt them — the carrier accepts any packet carrying the
@@ -246,6 +251,22 @@ Both servers need 2.3.9 or newer.
 **Live stats** (→ 8) shows the speed right now, the peak, a 40-second
 history, the links that are up and the users connected, on both servers and for
 every transport. It updates in place once a second; any key goes back.
+
+**Tunnel connected and speed test fine, but users get nothing?** The speed
+test does not pass through your forwarded ports, so it cannot see this. Run
+**Diagnose** (Manage tunnels → a tunnel → 18) on the Iran server. It checks
+every port the whole way — served on this server, not taken by a NAT rule,
+open in the firewall (ufw/iptables), and reachable by the foreign server at
+`target_host` — and prints the command that fixes each problem. The tunnel
+list also shows in red a port that is not being served (another program holds
+it); the tunnel keeps retrying such a port and serves it as soon as it is free.
+
+A common cause is an old NAT rule, left by a deleted `gre`/`ipip`/`l2tp`
+tunnel, that sends the port somewhere else before the tunnel ever sees it.
+Since 2.8.6 every start removes such leftovers and deleting a tunnel sweeps
+them; `brokennode cleanup` does it by hand. A rule another program added is not
+removed: Diagnose and the tunnel's log name it, with the command that removes
+it. For the exact answer about the foreign side, both servers need 2.8.6.
 
 ## Tuning for games
 
@@ -327,6 +348,8 @@ brokennode -gen server                    # print a sample server config
 brokennode -gen client                    # print a sample client config
 brokennode -transports                    # list transports and encryption layers
 brokennode speedtest -c /etc/brokennode/main.json [-t 10] [-p 4]
+brokennode doctor -c /etc/brokennode/main.json   # why does a tunnel carry no users?
+brokennode cleanup                        # remove NAT rules left by deleted tunnels
 brokennode version
 ```
 
@@ -335,7 +358,10 @@ brokennode version
 Common: `mode`, `transport`, `encryption`, `token`, `keepalive`, `log_level`
 
 Server: `ports` (`"2052"`, `"2052/udp"`, `"2052/both"`,
-`"8443=443"`), `quota_total_gb`, `quota_up_gb`, `quota_down_gb`
+`"8443=443"`), `quota_total_gb`, `quota_up_gb`, `quota_down_gb`; `socks`
+(a SOCKS5 + HTTP CONNECT proxy on this address, e.g. `"127.0.0.1:1080"`),
+`socks_user` + `socks_pass` (both, to require a login), `socks_open` (allow a
+proxy with no login on a public address)
 
 Client: `target_host`
 
@@ -626,6 +652,21 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 کاربرهای متصل را روی هر دو سرور و برای همهٔ ترنسپورت‌ها نشان می‌دهد. هر ثانیه
 درجا به‌روز می‌شود (بدون پرش صفحه)؛ با زدن هر کلیدی برمی‌گردی.
 
+**تانل وصل است و تست سرعت خوب است، ولی کانفیگ کار نمی‌کند؟** تست سرعت از پورت‌های
+فوروارد عبور نمی‌کند، پس این مشکل را نمی‌بیند. روی سرور ایران **Diagnose** را بزن
+(مدیریت تانل‌ها ← یک تانل ← ۱۸). هر پورت را در کل مسیر چک می‌کند — روی این سرور باز
+شده، قانون NAT آن را نگرفته، فایروال (ufw/iptables) بازش گذاشته، و سرور خارج به
+`target_host` می‌رسد — و برای هر مشکل دستور رفعش را چاپ می‌کند. فهرست تانل‌ها هم
+پورتی را که باز نشده (برنامهٔ دیگری گرفته) قرمز نشان می‌دهد؛ تانل مدام دوباره امتحان
+می‌کند و به محض آزاد شدن پورت، سرویسش را شروع می‌کند.
+
+یک علت رایج، قانون NAT قدیمی است که از یک تانل `gre`/`ipip`/`l2tp` حذف‌شده مانده و
+پورت را قبل از رسیدن به تانل به جای دیگری می‌فرستد. از 2.8.6 هر بار اجرا این
+باقی‌مانده‌ها را پاک می‌کند و حذف تانل هم آن‌ها را جارو می‌کند؛ `brokennode cleanup`
+همین کار را دستی انجام می‌دهد. قانونی که برنامهٔ دیگری گذاشته پاک نمی‌شود: Diagnose
+و لاگ تانل آن را با دستور حذفش نشان می‌دهند. برای جواب دقیقِ سمت سرور خارج، هر دو
+سرور باید 2.8.6 باشند.
+
 ## تنظیم برای بازی
 
 </div>
@@ -711,6 +752,8 @@ brokennode -gen server                    # چاپ یک کانفیگ نمونه�
 brokennode -gen client                    # چاپ یک کانفیگ نمونهٔ کلاینت
 brokennode -transports                    # فهرست ترنسپورت‌ها و لایه‌های رمزنگاری
 brokennode speedtest -c /etc/brokennode/main.json [-t 10] [-p 4]   # تست سرعت از داخل تانل
+brokennode doctor -c /etc/brokennode/main.json   # چرا تانل کاربر رد نمی‌کند؟
+brokennode cleanup                        # پاک کردن قوانین NAT تانل‌های حذف‌شده
 brokennode version
 ```
 
@@ -721,7 +764,10 @@ brokennode version
 مشترک: `mode`، `transport`، `encryption`، `token`، `keepalive`، `log_level`
 
 سرور: `ports` (به شکل `"2052"`، `"2052/udp"`، `"2052/both"`،
-`"8443=443"`)، `quota_total_gb`، `quota_up_gb`، `quota_down_gb`
+`"8443=443"`)، `quota_total_gb`، `quota_up_gb`، `quota_down_gb`؛ `socks`
+(پروکسی SOCKS5 و HTTP CONNECT روی این آدرس، مثلاً `"127.0.0.1:1080"`)،
+`socks_user` و `socks_pass` (هر دو، برای اجباری کردن ورود با رمز)، `socks_open`
+(اجازهٔ پروکسی بدون رمز روی آدرس عمومی)
 
 کلاینت: `target_host`
 

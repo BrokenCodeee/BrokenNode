@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.4"
+VERSION="2.8.6"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -53,8 +53,14 @@ menu_ask(){ local a; if read -rp "$(echo -e "${C_B}  ?${C_N} $1: ")" a; then ech
 # core's parser refuses "01.2.3.4").
 is_ipv4(){ local q='(0|[1-9][0-9]{0,2})'; [[ "$1" =~ ^$q\.$q\.$q\.$q$ ]] || return 1
   local o; for o in "${BASH_REMATCH[@]:1}"; do [ "$((10#$o))" -le 255 ] || return 1; done; }
+# is_ipv6 ADDR — an IPv6 address, without brackets.
+is_ipv6(){ case "$1" in *%*) return 1 ;; *:*) python3 -c 'import ipaddress,sys; ipaddress.IPv6Address(sys.argv[1])' "$1" 2>/dev/null ;; *) return 1 ;; esac; }
+# hostport HOST PORT — "HOST:PORT", with an IPv6 host in brackets ([2001:db8::1]:443).
+hostport(){ case "$1" in *:*) printf '[%s]:%s' "$1" "$2" ;; *) printf '%s:%s' "$1" "$2" ;; esac; }
 need_root(){ [ "$(id -u)" -eq 0 ] || { err "Run as root: sudo bash $SELF"; exit 1; }; }
 detect_ip(){ ip -4 route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1 || true; }
+# detect_ip6 — this server's global IPv6 address, empty when it has none.
+detect_ip6(){ ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1 || true; }
 default_iface(){ ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1; }
 
 core_ver(){ if [ -x "$BIN" ]; then "$BIN" version 2>/dev/null | awk '{print $NF}'; else echo "v$VERSION"; fi; }
@@ -184,6 +190,11 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStart=$BIN -c $CFG_DIR/%i.json
+# After EVERY stop — a clean one, a crash, a kill -9, the stop timeout — sweep
+# the NAT rules no running tunnel owns. A rule a stop failed to remove kept
+# its port pointed at a tunnel that was gone. "-": a failure here is not a
+# failure of the unit.
+ExecStopPost=-$BIN cleanup
 Restart=always
 RestartSec=2
 # No resource ceilings: the tunnel may use as much CPU / RAM / sockets as the
@@ -269,13 +280,17 @@ pick_direction(){
 
 # ask_hostport PROMPT DEFAULT_PORT [DEFAULT] — a host:port, with the port
 # added when only a host is typed. Empty stays empty (the caller decides).
+# An IPv6 address works typed bare (2001:db8::1) or as [2001:db8::1]:443.
 ask_hostport(){
   local a; a=$(ask "$1" "${3:-}")
   a="$(echo "$a" | tr -d ' ')"
   [ -z "$a" ] && { echo ""; return; }
   case "$a" in
-    *:*) echo "$a" ;;
-    *)   echo "$a:$2" ;;
+    \[*\]:*) echo "$a" ;;
+    \[*\])   echo "$a:$2" ;;
+    *:*:*)   echo "[$a]:$2" ;;   # a bare IPv6 address: its colons are not a port
+    *:*)     echo "$a" ;;
+    *)       echo "$a:$2" ;;
   esac
 }
 
@@ -902,6 +917,7 @@ check_bind(){
   case "$host" in
     ""|"0.0.0.0"|"::"|"[::]"|"*") echo "$addr"; return ;;
   esac
+  host="${host#[}"; host="${host%]}"
   command -v ip >/dev/null 2>&1 || { echo "$addr"; return; }
   if ip -o addr show 2>/dev/null | grep -qw "$host"; then
     echo "$addr"; return
@@ -916,6 +932,7 @@ check_bind(){
     echo
     echo -e "  ${C_D}addresses this machine does have:${C_N}"
     ip -o -4 addr show 2>/dev/null | awk '{print "    " $2 "  " $4}'
+    ip -o -6 addr show scope global 2>/dev/null | awk '{print "    " $2 "  " $4}'
   } >&2
   local c; c=$(ask "Use 0.0.0.0:$port instead? Y/n" "Y") 
   case "$c" in n|N) echo "$addr" ;; *) echo "0.0.0.0:$port" ;; esac
@@ -948,6 +965,8 @@ server_summary(){
   done
   echo
   echo -e "  ${C_D}The FOREIGN server connects to ${C_N}$ip:$bport${C_D} — that is its remote_addr.${C_N}"
+  local ip6; ip6="$(detect_ip6)"
+  [ -n "$ip6" ] && echo -e "  ${C_D}Over IPv6 (when IPv4 is filtered or unreliable) it can use ${C_N}[$ip6]:$bport${C_D} instead.${C_N}"
   echo -e "  ${C_D}Never point a user config at $bport: it is the tunnel itself, not your service.${C_N}"
   echo
   echo -e "  ${C_D}And on the FOREIGN server, your real service (xray, v2ray, ...) must be${C_N}"
@@ -999,15 +1018,29 @@ write_tunnel_cfg(){
   local go_on; go_on=$(ask "Continue with $tr? Y/n" "Y")
   case "$go_on" in n|N) warn "Cancelled."; return ;; esac
   local lip rip tl trr
-  # Both are required IPv4 addresses (the core refuses anything else): an
-  # empty or mistyped one used to be saved, and the tunnel then failed at start.
+  # The two servers reach each other over IPv4, or over IPv6 when IPv4 between
+  # them is filtered or unreliable (gre, gretap, ipip, sit and l2tp run over
+  # either; both ends must use the same). udp and icmp are IPv4 only.
+  local fam=4 isfam=is_ipv4 myip
+  case "$tr" in gre|gretap|ipip|sit|l2tp)
+    local f6; f6=$(ask "Connect the two servers over  1) IPv4   2) IPv6 (when IPv4 is filtered or unreliable)" "1")
+    if [ "$f6" = 2 ]; then
+      fam=6; isfam=is_ipv6
+      [ -z "$(detect_ip6)" ] && warn "This server has no global IPv6 address — IPv6 needs one on BOTH servers."
+      info "Choose IPv6 on the other server too."
+    fi ;;
+  esac
+  [ "$fam" = 6 ] && myip="$(detect_ip6)" || myip="$(detect_ip)"
+  # Both are required addresses of that family (the core refuses anything
+  # else): an empty or mistyped one used to be saved, and the tunnel then
+  # failed at start.
   while :; do
-    lip=$(ask "This server's real (public) IP" "$(detect_ip)"); lip="${lip// /}"
-    is_ipv4 "$lip" && break; warn "'$lip' is not an IPv4 address (e.g. 203.0.113.5)."
+    lip=$(ask "This server's real (public) IPv$fam" "$myip"); lip="${lip// /}"; lip="${lip#[}"; lip="${lip%]}"
+    $isfam "$lip" && break; warn "'$lip' is not an IPv$fam address."
   done
   while :; do
-    rip=$(ask "The OTHER server's real IP" ""); rip="${rip// /}"
-    if ! is_ipv4 "$rip"; then warn "'$rip' is not an IPv4 address (e.g. 198.51.100.7)."
+    rip=$(ask "The OTHER server's real IPv$fam" ""); rip="${rip// /}"; rip="${rip#[}"; rip="${rip%]}"
+    if ! $isfam "$rip"; then warn "'$rip' is not an IPv$fam address."
     elif [ "$rip" = "$lip" ]; then warn "That is this server's own IP — give the OTHER server's."
     else break; fi
   done
@@ -1255,6 +1288,7 @@ EOF
         echo -e "  ${C_D}This server's firewall must allow that port inbound, e.g.${C_N}"
         echo -e "  ${C_D}  ufw allow ${bind##*:}/$bproto   or   iptables -I INPUT -p $bproto --dport ${bind##*:} -j ACCEPT${C_N}"
         echo -e "  ${C_D}On the Iran server enter:${C_N} ${C_Y}$(detect_ip):${bind##*:}${C_N}"
+        [ -n "$(detect_ip6)" ] && echo -e "  ${C_D}or over IPv6:${C_N} ${C_Y}[$(detect_ip6)]:${bind##*:}${C_N}"
       fi
     fi
   fi
@@ -1268,6 +1302,49 @@ EOF
 # link_state reports the REAL connection state by looking at the most recent
 # connect/disconnect event in the journal, rather than trusting systemd's notion
 # of "active" (which only means the process is alive).
+# diagnose runs the core's end-to-end check of one tunnel on this server
+# (brokennode doctor): service, link, every port from the user's side to the
+# service behind it, the firewall and NAT rules, with the fix for each problem.
+diagnose(){
+  local n="$1"
+  echo
+  "$BIN" doctor -c "$CFG_DIR/$n.json" 2>&1 | sed \
+    -e "s/\[FAIL\]/$(printf '%b' "$C_R")[FAIL]$(printf '%b' "$C_N")/" \
+    -e "s/\[WARN\]/$(printf '%b' "$C_Y")[WARN]$(printf '%b' "$C_N")/" \
+    -e "s/\[OK\]/$(printf '%b' "$C_G")[OK]$(printf '%b' "$C_N")/"
+  echo
+  read -t 300 -rp "  ▶ press ENTER to continue... " _
+}
+
+# version_note prints a warning when the two ends of a running tunnel run
+# different releases (the core swaps versions on every new link), else
+# nothing. Fixes that need both ends are not in effect until they match.
+version_note(){
+  local lf="/run/brokennode/$1.live" ts now mine peer
+  [ -f "$lf" ] || return
+  ts=$(sed -n 's/^ts=//p' "$lf"); now=$(date +%s)
+  case "$ts" in ""|*[!0-9]*) return;; esac
+  [ $((now - ts)) -le 5 ] || return
+  mine=$(sed -n 's/^version=//p' "$lf"); peer=$(sed -n 's/^peer_version=//p' "$lf")
+  [ -n "$peer" ] && [ -n "$mine" ] && [ "$peer" != "$mine" ] || return
+  [ "$peer" = older ] && peer="a release older than 2.8.6"
+  echo -e "${C_Y}⚠ the other server runs ${peer}, this one ${mine} — update both to the same release${C_N}"
+}
+
+# ports_failed prints how many of a running relay's user ports are NOT being
+# served (another program holds the port, ...), from the core's live
+# snapshot; 0 when it cannot tell. The tunnel shows connected and passes its
+# speed test regardless, so this is the only place that shows it.
+ports_failed(){
+  local lf="/run/brokennode/$1.live" ts now v
+  [ -f "$lf" ] || { echo 0; return; }
+  ts=$(sed -n 's/^ts=//p' "$lf"); now=$(date +%s)
+  case "$ts" in ""|*[!0-9]*) echo 0; return;; esac
+  [ $((now - ts)) -le 5 ] || { echo 0; return; }
+  v=$(sed -n 's/^ports_failed=//p' "$lf")
+  case "$v" in ""|*[!0-9]*) echo 0;; *) echo "$v";; esac
+}
+
 link_state(){
   local n="$1" last
   last="$(journalctl -u "brokennode@$n" -n 200 --no-pager -o cat 2>/dev/null \
@@ -1308,6 +1385,9 @@ list_tunnels(){
     IFS=$'\t' read -r dir listens addr ports < <(tunnel_summary "$f")
     [ "$dir" = direct ] && tr="$tr (direct)"
     printf "  %2d) %-14s ${col}%-8s${C_N} %-22s ${C_D}%s/%s${C_N}\n" "$i" "$n" "$st" "$link" "$m" "$tr"
+    local pf; pf=$(ports_failed "$n")
+    [ "$pf" -gt 0 ] && echo -e "      ${C_R}⚠ ${pf} port(s) NOT served — users of them get nothing. Open the tunnel → 18) Diagnose${C_N}"
+    local vn; vn=$(version_note "$n"); [ -n "$vn" ] && echo -e "      $vn"
     # second line: address/port + psk (token), so both sides can be re-checked
     # against each other at a glance without opening the config file.
     local psk
@@ -1960,14 +2040,14 @@ change_relay_ip(){
   local what="relay"; [ "$(jget "$cfg" mode)" = server ] && what="foreign server"
   local cur port newip; cur="$(jget "$cfg" remote_addr)"; port="${cur##*:}"
   echo; echo -e "${C_B}  Change $what IP for '$n'${C_N}  ${C_D}(current: $cur)${C_N}"
-  newip=$(ask "New $what IP (port $port kept)" "")
+  newip=$(ask "New $what IP — IPv4 or IPv6 (port $port kept)" "")
   [ -z "$newip" ] && { warn "cancelled"; return; }
-  newip="${newip// /}"
-  is_ipv4 "$newip" || { err "'$newip' is not an IPv4 address."; return; }
+  newip="${newip// /}"; newip="${newip#[}"; newip="${newip%]}"
+  is_ipv4 "$newip" || is_ipv6 "$newip" || { err "'$newip' is not an IPv4 or IPv6 address."; return; }
   cfg_begin "$cfg"
-  jset "$cfg" remote_addr "$newip:$port"
+  jset "$cfg" remote_addr "$(hostport "$newip" "$port")"
   cfg_commit "$cfg" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
-  info "$what: $cur -> $newip:$port"
+  info "$what: $cur -> $(hostport "$newip" "$port")"
   systemctl restart "brokennode@$n" >/dev/null 2>&1
   info "restarted '$n'"
   read -t 30 -rp "  ▶ press ENTER to continue... " _
@@ -2387,6 +2467,7 @@ delete_all_tunnels(){
     rm -f "$CFG_DIR/$n.json"
     echo "  removed $n"
   done
+  "$BIN" cleanup 2>/dev/null | sed 's/^/  /'   # NAT rules a stop failed to remove
   info "all tunnels deleted"
   read -t 30 -rp "  ▶ press ENTER to continue... " _
 }
@@ -2429,6 +2510,9 @@ manage_tunnels(){
     local ED; ED="$(command -v nano || command -v vi)"
     while true; do
       echo; echo -e "${C_B}  Manage '$n'${C_N}  ${C_D}[$(systemctl is-active "brokennode@$n" 2>/dev/null)]${C_N}"
+      local pfn; pfn=$(ports_failed "$n")
+      [ "$pfn" -gt 0 ] && echo -e "  ${C_R}⚠ ${pfn} port(s) of this tunnel are NOT served (another program may hold them). Run 18) Diagnose.${C_N}"
+      local vnn; vnn=$(version_note "$n"); [ -n "$vnn" ] && echo -e "  $vnn"
       echo "   1) Start    2) Stop    3) Restart"
       echo "   4) Live logs   5) Show config   6) Edit config (nano)"
       echo "   7) Delete   8) Live stats"
@@ -2436,6 +2520,7 @@ manage_tunnels(){
       echo -e "   ${C_G}13) Change direction${C_N}  ${C_D}[$(tunnel_direction "$CFG_DIR/$n.json")]${C_N}"
       echo -e "   ${C_G}15) Speed test${C_N}  ${C_D}(download/upload/ping through this tunnel)${C_N}"
       echo -e "   ${C_G}16) Apply preset${C_N}  ${C_D}(Optimized/High-Speed/Stable/Low-Latency/Eco)${C_N}   ${C_G}17) Port-forwards${C_N}  ${C_D}(add / remove / replace)${C_N}"
+      echo -e "   ${C_G}18) Diagnose${C_N}  ${C_D}(connected but users get nothing? checks every port end to end, firewall, NAT rules)${C_N}"
       echo "   0) Back"
       case "$(menu_ask 'Choice')" in
         1) systemctl enable --now "brokennode@$n" >/dev/null 2>&1; systemctl start "brokennode@$n"; info "started";;
@@ -2448,6 +2533,9 @@ manage_tunnels(){
            if [ "$c" = yes ]; then
              systemctl disable --now "brokennode@$n" >/dev/null 2>&1
              rm -f "$CFG_DIR/$n.json" "$CFG_DIR/.undo-$n.json" "/var/lib/brokennode/$n.stats" "/run/brokennode/$n".*
+             # A NAT rule the stop failed to remove would keep sending the
+             # port to this deleted tunnel; sweep whatever is left.
+             "$BIN" cleanup 2>/dev/null | sed 's/^/  /'
              info "deleted '$n'"; break
            fi;;
         8) stats_page "$n";;
@@ -2459,6 +2547,7 @@ manage_tunnels(){
         15) speed_test "$n"; read -t 120 -rp "  ▶ press ENTER to continue... " _;;
         16) apply_preset "$n";;
         17) manage_ports "$n";;
+        18) diagnose "$n";;
         __eof__) return;;
         0) break;;
         *) warn "Invalid.";;
@@ -2562,6 +2651,9 @@ health_check(){
       systemctl restart "brokennode@$n" 2>/dev/null
     fi
   done
+  # NAT rules of tunnels that no longer run (a stop that could not remove
+  # them, rules restored at boot) would keep stealing their ports.
+  /usr/local/bin/brokennode cleanup >/dev/null 2>&1 || true
 }
 
 # restart_all_tunnels: refresh the unit and restart every configured instance.
@@ -2664,6 +2756,8 @@ uninstall_all(){
   systemctl list-units --all --no-legend 2>/dev/null | grep -o 'brokennode@[^ ]*\.service' | sort -u | while read -r u; do systemctl disable --now "$u" >/dev/null 2>&1; done
   systemctl disable --now brokennode-autoupdate.timer >/dev/null 2>&1
   systemctl disable --now brokennode-health.timer >/dev/null 2>&1
+  # Every rule any release added, now that no tunnel runs.
+  "$BIN" cleanup --all 2>/dev/null | sed 's/^/  /'
   unshape_egress
   rm -f "$AU_SVC" "$AU_TIMER" "$HEALTH_SVC" "$HEALTH_TMR" "$TPL"; rm -rf "${HEALTH_SH%/*}"
   rm -rf /run/brokennode /var/lib/brokennode
