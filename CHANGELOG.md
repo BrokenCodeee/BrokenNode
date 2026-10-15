@@ -3,6 +3,29 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.9
+
+### Changed
+- **The proxy lives only under *Connection direction*.** The separate
+  *Manage → 19) Proxy* item is gone. *Manage → 13) Change direction* now offers
+  the same three choices as creating a tunnel — reverse, direct, proxy — so the
+  proxy is switched on or off there, and picking 3) proxy again changes its port
+  and login. Switching to proxy removes the port forwards (proxy mode has
+  none); switching back asks for them.
+
+---
+
+## فارسی — 2.8.9
+
+### تغییر
+- **پروکسی فقط در بخش *Connection direction* است.** گزینهٔ جداگانهٔ *Manage ← 19) Proxy*
+  حذف شد. *Manage ← 13) Change direction* حالا همان سه گزینهٔ ساخت تانل را دارد (reverse،
+  direct، proxy): پروکسی همان‌جا روشن یا خاموش می‌شود و انتخاب دوبارهٔ 3) proxy پورت و رمز
+  آن را عوض می‌کند. رفتن به حالت پروکسی فوروارد پورت‌ها را حذف می‌کند (حالت پروکسی فوروارد
+  ندارد)؛ برگشتن از آن دوباره پورت‌ها را می‌پرسد.
+
+---
+
 ## 2.8.8
 
 ### Changed

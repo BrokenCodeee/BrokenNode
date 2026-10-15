@@ -113,7 +113,9 @@ the Iran server runs a SOCKS5 + HTTP proxy (port, username and password are
 asked) and users set it in their app or browser; every site they open goes out
 from the foreign server. The manager then asks which server connects (reverse
 or direct). On the foreign server pick 3) proxy too, with the same direction.
-Not with `tcpnomux`. **Manage → 19) Proxy** changes it later.
+Not with `tcpnomux`. **Manage → 13) Change direction** offers the same three
+choices later: switch to or from proxy, or pick 3 again to change the proxy's
+port and login.
 
 Direction applies to the stream transports (`tcp` `mtcp` `mptcp` `ws`
 `tcpnomux` `kcp` `sctp`). The point-to-point tunnels (`gre`, `udp`,
@@ -136,10 +138,9 @@ tunnel*:
 | 9) Change transport | the transport and the encryption layer |
 | 10) Change peer IP | the other server's IP (stream and point-to-point tunnels) |
 | 11) Tune settings | keepalive, kcp, links, pool, ws path and headers, smux windows, addresses, quota, MTU, gre key, l2tp ids, carrier port, `target_host`, log level |
-| 13) Change direction | reverse ↔ direct |
+| 13) Change direction | reverse, direct or proxy (the SOCKS5/HTTP proxy on the Iran server: on/off, port, login) |
 | 14) Encryption & stealth | encryption layer, token, tls name and ALPN, `reality_dest`, fingerprint, `tls_fragment`, `pad` |
 | 17) Port-forwards | add, remove or replace the forwarded ports |
-| 19) Proxy | the SOCKS5/HTTP proxy on/off, its port and login (Iran server) |
 
 Every change is checked by the core before it replaces the config; a change it
 refuses leaves the tunnel as it was. Settings marked "same on both ends" must be
@@ -545,7 +546,8 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 پروکسی SOCKS5 و HTTP اجرا می‌کند (پورت، نام کاربری و رمز پرسیده می‌شود) و کاربر آن را
 در برنامه یا مرورگرش تنظیم می‌کند؛ هر سایتی که باز کند از سرور خارج باز می‌شود. بعد
 منیجر می‌پرسد کدام سرور وصل شود (ریورس یا دایرکت). روی سرور خارج هم 3) proxy را با
-همان جهت انتخاب کن. با `tcpnomux` نمی‌شود. بعداً با **Manage → 19) Proxy** قابل تغییر است.
+همان جهت انتخاب کن. با `tcpnomux` نمی‌شود. بعداً **Manage → 13) Change direction** همین سه گزینه را دارد:
+رفتن به حالت پروکسی یا برگشتن از آن، یا انتخاب دوبارهٔ ۳ برای تغییر پورت و رمز پروکسی.
 
 جهت فقط برای ترنسپورت‌های جریانی است (`tcp` `mtcp` `mptcp` `ws` `tcpnomux`
 `kcp` `sctp`). تونل‌های نقطه‌به‌نقطه (`gre`، `udp`، `icmp` و ...) از هر
@@ -568,10 +570,9 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 | 9) Change transport | ترنسپورت و لایهٔ رمزنگاری |
 | 10) Change peer IP | IP سرور مقابل (تانل‌های استریم و نقطه‌به‌نقطه) |
 | 11) Tune settings | keepalive، kcp، links، pool، مسیر و هدرهای ws، پنجره‌های smux، آدرس‌ها، سهمیه، MTU، کلید gre، شناسه‌های l2tp، پورت حامل، `target_host`، سطح لاگ |
-| 13) Change direction | ریورس ↔ دایرکت |
+| 13) Change direction | ریورس، دایرکت یا پروکسی (پروکسی SOCKS5/HTTP سرور ایران: روشن/خاموش، پورت، رمز) |
 | 14) Encryption & stealth | لایهٔ رمزنگاری، توکن، نام و ALPN در tls، `reality_dest`، اثرانگشت، `tls_fragment`، `pad` |
 | 17) Port-forwards | افزودن، حذف یا جایگزینی پورت‌ها |
-| 19) Proxy | روشن/خاموش کردن پروکسی SOCKS5/HTTP، پورت و نام کاربری و رمز (سرور ایران) |
 
 هر تغییر قبل از جایگزین شدن توسط هسته چک می‌شود؛ تغییری که رد شود تانل را دست‌نخورده
 می‌گذارد. تنظیماتی که «در هر دو طرف یکسان» هستند را روی سرور دیگر هم عوض کن.

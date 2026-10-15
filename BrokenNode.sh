@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.8"
+VERSION="2.8.9"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -890,12 +890,12 @@ stealth_extra(){
   return 0
 }
 
-# socks_extra TRANSPORT NAME — the relay's optional SOCKS5 + HTTP proxy, into
+# socks_extra TRANSPORT NAME [CFG] — the relay's SOCKS5 + HTTP proxy, into
 # SOCKSJSON. Each proxied connection names its own destination and is opened
 # from the foreign server. A proxy without a login is offered only on
 # localhost, unless the operator insists (strangers find open proxies fast).
 socks_extra(){
-  local tr="$1" name="$2" from="${3:-}" chosen="${4:-0}"; SOCKSJSON=""
+  local tr="$1" name="$2" from="${3:-}"; SOCKSJSON=""
   [ "$tr" = tcpnomux ] && return 0
   local cport="" cuser="bn" cpass=""
   if [ -n "$from" ] && [ -n "$(jget "$from" socks)" ]; then
@@ -904,14 +904,7 @@ socks_extra(){
   fi
   echo >&2
   echo -e "  ${C_D}Proxy mode: a SOCKS5 + HTTP proxy on this server; every site it opens goes out from the${C_N}" >&2
-  echo -e "  ${C_D}foreign server. Can be used instead of, or alongside, port forwards.${C_N}" >&2
-  if [ "$chosen" = 1 ]; then
-    :   # picked as the connection type: no need to ask again
-  elif [ -n "$cport" ]; then
-    yes_no "Keep a SOCKS5/HTTP proxy on this server? Y/n" y || return 0
-  else
-    yes_no "Run a SOCKS5/HTTP proxy on this server too? y/N" n || return 0
-  fi
+  echo -e "  ${C_D}foreign server. Users set it in their app or browser.${C_N}" >&2
   local port host=0.0.0.0 user pass
   while :; do
     port=$(ask "Proxy port" "${cport:-$(next_free_port 1080 tcp "$name")}"); port="${port// /}"
@@ -1350,7 +1343,7 @@ create_tunnel(){
       fi
       SOCKSJSON=""
       if [ "$proxy" = 1 ]; then
-        socks_extra "$tr" "$name" "" 1
+        socks_extra "$tr" "$name"
         ports=""
         echo -e "  ${C_D}No port forwards in proxy mode (add some later with 17 Port-forwards if you want both).${C_N}"
       else
@@ -2258,32 +2251,6 @@ edit_security(){
   read -t 30 -rp "  ▶ press ENTER to continue... " _
 }
 
-# edit_proxy NAME — turn the relay's SOCKS5/HTTP proxy on or off, or change its
-# port and login.
-edit_proxy(){
-  local n="$1"; local cfg="$CFG_DIR/$n.json" tr k
-  tr="$(jget "$cfg" transport)"
-  if [ "$(jget "$cfg" mode)" != server ] || [ "$(transport_family "$tr")" != stream ] || [ "$tr" = tcpnomux ]; then
-    warn "The proxy runs on the Iran server (server mode) over tcp, mtcp, mptcp, ws, kcp or sctp."
-    read -t 30 -rp "  ▶ press ENTER to continue... " _; return
-  fi
-  local work="$CFG_DIR/.tune-$n.json"
-  cp -p "$cfg" "$work" || { err "Could not prepare the edit."; return; }
-  trap 'rm -f "$work"' RETURN
-  local now; now="$(jget "$cfg" socks)"
-  echo; echo -e "${C_B}  Proxy of '$n'${C_N}  ${C_D}(now: ${now:-off})${C_N}"
-  socks_extra "$tr" "$n" "$cfg"
-  for k in socks socks_user socks_pass socks_open; do jset "$work" "$k" "" del; done
-  [ -n "$SOCKSJSON" ] && jmerge "$work" "{${SOCKSJSON%,}}"
-  if [ -z "$SOCKSJSON" ] && [ "$(jq_ports "$work")" = "" ]; then
-    warn "This tunnel has no port forwards: without the proxy it would carry nothing. Add ports first (17)."
-  fi
-  tune_apply "$n" "$cfg" "$work" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
-  info "saved, '$n' restarted"
-  socks_summary "$cfg"
-  read -t 30 -rp "  ▶ press ENTER to continue... " _
-}
-
 # change_relay_ip updates the IP this end dials, keeping the port: the Iran
 # relay's IP on a foreign server in reverse mode (needed every time the relay's
 # IP changes), or the foreign server's IP on the relay in direct mode.
@@ -2328,58 +2295,94 @@ change_relay_ip(){
   read -t 30 -rp "  ▶ press ENTER to continue... " _
 }
 
-# change_direction flips a stream tunnel between reverse (the foreign server
-# dials the relay) and direct (the relay dials the foreign server). Each end
-# needs the address for its new role; the old one stays in the config, so
-# flipping back later offers it as the default.
+# direction_label CFG — reverse, direct, or "proxy (reverse)" / "proxy (direct)"
+# when the relay runs the SOCKS5/HTTP proxy.
+direction_label(){
+  local d; d="$(tunnel_direction "$1")"
+  if [ -n "$(jget "$1" socks)" ]; then echo "proxy ($d)"; else echo "$d"; fi
+}
+
+# change_direction — the same three choices as at creation: reverse (the
+# foreign server dials the relay), direct (the relay dials the foreign server)
+# or proxy (a SOCKS5/HTTP proxy on the relay instead of port forwards, over
+# either). Each end needs the address for its new role; choosing proxy again
+# changes the proxy's port and login. The old address stays in the config,
+# so flipping back later offers it as the default.
 change_direction(){
-  local n="$1"; local cfg="$CFG_DIR/$n.json"
+  local n="$1"; local cfg="$CFG_DIR/$n.json" k
   local tr mode cur new; tr="$(jget "$cfg" transport)"; mode="$(jget "$cfg" mode)"
   if [ "$(transport_family "$tr")" != stream ]; then
     warn "$tr has no direction: both ends send to each other, so it already works either way."
     read -t 30 -rp "  ▶ press ENTER to continue... " _; return
   fi
-  cur="$(tunnel_direction "$cfg")"; [ "$cur" = direct ] && new=reverse || new=direct
-  echo; echo -e "${C_B}  Direction of '$n'${C_N}  ${C_D}(now: $cur)${C_N}"
-  echo -e "  ${C_D}reverse: the foreign server connects to the Iran server.${C_N}"
-  echo -e "  ${C_D}direct:  the Iran server connects to the foreign server.${C_N}"
-  local c; c=$(ask "Switch to $new? y/N" "N"); case "$c" in y|Y) :;; *) warn "cancelled"; return;; esac
+  cur="$(tunnel_direction "$cfg")"
+  local hadproxy=0 before; [ -n "$(jget "$cfg" socks)" ] && hadproxy=1
+  before="$(direction_label "$cfg")"
+  echo; echo -e "${C_B}  Direction of '$n'${C_N}  ${C_D}(now: $before)${C_N}"
+  local dsel proxy=0; dsel=$(pick_direction "$tr"); new="${dsel#proxy-}"; [ "$dsel" != "$new" ] && proxy=1
+  if [ "$new" = "$cur" ] && [ "$proxy" = 0 ] && { [ "$hadproxy" = 0 ] || [ "$mode" = client ]; }; then
+    info "already $cur — nothing to do"; return
+  fi
   local bproto=tcp; [ "$tr" = kcp ] && bproto=udp
   local bind remote port
   bind="$(jget "$cfg" bind_addr)"; remote="$(jget "$cfg" remote_addr)"
   cfg_begin "$cfg"
-  # The side that will listen needs bind_addr; the side that will dial needs
-  # remote_addr. The tunnel port is the same number either way.
-  if { [ "$mode" = server ] && [ "$new" = reverse ]; } || { [ "$mode" = client ] && [ "$new" = direct ]; }; then
-    port="${bind##*:}"; [ -z "$bind" ] && port="${remote##*:}"; [ -z "$port" ] && port=8443
-    local v; v=$(ask "Listen address (host:port)" "${bind:-0.0.0.0:$port}")
-    jset "$cfg" bind_addr "$(check_bind "$v")"
-    jset "$cfg" remote_addr "" del   # this end no longer dials
-    port="$(jget "$cfg" bind_addr)"; port="${port##*:}"
-    warn_port_clash "$(jq_ports "$cfg")" "$n" "$port" "$bproto"
-    warn "This server must now accept ${bproto^^} $port inbound (firewall)."
-  else
-    local who="Iran relay"; [ "$mode" = server ] && who="foreign server"
-    port="${remote##*:}"; [ -z "$remote" ] && port="${bind##*:}"; [ -z "$port" ] && port=8443
-    local v=""
-    while [ -z "$v" ]; do
-      v=$(ask_hostport "$who address (IP:port)" "$port" "$remote")
-      [ -z "$v" ] && warn "Required: the $who's real IP and the port it listens on."
-    done
-    jset "$cfg" remote_addr "$v"
-    jset "$cfg" bind_addr "" del     # this end no longer listens
+  if [ "$new" != "$cur" ]; then
+    # The side that will listen needs bind_addr; the side that will dial needs
+    # remote_addr. The tunnel port is the same number either way.
+    if { [ "$mode" = server ] && [ "$new" = reverse ]; } || { [ "$mode" = client ] && [ "$new" = direct ]; }; then
+      port="${bind##*:}"; [ -z "$bind" ] && port="${remote##*:}"; [ -z "$port" ] && port=8443
+      local v; v=$(ask "Listen address (host:port)" "${bind:-0.0.0.0:$port}")
+      jset "$cfg" bind_addr "$(check_bind "$v")"
+      jset "$cfg" remote_addr "" del   # this end no longer dials
+      port="$(jget "$cfg" bind_addr)"; port="${port##*:}"
+      warn_port_clash "$(jq_ports "$cfg")" "$n" "$port" "$bproto"
+      warn "This server must now accept ${bproto^^} $port inbound (firewall)."
+    else
+      local who="Iran relay"; [ "$mode" = server ] && who="foreign server"
+      port="${remote##*:}"; [ -z "$remote" ] && port="${bind##*:}"; [ -z "$port" ] && port=8443
+      local v=""
+      while [ -z "$v" ]; do
+        v=$(ask_hostport "$who address (IP:port)" "$port" "$remote")
+        [ -z "$v" ] && warn "Required: the $who's real IP and the port it listens on."
+      done
+      jset "$cfg" remote_addr "$v"
+      jset "$cfg" bind_addr "" del     # this end no longer listens
+    fi
+    jset "$cfg" direction "$new"
   fi
-  jset "$cfg" direction "$new"
+  if [ "$mode" = server ]; then
+    if [ "$proxy" = 1 ]; then
+      # Proxy mode carries no port forwards, as at creation.
+      socks_extra "$tr" "$n" "$cfg"
+      for k in socks socks_user socks_pass socks_open; do jset "$cfg" "$k" "" del; done
+      jmerge "$cfg" "{${SOCKSJSON%,}}"
+      if [ -n "$(jq_ports "$cfg")" ]; then
+        warn "Proxy mode has no port forwards: removing this tunnel's ports ($(jq_ports "$cfg" | tr -d '"'))."
+        jmerge "$cfg" '{"ports":[]}'
+      fi
+    elif [ "$hadproxy" = 1 ]; then
+      # Leaving proxy mode: the tunnel carries port forwards again.
+      for k in socks socks_user socks_pass socks_open; do jset "$cfg" "$k" "" del; done
+      if [ -z "$(jq_ports "$cfg")" ]; then
+        info "Without the proxy this tunnel needs port forwards:"
+        jmerge "$cfg" "{\"ports\":[$(ask_ports "$n")]}"
+      fi
+    fi
+  elif [ "$proxy" = 1 ]; then
+    info "The proxy itself is set up on the Iran server; this server only needs the same direction ($new)."
+  fi
   cfg_commit "$cfg" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
-  info "direction: $cur -> $new"
+  info "direction: $before -> $(direction_label "$cfg")"
   # The certificate belongs to the end that LISTENS, and the flip moves that
   # role. Self-signed carries over by itself (either tls flag works on either
   # end); a certificate from files or Let's Encrypt lives on the OTHER server.
-  if [ "$(jget "$cfg" encryption)" = tls ] && [ "$(jget "$cfg" tls_selfsigned)" != True ] && [ "$(jget "$cfg" tls_insecure)" != True ]; then
+  if [ "$new" != "$cur" ] && [ "$(jget "$cfg" encryption)" = tls ] && [ "$(jget "$cfg" tls_selfsigned)" != True ] && [ "$(jget "$cfg" tls_insecure)" != True ]; then
     warn "This tunnel uses tls with a real certificate, and the flip moved the listening role to the other end."
     warn "That end now needs the certificate (tls_cert/tls_key, or Let's Encrypt on :443) — or switch both ends to self-signed."
   fi
-  warn "Switch the OTHER server to ${C_Y}$new${C_N} too, or the two will not connect."
+  [ "$new" != "$cur" ] && warn "Switch the OTHER server to ${C_Y}$new${C_N} too, or the two will not connect."
+  [ "$mode" = server ] && socks_summary "$cfg"
   service_check "$n"
   read -t 30 -rp "  ▶ press ENTER to continue... " _
 }
@@ -2839,12 +2842,10 @@ manage_tunnels(){
       echo "   4) Live logs   5) Show config   6) Edit config (nano)"
       echo "   7) Delete   8) Live stats"
       echo -e "   ${C_G}9) Change transport${C_N}   ${C_G}10) Change peer IP${C_N}   ${C_G}11) Tune settings (MTU/FEC/window...)${C_N}"
-      echo -e "   ${C_G}13) Change direction${C_N}  ${C_D}[$(tunnel_direction "$CFG_DIR/$n.json")]${C_N}   ${C_G}14) Encryption & stealth${C_N}  ${C_D}(token, tls, reality, fingerprint, fragment, pad)${C_N}"
+      echo -e "   ${C_G}13) Change direction${C_N}  ${C_D}(reverse / direct / proxy) [$(direction_label "$CFG_DIR/$n.json")]${C_N}   ${C_G}14) Encryption & stealth${C_N}  ${C_D}(token, tls, reality, fingerprint, fragment, pad)${C_N}"
       echo -e "   ${C_G}15) Speed test${C_N}  ${C_D}(download/upload/ping through this tunnel)${C_N}"
       echo -e "   ${C_G}16) Apply preset${C_N}  ${C_D}(Optimized/High-Speed/Stable/Low-Latency/Eco)${C_N}   ${C_G}17) Port-forwards${C_N}  ${C_D}(add / remove / replace)${C_N}"
       echo -e "   ${C_G}18) Diagnose${C_N}  ${C_D}(connected but users get nothing? checks every port end to end, firewall, NAT rules)${C_N}"
-      local sx; sx="$(jget "$CFG_DIR/$n.json" socks)"
-      [ "$(jget "$CFG_DIR/$n.json" mode)" = server ] && echo -e "   ${C_G}19) Proxy${C_N}  ${C_D}(SOCKS5/HTTP proxy on this server: on/off, port, login) [${sx:-off}]${C_N}"
       echo "   0) Back"
       case "$(menu_ask 'Choice')" in
         1) systemctl enable --now "brokennode@$n" >/dev/null 2>&1; systemctl start "brokennode@$n"; info "started";;
@@ -2873,7 +2874,6 @@ manage_tunnels(){
         16) apply_preset "$n";;
         17) manage_ports "$n";;
         18) diagnose "$n";;
-        19) edit_proxy "$n";;
         __eof__) return;;
         0) break;;
         *) warn "Invalid.";;
