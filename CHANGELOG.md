@@ -3,6 +3,33 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.8
+
+### Changed
+- **The proxy is now chosen under *Connection direction*, as 3) proxy**, next to
+  reverse and direct, instead of a separate yes/no question later. It asks the
+  proxy port, username and password, then which server connects (reverse or
+  direct), and sets up no port forwards. Pick 3) proxy on the foreign server
+  too. *Manage → 19) Proxy* still changes it later.
+- The transport menu's first group was labelled "proxy (users connect to a
+  port)", which read like the SOCKS proxy. It is now "stream transports (users
+  connect to a forwarded port)".
+
+---
+
+## فارسی — 2.8.8
+
+### تغییر
+- **پروکسی حالا در بخش *Connection direction* به‌عنوان گزینهٔ 3) proxy** کنار reverse و
+  direct انتخاب می‌شود، نه با یک سؤال بله/خیر جداگانه در ادامه. پورت، نام کاربری و رمز
+  پروکسی را می‌پرسد، بعد اینکه کدام سرور وصل شود (ریورس یا دایرکت)، و فوروارد پورت
+  نمی‌سازد. روی سرور خارج هم 3) proxy را انتخاب کنید. *Manage ← 19) Proxy* همچنان برای
+  تغییر بعدی است.
+- عنوان گروه اول منوی ترنسپورت «proxy (users connect to a port)» بود که با پروکسی SOCKS
+  اشتباه گرفته می‌شد. حالا «stream transports (users connect to a forwarded port)» است.
+
+---
+
 ## 2.8.7
 
 ### New

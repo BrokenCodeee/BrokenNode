@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.7"
+VERSION="2.8.8"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -269,13 +269,29 @@ tunnel_listens(){
   { [ "$m" = server ] && [ "$d" = reverse ]; } || { [ "$m" = client ] && [ "$d" = direct ]; }
 }
 
+# pick_direction [TRANSPORT] — reverse, direct, or proxy-reverse /
+# proxy-direct: a SOCKS5/HTTP proxy on the Iran server in place of port
+# forwards. The proxy still rides a tunnel, so it asks which server connects.
+# tcpnomux does not multiplex and cannot carry the proxy.
 pick_direction(){
+  local tr="${1:-}" max=3
+  [ "$tr" = tcpnomux ] && max=2
   echo -e "${C_B}  Connection direction:${C_N}" >&2
   echo -e "   1) reverse  the FOREIGN server connects to the Iran server  ${C_D}(classic)${C_N}" >&2
   echo -e "   2) direct   the IRAN server connects to the foreign server" >&2
+  [ "$max" = 3 ] && echo -e "   3) proxy    a SOCKS5/HTTP proxy on the Iran server  ${C_D}(no port forwards: users set it in their app or browser)${C_N}" >&2
   echo -e "  ${C_D}Pick direct when connections INTO the Iran server are being cut.${C_N}" >&2
-  echo -e "  ${C_D}Both servers must use the SAME direction.${C_N}" >&2
-  local d; d=$(ask "Choice [1-2]" "1"); case "$d" in 2|d|direct) echo direct;; *) echo reverse;; esac
+  echo -e "  ${C_D}Both servers must use the SAME choice.${C_N}" >&2
+  local d; d=$(ask "Choice [1-$max]" "1")
+  case "$d" in
+    2|d|direct) echo direct ;;
+    3|p|proxy)
+      if [ "$max" = 2 ]; then echo reverse; return; fi
+      echo -e "  ${C_D}The proxy runs over the tunnel. Which server connects to the other?${C_N}" >&2
+      local w; w=$(ask "1) the FOREIGN server connects to Iran (reverse)   2) IRAN connects to the foreign server (direct)" "1")
+      [ "$w" = 2 ] && echo proxy-direct || echo proxy-reverse ;;
+    *) echo reverse ;;
+  esac
 }
 
 # ask_hostport PROMPT DEFAULT_PORT [DEFAULT] — a host:port, with the port
@@ -694,7 +710,7 @@ pick_transport(){
   # tunnel never connected. New transports only ever get appended.
   echo >&2
   echo -e "${C_B}  Select transport:${C_N}" >&2
-  echo -e "  ${C_D}── proxy (users connect to a port) ───────────${C_N}" >&2
+  echo -e "  ${C_D}── stream transports (users connect to a forwarded port) ──${C_N}" >&2
   echo -e "   1) tcp       Plain TCP + smux         ${C_G}(stable baseline)${C_N}" >&2
   echo -e "   2) mtcp      Multi-link TCP           ${C_G}(beats throttling, best for Iran)${C_N}" >&2
   echo    "   3) ws        WebSocket/HTTP + smux    (HTTP mimicry)" >&2
@@ -879,7 +895,7 @@ stealth_extra(){
 # from the foreign server. A proxy without a login is offered only on
 # localhost, unless the operator insists (strangers find open proxies fast).
 socks_extra(){
-  local tr="$1" name="$2" from="${3:-}"; SOCKSJSON=""
+  local tr="$1" name="$2" from="${3:-}" chosen="${4:-0}"; SOCKSJSON=""
   [ "$tr" = tcpnomux ] && return 0
   local cport="" cuser="bn" cpass=""
   if [ -n "$from" ] && [ -n "$(jget "$from" socks)" ]; then
@@ -889,7 +905,9 @@ socks_extra(){
   echo >&2
   echo -e "  ${C_D}Proxy mode: a SOCKS5 + HTTP proxy on this server; every site it opens goes out from the${C_N}" >&2
   echo -e "  ${C_D}foreign server. Can be used instead of, or alongside, port forwards.${C_N}" >&2
-  if [ -n "$cport" ]; then
+  if [ "$chosen" = 1 ]; then
+    :   # picked as the connection type: no need to ask again
+  elif [ -n "$cport" ]; then
     yes_no "Keep a SOCKS5/HTTP proxy on this server? Y/n" y || return 0
   else
     yes_no "Run a SOCKS5/HTTP proxy on this server too? y/N" n || return 0
@@ -949,8 +967,7 @@ build_ports(){
     case "$proto" in 1) sfx="";; 2) sfx="/udp";; *) sfx="/both";; esac
     arr+=("\"${spec}${sfx}\""); echo -e "${C_G}    added ${spec}${sfx}${C_N}" >&2
   done
-  # With a proxy on this relay the forwards are optional (NO_PORTS_OK=1).
-  [ ${#arr[@]} -eq 0 ] && [ "${NO_PORTS_OK:-0}" != 1 ] && arr+=("\"443/both\""); ( IFS=,; echo "${arr[*]}" )
+  [ ${#arr[@]} -eq 0 ] && arr+=("\"443/both\""); ( IFS=,; echo "${arr[*]}" )
 }
 
 # jstr TEXT — TEXT escaped for use inside a JSON string. Typed answers
@@ -1310,7 +1327,7 @@ create_tunnel(){
   if is_tunnel_transport "$tr"; then
     write_tunnel_cfg "$role" "$name" "$tr" "$enc"
   else
-    local dir; dir=$(pick_direction)
+    local dsel dir proxy=0; dsel=$(pick_direction "$tr"); dir="${dsel#proxy-}"; [ "$dsel" != "$dir" ] && proxy=1
     read -r ka kmode kdata kparity <<< "$(pick_preset)"; build_extra "$role" "$tr" "$dir" "$enc"
     local cfg="$CFG_DIR/$name.json"
     local bproto=tcp; [ "$tr" = kcp ] && bproto=udp
@@ -1331,10 +1348,11 @@ create_tunnel(){
         bind="$(check_bind "$bind")"
         addrline="\"bind_addr\": \"$bind\","
       fi
-      socks_extra "$tr" "$name"
-      if [ -n "$SOCKSJSON" ]; then
-        info "Port forwards are optional with a proxy: press Enter at once for none."
-        ports=$(NO_PORTS_OK=1 ask_ports "$name")
+      SOCKSJSON=""
+      if [ "$proxy" = 1 ]; then
+        socks_extra "$tr" "$name" "" 1
+        ports=""
+        echo -e "  ${C_D}No port forwards in proxy mode (add some later with 17 Port-forwards if you want both).${C_N}"
       else
         ports=$(ask_ports "$name")
       fi
@@ -1374,6 +1392,7 @@ EOF
       [ -n "$SOCKSJSON" ] && socks_summary "$cfg"
     else
       local remote="" bind="" addrline token target
+      [ "$proxy" = 1 ] && info "Proxy mode: the proxy itself is set up on the Iran server; this server only needs the same direction ($dir)."
       if [ "$dir" = direct ]; then
         bind=$(ask "Listen address for the Iran server to connect to (host:port)" "0.0.0.0:$(next_free_port 8443 "$bproto" "$name")")
         bind="$(check_bind "$bind")"

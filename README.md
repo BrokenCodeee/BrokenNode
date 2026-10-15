@@ -108,6 +108,13 @@ encryption and speed are the same either way. Both servers must use the same
 direction. The manager asks for it when you create a tunnel, and
 **Manage → Change direction** switches an existing one.
 
+The same question has a third answer, **3) proxy**: instead of port forwards,
+the Iran server runs a SOCKS5 + HTTP proxy (port, username and password are
+asked) and users set it in their app or browser; every site they open goes out
+from the foreign server. The manager then asks which server connects (reverse
+or direct). On the foreign server pick 3) proxy too, with the same direction.
+Not with `tcpnomux`. **Manage → 19) Proxy** changes it later.
+
 Direction applies to the stream transports (`tcp` `mtcp` `mptcp` `ws`
 `tcpnomux` `kcp` `sctp`). The point-to-point tunnels (`gre`, `udp`,
 `icmp`, ...) send from both ends at once and have no direction.
@@ -120,8 +127,8 @@ encryption layer and the token.
 Creating a tunnel asks for everything it can use, on the end it belongs to:
 the encryption layer (`aead`, `obfs`, `tls`, `reality`, `none`), the tls
 certificate, the site `reality` borrows, the browser fingerprint and the split
-ClientHello (on the end that connects), padding, and on the Iran server an
-optional SOCKS5/HTTP proxy with a login. Afterwards, under *Manage tunnels → a
+ClientHello (on the end that connects), padding, and — when *Connection
+direction* is 3) proxy — the Iran server's SOCKS5/HTTP proxy with a login. Afterwards, under *Manage tunnels → a
 tunnel*:
 
 | Item | Changes |
@@ -534,6 +541,12 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 باشند. منیجر هنگام ساخت تانل این را می‌پرسد و با
 **Manage → Change direction** می‌توان جهت یک تانل موجود را عوض کرد.
 
+همین سؤال گزینهٔ سومی هم دارد، **3) proxy**: به جای فوروارد پورت، سرور ایران یک
+پروکسی SOCKS5 و HTTP اجرا می‌کند (پورت، نام کاربری و رمز پرسیده می‌شود) و کاربر آن را
+در برنامه یا مرورگرش تنظیم می‌کند؛ هر سایتی که باز کند از سرور خارج باز می‌شود. بعد
+منیجر می‌پرسد کدام سرور وصل شود (ریورس یا دایرکت). روی سرور خارج هم 3) proxy را با
+همان جهت انتخاب کن. با `tcpnomux` نمی‌شود. بعداً با **Manage → 19) Proxy** قابل تغییر است.
+
 جهت فقط برای ترنسپورت‌های جریانی است (`tcp` `mtcp` `mptcp` `ws` `tcpnomux`
 `kcp` `sctp`). تونل‌های نقطه‌به‌نقطه (`gre`، `udp`، `icmp` و ...) از هر
 دو طرف هم‌زمان ارسال می‌کنند و جهت ندارند.
@@ -546,7 +559,8 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 ساخت تانل هر تنظیمی را که به کار می‌آید، روی همان طرفی که لازم است می‌پرسد: لایهٔ
 رمزنگاری (`aead`، `obfs`، `tls`، `reality`، `none`)، گواهی tls، سایتی که `reality`
 از آن استفاده می‌کند، اثرانگشت مرورگر و تکه‌تکه کردن ClientHello (روی طرفی که وصل
-می‌شود)، padding، و روی سرور ایران پروکسی اختیاری SOCKS5/HTTP با نام کاربری و رمز.
+می‌شود)، padding، و وقتی *Connection direction* روی 3) proxy باشد، پروکسی SOCKS5/HTTP
+سرور ایران با نام کاربری و رمز.
 بعداً در *Manage tunnels ← یک تانل*:
 
 | گزینه | چه چیزی را عوض می‌کند |
