@@ -3,6 +3,70 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.7
+
+### New
+- **Every setting is asked in the menu, and can be changed later.** Creating a
+  tunnel now also asks for:
+  - `reality` as an encryption choice, with the real site it borrows
+    (`reality_dest`);
+  - on the end that connects: the browser fingerprint (`tls_fingerprint`) for
+    tls, and splitting the ClientHello (`tls_fragment`) for tls and reality;
+  - padding (`pad`);
+  - on the Iran server, an optional SOCKS5/HTTP proxy (`socks`) with a login.
+    Port forwards become optional when the proxy is on.
+- **Manage → a tunnel → 14) Encryption & stealth:** change the encryption layer,
+  the token, the tls name and ALPN, the reality site, the fingerprint, the
+  fragment and padding.
+- **Manage → a tunnel → 19) Proxy** (Iran server): turn the proxy on or off,
+  change its port and login.
+- **Tune settings** now also covers the ws path and headers, `links_max`,
+  `links_per_link`, `pool_min_idle`, `smux_frame_kb`, and for point-to-point
+  tunnels the two IPs, the tunnel addresses, the gre key, the l2tp ids, encap
+  and port, and the carrier port.
+- **Change peer IP** works for point-to-point tunnels too (`remote_ip`).
+
+### Fixed
+- Changing the transport away from ws no longer leaves its `ws_*` settings in
+  the config. Switching the encryption layer drops the old layer's settings
+  (tls, reality, fragment) and asks the new layer's questions.
+
+### Note
+- In the encryption menu `none` is now 5 (4 is `reality`).
+
+---
+
+## فارسی — 2.8.7
+
+### جدید
+- **همهٔ تنظیمات در منو پرسیده می‌شوند و بعداً قابل تغییرند.** ساخت تانل حالا این‌ها را
+  هم می‌پرسد:
+  - `reality` به‌عنوان یک گزینهٔ رمزنگاری، با سایت واقعی‌ای که از آن استفاده می‌کند
+    (`reality_dest`)؛
+  - روی طرفی که وصل می‌شود: اثرانگشت مرورگر (`tls_fingerprint`) برای tls، و
+    تکه‌تکه کردن ClientHello (`tls_fragment`) برای tls و reality؛
+  - padding (`pad`)؛
+  - روی سرور ایران، پروکسی اختیاری SOCKS5/HTTP (`socks`) با نام کاربری و رمز. با
+    روشن بودن پروکسی، فوروارد پورت اختیاری است.
+- **Manage ← یک تانل ← 14) Encryption & stealth:** تغییر لایهٔ رمزنگاری، توکن، نام و
+  ALPN در tls، سایت reality، اثرانگشت، fragment و padding.
+- **Manage ← یک تانل ← 19) Proxy** (سرور ایران): روشن/خاموش کردن پروکسی و تغییر
+  پورت و نام کاربری و رمز.
+- **Tune settings** حالا این‌ها را هم دارد: مسیر و هدرهای ws، `links_max`،
+  `links_per_link`، `pool_min_idle`، `smux_frame_kb`، و برای تانل‌های نقطه‌به‌نقطه دو
+  IP، آدرس‌های تانل، کلید gre، شناسه‌ها و encap و پورت l2tp، و پورت حامل.
+- **Change peer IP** حالا برای تانل‌های نقطه‌به‌نقطه هم کار می‌کند (`remote_ip`).
+
+### رفع‌شده
+- عوض کردن ترنسپورت از ws دیگر تنظیمات `ws_*` را در کانفیگ جا نمی‌گذارد. عوض کردن
+  لایهٔ رمزنگاری تنظیمات لایهٔ قبلی (tls، reality، fragment) را پاک می‌کند و سؤال‌های
+  لایهٔ جدید را می‌پرسد.
+
+### توجه
+- در منوی رمزنگاری، `none` حالا گزینهٔ 5 است (4 شده `reality`).
+
+---
+
 ## 2.8.6
 
 ### Fixed

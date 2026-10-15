@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.6"
+VERSION="2.8.7"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -762,11 +762,12 @@ pick_encryption(){
   echo -e "   1) aead   ChaCha20-Poly1305   ${C_G}(encrypted + tamper-proof, Recommended)${C_N}" >&2
   echo -e "   2) obfs   AES-CTR obfuscation ${C_G}(anti-DPI, matches older builds)${C_N}" >&2
   echo -e "   3) tls    Real HTTPS + certificate ${C_G}(looks like HTTPS to DPI, works on any port)${C_N}" >&2
-  echo    "   4) none   No encryption layer (lowest overhead)" >&2
+  echo -e "   4) reality Borrow a real site's HTTPS ${C_G}(no domain/certificate; probers see the real site)${C_N}" >&2
+  echo    "   5) none   No encryption layer (lowest overhead)" >&2
   echo -e "  ${C_D}──────────────────────────────────────────────${C_N}" >&2
   echo -e "  ${C_D}Both ends of the tunnel must use the SAME choice.${C_N}" >&2
-  local n; n=$(ask "Choice [1-4]" "1")
-  case "$n" in 2) echo obfs ;; 3) echo tls ;; 4) echo none ;; *) echo aead ;; esac
+  local n; n=$(ask "Choice [1-5]" "1")
+  case "$n" in 2) echo obfs ;; 3) echo tls ;; 4) echo reality ;; 5) echo none ;; *) echo aead ;; esac
 }
 
 # tls_extra collects the tls encryption layer's fields into TLSJSON (the config
@@ -817,6 +818,100 @@ tls_extra(){
   [ -n "$alpn" ] && TLSJSON="$TLSJSON\"alpn\":\"$(jstr "$alpn")\","
 }
 
+# yes_no QUESTION DEFAULT — true for a yes; Enter takes DEFAULT (y or n).
+yes_no(){
+  local a; a=$(ask "$1" "$2")
+  case "$a" in y|Y|yes|YES|Yes) return 0 ;; n|N|no|NO|No) return 1 ;; esac
+  case "$2" in y|Y) return 0 ;; *) return 1 ;; esac
+}
+
+# pick_fingerprint [CURRENT] — the browser the tls ClientHello imitates
+# (tls_fingerprint). Enter keeps CURRENT (chrome when there is none).
+pick_fingerprint(){
+  local cur="${1:-chrome}" n d=1
+  echo -e "  ${C_D}Which browser should the TLS handshake look like? (DPI fingerprints it)${C_N}" >&2
+  echo    "   1) chrome   2) firefox   3) safari   4) edge   5) ios   6) random" >&2
+  case "$cur" in firefox) d=2 ;; safari) d=3 ;; edge) d=4 ;; ios) d=5 ;; random|randomized) d=6 ;; esac
+  n=$(ask "Fingerprint [1-6]" "$d")
+  case "$n" in 2) echo firefox ;; 3) echo safari ;; 4) echo edge ;; 5) echo ios ;; 6) echo random ;; *) echo chrome ;; esac
+}
+
+# ask_reality_dest [CURRENT] — the real site reality borrows, as host:port.
+# A bare host gets :443. Both ends must name the same site.
+ask_reality_dest(){
+  local v; v=$(ask "Real site to borrow (host:port, the SAME on both ends)" "${1:-www.microsoft.com:443}"); v="${v// /}"
+  case "$v" in
+    *:*[!0-9]*|*:) v="${v%%:*}:443" ;;   # "host:" or a non-numeric port
+    *:*) : ;;
+    *) v="$v:443" ;;
+  esac
+  echo "$v"
+}
+
+# stealth_extra ENC DIALS — the anti-DPI options of a stream tunnel, appended
+# to TLSJSON: the site reality borrows; on the end that DIALS the browser
+# fingerprint (tls) and the split ClientHello (tls, reality); and padding,
+# which both ends must set alike.
+stealth_extra(){
+  local enc="$1" dials="$2"
+  if [ "$enc" = reality ]; then
+    echo -e "  ${C_D}reality shows a real site's HTTPS: no domain or certificate of your own. Anyone${C_N}" >&2
+    echo -e "  ${C_D}probing the port is passed through to that real site.${C_N}" >&2
+    TLSJSON="$TLSJSON\"reality_dest\":\"$(jstr "$(ask_reality_dest)")\","
+  fi
+  if [ "$dials" = 1 ]; then
+    if [ "$enc" = tls ]; then
+      TLSJSON="$TLSJSON\"tls_fingerprint\":\"$(pick_fingerprint)\","
+    fi
+    if [ "$enc" = tls ] || [ "$enc" = reality ]; then
+      echo -e "  ${C_D}Fragment: split the TLS ClientHello so a DPI box cannot read the server name. Only this end.${C_N}" >&2
+      yes_no "Fragment the ClientHello (tls_fragment)? y/N" n && TLSJSON="$TLSJSON\"tls_fragment\":true,"
+    fi
+  fi
+  echo -e "  ${C_D}Padding: hides packet sizes and timing from pattern-based DPI. Costs a little bandwidth.${C_N}" >&2
+  echo -e "  ${C_D}It MUST be the same on both ends.${C_N}" >&2
+  yes_no "Add padding (pad)? y/N" n && TLSJSON="$TLSJSON\"pad\":true,"
+  return 0
+}
+
+# socks_extra TRANSPORT NAME — the relay's optional SOCKS5 + HTTP proxy, into
+# SOCKSJSON. Each proxied connection names its own destination and is opened
+# from the foreign server. A proxy without a login is offered only on
+# localhost, unless the operator insists (strangers find open proxies fast).
+socks_extra(){
+  local tr="$1" name="$2" from="${3:-}"; SOCKSJSON=""
+  [ "$tr" = tcpnomux ] && return 0
+  local cport="" cuser="bn" cpass=""
+  if [ -n "$from" ] && [ -n "$(jget "$from" socks)" ]; then
+    cport="$(jget "$from" socks)"; cport="${cport##*:}"
+    cuser="$(jget "$from" socks_user)"; cpass="$(jget "$from" socks_pass)"
+  fi
+  echo >&2
+  echo -e "  ${C_D}Proxy mode: a SOCKS5 + HTTP proxy on this server; every site it opens goes out from the${C_N}" >&2
+  echo -e "  ${C_D}foreign server. Can be used instead of, or alongside, port forwards.${C_N}" >&2
+  if [ -n "$cport" ]; then
+    yes_no "Keep a SOCKS5/HTTP proxy on this server? Y/n" y || return 0
+  else
+    yes_no "Run a SOCKS5/HTTP proxy on this server too? y/N" n || return 0
+  fi
+  local port host=0.0.0.0 user pass
+  while :; do
+    port=$(ask "Proxy port" "${cport:-$(next_free_port 1080 tcp "$name")}"); port="${port// /}"
+    [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] && break
+    warn "'$port' is not a port (1-65535)." >&2
+  done
+  user=$(ask "Proxy username ('-' = no login)" "${cuser:--}"); user="${user// /}"; [ "$user" = - ] && user=""
+  if [ -n "$user" ]; then
+    local tk; tk="$(gen_token)"; pass=$(ask "Proxy password" "${cpass:-${tk:0:12}}")
+    SOCKSJSON="\"socks_user\":\"$(jstr "$user")\",\"socks_pass\":\"$(jstr "$pass")\","
+  else
+    echo -e "  ${C_D}Without a login, anyone who finds a public proxy port can use it.${C_N}" >&2
+    local o; o=$(ask "Listen on  1) localhost only (safe)   2) every address, open to anyone" "1")
+    if [ "$o" = 2 ]; then SOCKSJSON="\"socks_open\":true,"; else host=127.0.0.1; fi
+  fi
+  SOCKSJSON="\"socks\":\"$host:$port\",$SOCKSJSON"
+}
+
 pick_preset(){
   echo >&2
   echo -e "${C_B}  Connection preset:${C_N}" >&2
@@ -854,7 +949,8 @@ build_ports(){
     case "$proto" in 1) sfx="";; 2) sfx="/udp";; *) sfx="/both";; esac
     arr+=("\"${spec}${sfx}\""); echo -e "${C_G}    added ${spec}${sfx}${C_N}" >&2
   done
-  [ ${#arr[@]} -eq 0 ] && arr+=("\"443/both\""); ( IFS=,; echo "${arr[*]}" )
+  # With a proxy on this relay the forwards are optional (NO_PORTS_OK=1).
+  [ ${#arr[@]} -eq 0 ] && [ "${NO_PORTS_OK:-0}" != 1 ] && arr+=("\"443/both\""); ( IFS=,; echo "${arr[*]}" )
 }
 
 # jstr TEXT — TEXT escaped for use inside a JSON string. Typed answers
@@ -877,6 +973,7 @@ build_extra(){ local role="$1" tr="$2" dir="${3:-reverse}" enc="${4:-}"; EXTRA="
   local dials=0
   { [ "$role" = client ] && [ "$dir" = reverse ]; } || { [ "$role" = server ] && [ "$dir" = direct ]; } && dials=1
   if [ "$enc" = tls ]; then local lis=1; [ "$dials" = 1 ] && lis=0; tls_extra "$lis"; fi
+  stealth_extra "$enc" "$dials"
   case "$tr" in
     ws)
       EXTRA="\"ws_path\":\"$(jstr "$(ask 'WebSocket path' '/')")\","
@@ -949,6 +1046,10 @@ server_summary(){
   ip="$(detect_ip)"; ip="${ip:-YOUR-RELAY-IP}"
   local bport="${bind##*:}"
   echo
+  if [ -z "$portspec" ]; then
+    echo -e "  ${C_D}No port forwards. The FOREIGN server connects to ${C_N}$ip:$bport${C_D} — that is its remote_addr.${C_N}"
+    return 0
+  fi
   echo -e "  ${C_B}These two ports do different jobs — do not mix them up.${C_N}"
   echo
   echo -e "  ${C_G}Users / client configs connect to:${C_N}"
@@ -991,6 +1092,21 @@ server_summary_direct(){
   echo -e "  ${C_D}Direct mode: this server CONNECTS to ${C_N}$remote${C_D} (${bproto^^}); no tunnel port is open here.${C_N}"
   echo -e "  ${C_D}On the FOREIGN server create the tunnel with direction ${C_N}direct${C_D}, listening on port ${C_N}${remote##*:}${C_D},${C_N}"
   echo -e "  ${C_D}and allow ${bproto^^} ${remote##*:} inbound in its firewall.${C_N}"
+}
+
+# socks_summary CFG — where to point a browser or an app at the relay's proxy.
+socks_summary(){
+  local s u pw ip; s="$(jget "$1" socks)"; [ -n "$s" ] || return 0
+  u="$(jget "$1" socks_user)"; pw="$(jget "$1" socks_pass)"
+  ip="$(detect_ip)"; ip="${ip:-YOUR-RELAY-IP}"
+  echo
+  echo -e "  ${C_G}Proxy (SOCKS5 and HTTP on the same port):${C_N}"
+  case "$s" in
+    127.0.0.1:*|localhost:*) echo -e "      ${C_Y}$s${C_N}  ${C_D}(this server only: apps on it, or an SSH tunnel)${C_N}" ;;
+    *) echo -e "      ${C_Y}$ip:${s##*:}${C_N}"
+       [ -n "$u" ] && echo -e "  ${C_D}  user:${C_N} $u   ${C_D}password:${C_N} $pw"
+       echo -e "  ${C_D}  e.g. socks5://${u:+$u:$pw@}$ip:${s##*:}   — allow TCP ${s##*:} in this server's firewall.${C_N}" ;;
+  esac
 }
 
 # write_tunnel_cfg writes the config for a point-to-point tunnel: the kernel
@@ -1215,7 +1331,13 @@ create_tunnel(){
         bind="$(check_bind "$bind")"
         addrline="\"bind_addr\": \"$bind\","
       fi
-      ports=$(ask_ports "$name")
+      socks_extra "$tr" "$name"
+      if [ -n "$SOCKSJSON" ]; then
+        info "Port forwards are optional with a proxy: press Enter at once for none."
+        ports=$(NO_PORTS_OK=1 ask_ports "$name")
+      else
+        ports=$(ask_ports "$name")
+      fi
       [ "$dir" = direct ] || warn_port_clash "" "$name" "${bind##*:}" "$bproto"
       token=$(ask "Shared token" "$(gen_token)")
       echo -e "  ${C_D}Traffic quota (optional) — leave blank for unlimited. Once reached, the${C_N}"
@@ -1238,7 +1360,7 @@ create_tunnel(){
   "direction": "$dir",
   $addrline
   "ports": [$ports],
-  $TLSJSON$EXTRA
+  $TLSJSON$EXTRA$SOCKSJSON
   "keepalive": $ka,
   "kcp_mode": "$kmode", "kcp_data": $kdata, "kcp_parity": $kparity,
   "quota_total_gb": $qtotal, "quota_up_gb": $qup, "quota_down_gb": $qdown,
@@ -1249,6 +1371,7 @@ EOF
       info "Saved $cfg"
       if [ "$dir" = direct ]; then server_summary_direct "$remote" "$ports" "$bproto"
       else server_summary "$bind" "$ports"; fi
+      [ -n "$SOCKSJSON" ] && socks_summary "$cfg"
     else
       local remote="" bind="" addrline token target
       if [ "$dir" = direct ]; then
@@ -1961,7 +2084,7 @@ service_check(){
 # addresses. It also clears settings that belong to the OLD transport so a
 # leftover field cannot confuse the new one.
 change_transport(){
-  local n="$1"; local cfg="$CFG_DIR/$n.json"
+  local n="$1"; local cfg="$CFG_DIR/$n.json" k
   local cur curenc mode; cur="$(jget "$cfg" transport)"; curenc="$(jget "$cfg" encryption)"; mode="$(jget "$cfg" mode)"
   # A config written by an older build may still carry a retired combined name.
   # The core reads "tcpobf" as tcp+obfs; show and compare it the same way, or
@@ -1997,19 +2120,13 @@ change_transport(){
     *)        jset "$cfg" pool_size "" del; jset "$cfg" links "" del ;;
   esac
   [ "$new" != sctp ] && { jset "$cfg" sctp_streams "" del; jset "$cfg" sctp_multihoming "" del; }
+  [ "$new" != ws ] && for k in ws_path ws_host ws_user_agent; do jset "$cfg" "$k" "" del; done
   # Settings only quic had (removed in 2.3.22). alpn and server_name now
   # belong to the tls layer, so they stay while the tunnel keeps tls.
   jset "$cfg" udp_duplicate "" del
-  if [ "$newenc" != tls ]; then
-    for k in alpn server_name tls_cert tls_key tls_selfsigned tls_insecure tls_auto_email tls_auto_cache tls_fingerprint; do jset "$cfg" "$k" "" del; done
-  elif [ "$curenc" != tls ]; then
-    # Switching TO tls: ask the certificate questions for this end's role
-    # (the listening end presents a certificate, the dialing end verifies it).
-    # Without them the config said "tls" with no certificate and never started.
-    local lis=0; tunnel_listens "$cfg" && lis=1
-    TLSJSON=""; tls_extra "$lis"
-    jmerge "$cfg" "{${TLSJSON%,}}"
-  fi
+  enc_switch "$cfg" "$curenc" "$newenc"
+  # tcpnomux does not multiplex, so it cannot carry the proxy.
+  [ "$new" = tcpnomux ] && for k in socks socks_user socks_pass socks_open; do jset "$cfg" "$k" "" del; done
   cfg_commit "$cfg" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
   info "transport: $cur/$curenc -> $new/$newenc"
   if tunnel_listens "$cfg" && is_udp_transport "$new" && ! is_udp_transport "$cur"; then
@@ -2022,6 +2139,132 @@ change_transport(){
   read -t 30 -rp "  ▶ press ENTER to continue... " _
 }
 
+# enc_switch CFG FROM TO — move a config from one encryption layer to another:
+# drop the settings of the old layer and ask the ones the new layer needs for
+# this end's role (the listening end presents a certificate or the borrowed
+# site, the dialing end verifies it and shapes the ClientHello). Without the
+# questions a switch to tls left a config with no certificate that never ran.
+enc_switch(){
+  local cfg="$1" from="$2" to="$3" k
+  if [ "$to" != tls ]; then
+    for k in alpn server_name tls_cert tls_key tls_selfsigned tls_insecure tls_auto_email tls_auto_cache tls_fingerprint; do jset "$cfg" "$k" "" del; done
+  fi
+  [ "$to" != reality ] && for k in reality_dest reality_server_name; do jset "$cfg" "$k" "" del; done
+  case "$to" in tls|reality) : ;; *) jset "$cfg" tls_fragment "" del ;; esac
+  [ "$to" = "$from" ] && return 0
+  local lis=0 dials=1; tunnel_listens "$cfg" && { lis=1; dials=0; }
+  TLSJSON=""
+  case "$to" in
+    tls)
+      tls_extra "$lis"
+      [ "$dials" = 1 ] && TLSJSON="$TLSJSON\"tls_fingerprint\":\"$(pick_fingerprint)\","
+      [ "$dials" = 1 ] && yes_no "Fragment the ClientHello (tls_fragment)? y/N" n && TLSJSON="$TLSJSON\"tls_fragment\":true,"
+      ;;
+    reality)
+      TLSJSON="\"reality_dest\":\"$(jstr "$(ask_reality_dest)")\","
+      [ "$dials" = 1 ] && yes_no "Fragment the ClientHello (tls_fragment)? y/N" n && TLSJSON="$TLSJSON\"tls_fragment\":true,"
+      ;;
+  esac
+  [ -n "$TLSJSON" ] && jmerge "$cfg" "{${TLSJSON%,}}"
+  return 0
+}
+
+# onoff CFG KEY — "on" or "off" for a true/false setting.
+onoff(){ case "$(jget "$1" "$2")" in True|true|1) echo on ;; *) echo off ;; esac; }
+
+# toggle WORK KEY QUESTION CURRENT(on|off) — ask, keeping CURRENT on Enter,
+# and write the answer (an "off" setting is removed, not written as false).
+toggle(){
+  local work="$1" key="$2" q="$3" cur="$4"
+  if [ "$cur" = on ]; then
+    if yes_no "$q (now on) Y/n" y; then jset "$work" "$key" true bool; else jset "$work" "$key" "" del; fi
+  else
+    if yes_no "$q (now off) y/N" n; then jset "$work" "$key" true bool; else jset "$work" "$key" "" del; fi
+  fi
+}
+
+# edit_security NAME — the encryption layer and everything that goes with it:
+# the token, the tls certificate and name, the reality site, the browser
+# fingerprint, the split ClientHello and padding. Edited on a copy that the
+# core checks before it replaces the config, like Tune settings.
+edit_security(){
+  local n="$1"; local cfg="$CFG_DIR/$n.json"
+  local tr enc fam v cur; tr="$(jget "$cfg" transport)"; enc="$(jget "$cfg" encryption)"; enc="${enc:-none}"
+  fam=$(transport_family "$tr")
+  local work="$CFG_DIR/.tune-$n.json"
+  cp -p "$cfg" "$work" || { err "Could not prepare the edit."; return; }
+  trap 'rm -f "$work"' RETURN
+  echo; echo -e "${C_B}  Encryption & stealth of '$n'${C_N}  ${C_D}($tr, encryption: $enc) — blank keeps the current value${C_N}"
+  echo -e "  ${C_D}──────────────────────────────────────────────${C_N}"
+  if [ "$fam" = stream ] || [ "$tr" = udp ] || [ "$tr" = icmp ]; then
+    if yes_no "Change the encryption layer (now $enc)? y/N" n; then
+      local newenc; newenc=$(pick_encryption "$tr")
+      jset "$work" encryption "$newenc"
+      enc_switch "$work" "$enc" "$newenc"
+      enc="$newenc"
+    fi
+  else
+    echo -e "  ${C_D}$tr is a kernel tunnel: it has no encryption layer (encrypt in the service, e.g. xray).${C_N}"
+  fi
+  v=$(ask "Shared token (same on both ends; blank keeps the current one)" "")
+  [ -n "$v" ] && jset "$work" token "$v"
+  if [ "$fam" = stream ]; then
+    local dials=1; tunnel_listens "$cfg" && dials=0
+    case "$enc" in
+      tls)
+        cur="$(jget "$work" server_name)"
+        v=$(ask "  server_name / SNI (same on both ends; '-' clears) [${cur:-none}]" "")
+        if [ "$v" = - ]; then jset "$work" server_name "" del; elif [ -n "$v" ]; then jset "$work" server_name "$v"; fi
+        cur="$(jget "$work" alpn)"
+        v=$(ask "  alpn ('-' = default h2,http/1.1) [${cur:-default}]" "")
+        if [ "$v" = - ]; then jset "$work" alpn "" del; elif [ -n "$v" ]; then jset "$work" alpn "$v"; fi
+        if [ "$dials" = 1 ]; then
+          jset "$work" tls_fingerprint "$(pick_fingerprint "$(jget "$work" tls_fingerprint)")"
+          toggle "$work" tls_fragment "  Fragment the ClientHello (tls_fragment)?" "$(onoff "$work" tls_fragment)"
+        fi ;;
+      reality)
+        jset "$work" reality_dest "$(ask_reality_dest "$(jget "$work" reality_dest)")"
+        if [ "$dials" = 1 ]; then
+          cur="$(jget "$work" reality_server_name)"
+          v=$(ask "  SNI to show ('-' = the site name) [${cur:-same as the site}]" "")
+          if [ "$v" = - ]; then jset "$work" reality_server_name "" del; elif [ -n "$v" ]; then jset "$work" reality_server_name "$v"; fi
+          toggle "$work" tls_fragment "  Fragment the ClientHello (tls_fragment)?" "$(onoff "$work" tls_fragment)"
+        fi ;;
+    esac
+    toggle "$work" pad "  Padding (pad; must match the other end)?" "$(onoff "$work" pad)"
+  fi
+  tune_apply "$n" "$cfg" "$work" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
+  info "saved, '$n' restarted"
+  warn "Make the SAME change on the other server (encryption, token, reality site, padding), or they will not connect."
+  read -t 30 -rp "  ▶ press ENTER to continue... " _
+}
+
+# edit_proxy NAME — turn the relay's SOCKS5/HTTP proxy on or off, or change its
+# port and login.
+edit_proxy(){
+  local n="$1"; local cfg="$CFG_DIR/$n.json" tr k
+  tr="$(jget "$cfg" transport)"
+  if [ "$(jget "$cfg" mode)" != server ] || [ "$(transport_family "$tr")" != stream ] || [ "$tr" = tcpnomux ]; then
+    warn "The proxy runs on the Iran server (server mode) over tcp, mtcp, mptcp, ws, kcp or sctp."
+    read -t 30 -rp "  ▶ press ENTER to continue... " _; return
+  fi
+  local work="$CFG_DIR/.tune-$n.json"
+  cp -p "$cfg" "$work" || { err "Could not prepare the edit."; return; }
+  trap 'rm -f "$work"' RETURN
+  local now; now="$(jget "$cfg" socks)"
+  echo; echo -e "${C_B}  Proxy of '$n'${C_N}  ${C_D}(now: ${now:-off})${C_N}"
+  socks_extra "$tr" "$n" "$cfg"
+  for k in socks socks_user socks_pass socks_open; do jset "$work" "$k" "" del; done
+  [ -n "$SOCKSJSON" ] && jmerge "$work" "{${SOCKSJSON%,}}"
+  if [ -z "$SOCKSJSON" ] && [ "$(jq_ports "$work")" = "" ]; then
+    warn "This tunnel has no port forwards: without the proxy it would carry nothing. Add ports first (17)."
+  fi
+  tune_apply "$n" "$cfg" "$work" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
+  info "saved, '$n' restarted"
+  socks_summary "$cfg"
+  read -t 30 -rp "  ▶ press ENTER to continue... " _
+}
+
 # change_relay_ip updates the IP this end dials, keeping the port: the Iran
 # relay's IP on a foreign server in reverse mode (needed every time the relay's
 # IP changes), or the foreign server's IP on the relay in direct mode.
@@ -2029,7 +2272,20 @@ change_relay_ip(){
   local n="$1"; local cfg="$CFG_DIR/$n.json"
   local fam; fam="$(transport_family "$(jget "$cfg" transport)")"
   if [ "$fam" != stream ]; then
-    warn "'$n' is a point-to-point tunnel: change remote_ip with 'Edit config' instead."
+    # A point-to-point tunnel names the other server by remote_ip, in the
+    # family (IPv4 or IPv6) local_ip already uses.
+    local cur newip isfam=is_ipv4; cur="$(jget "$cfg" remote_ip)"
+    case "$(jget "$cfg" local_ip)" in *:*) isfam=is_ipv6 ;; esac
+    echo; echo -e "${C_B}  Change the other server's IP for '$n'${C_N}  ${C_D}(current: $cur)${C_N}"
+    newip=$(ask "New IP of the other server" ""); newip="${newip// /}"; newip="${newip#[}"; newip="${newip%]}"
+    [ -z "$newip" ] && { warn "cancelled"; return; }
+    $isfam "$newip" || { err "'$newip' is not an address of the same family as local_ip ($(jget "$cfg" local_ip))."; return; }
+    cfg_begin "$cfg"
+    jset "$cfg" remote_ip "$newip"
+    cfg_commit "$cfg" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
+    info "remote_ip: $cur -> $newip"
+    warn "On the other server, set local_ip to $newip too (11 Tune settings)."
+    service_check "$n"
     read -t 30 -rp "  ▶ press ENTER to continue... " _; return
   fi
   if tunnel_listens "$cfg"; then
@@ -2349,6 +2605,33 @@ tune_tunnel(){
       cur="$(jget "$cfg" tun_ttl)"
       v=$(ask "  tun_ttl (outer TTL, 0 = kernel default) [${cur:-0}]" ""); [ -n "$v" ] && jset "$work" tun_ttl "$v" int
     fi
+    echo -e "  ${C_D}The values below must match the other end (its local is your remote).${C_N}"
+    cur="$(jget "$cfg" local_ip)"
+    v=$(ask "  local_ip (this server's real IP) [$cur]" ""); [ -n "$v" ] && jset "$work" local_ip "${v// /}"
+    cur="$(jget "$cfg" remote_ip)"
+    v=$(ask "  remote_ip (the other server's real IP) [$cur]" ""); [ -n "$v" ] && jset "$work" remote_ip "${v// /}"
+    cur="$(jget "$cfg" tun_local)"
+    v=$(ask "  tun_local (this end's tunnel address) [$cur]" ""); [ -n "$v" ] && jset "$work" tun_local "${v// /}"
+    cur="$(jget "$cfg" tun_remote)"
+    v=$(ask "  tun_remote (the other end's tunnel address) [$cur]" ""); [ -n "$v" ] && jset "$work" tun_remote "${v// /}"
+    case "$tr" in
+      gre|gretap)
+        cur="$(jget "$cfg" gre_key)"
+        v=$(ask "  gre_key (0 = none, same on both ends) [${cur:-0}]" ""); [ -n "$v" ] && jset "$work" gre_key "$v" int ;;
+      l2tp)
+        cur="$(jget "$cfg" l2tp_tunnel_id)"
+        v=$(ask "  l2tp_tunnel_id (same on both ends) [${cur:-1000}]" ""); [ -n "$v" ] && jset "$work" l2tp_tunnel_id "$v" int
+        cur="$(jget "$cfg" l2tp_session_id)"
+        v=$(ask "  l2tp_session_id (same on both ends) [${cur:-1000}]" ""); [ -n "$v" ] && jset "$work" l2tp_session_id "$v" int
+        cur="$(jget "$cfg" l2tp_encap)"
+        v=$(ask "  l2tp_encap (udp/ip) [${cur:-udp}]" ""); [ -n "$v" ] && jset "$work" l2tp_encap "$v"
+        cur="$(jget "$cfg" l2tp_port)"
+        v=$(ask "  l2tp_port (udp encap, same on both ends) [${cur:-1701}]" ""); [ -n "$v" ] && jset "$work" l2tp_port "$v" int ;;
+      udp|icmp)
+        cur="$(jget "$cfg" carrier_port)"
+        v=$(ask "  carrier_port ($([ "$tr" = icmp ] && echo 'icmp tunnel id' || echo 'udp port'), same on both ends) [${cur:-6262}]" "")
+        [ -n "$v" ] && jset "$work" carrier_port "$v" int ;;
+    esac
     if [ "$mode" = client ]; then
       cur="$(jget "$cfg" target_host)"
       v=$(ask "  target_host (where traffic is delivered locally) [$cur]" ""); [ -n "$v" ] && jset "$work" target_host "$v"
@@ -2396,11 +2679,29 @@ tune_tunnel(){
       cur="$(jget "$cfg" links)"
       echo -e "  ${C_D}links: 0 = auto-scale with load (recommended)${C_N}"
       v=$(ask "  links [${cur:-0}]" ""); [ -n "$v" ] && jset "$work" links "$v" int
+      cur="$(jget "$cfg" links_max)"
+      v=$(ask "  links_max (auto: most links, 0 = no cap) [${cur:-0}]" ""); [ -n "$v" ] && jset "$work" links_max "$v" int
+      cur="$(jget "$cfg" links_per_link)"
+      v=$(ask "  links_per_link (auto: users per link before another opens) [${cur:-1}]" ""); [ -n "$v" ] && jset "$work" links_per_link "$v" int
       ;;
     tcpnomux)
       cur="$(jget "$cfg" pool_size)"
       echo -e "  ${C_D}pool_size: 0 = auto-scale with load (recommended)${C_N}"
       v=$(ask "  pool_size [${cur:-0}]" ""); [ -n "$v" ] && jset "$work" pool_size "$v" int
+      cur="$(jget "$cfg" pool_min_idle)"
+      v=$(ask "  pool_min_idle (auto: idle connections kept ready) [${cur:-16}]" ""); [ -n "$v" ] && jset "$work" pool_min_idle "$v" int
+      ;;
+    ws)
+      cur="$(jget "$cfg" ws_path)"
+      v=$(ask "  ws_path (same on both ends) [${cur:-/}]" ""); [ -n "$v" ] && jset "$work" ws_path "$v"
+      if ! tunnel_listens "$cfg"; then
+        cur="$(jget "$cfg" ws_host)"
+        v=$(ask "  ws_host (fake Host header; '-' clears) [${cur:-none}]" "")
+        if [ "$v" = - ]; then jset "$work" ws_host "" del; elif [ -n "$v" ]; then jset "$work" ws_host "$v"; fi
+        cur="$(jget "$cfg" ws_user_agent)"
+        v=$(ask "  ws_user_agent ('-' = default) [${cur:-default}]" "")
+        if [ "$v" = - ]; then jset "$work" ws_user_agent "" del; elif [ -n "$v" ]; then jset "$work" ws_user_agent "$v"; fi
+      fi
       ;;
     sctp)
       cur="$(jget "$cfg" sctp_streams)"
@@ -2416,6 +2717,8 @@ tune_tunnel(){
   v=$(ask "  smux_recv_mb (session window MB; larger = more throughput on long links) [${cur:-16}]" ""); [ -n "$v" ] && jset "$work" smux_recv_mb "$v" int
   cur="$(jget "$cfg" smux_stream_mb)"
   v=$(ask "  smux_stream_mb (per-stream window MB) [${cur:-8}]" ""); [ -n "$v" ] && jset "$work" smux_stream_mb "$v" int
+  cur="$(jget "$cfg" smux_frame_kb)"
+  v=$(ask "  smux_frame_kb (largest frame KB; 0 = default) [${cur:-0}]" ""); [ -n "$v" ] && jset "$work" smux_frame_kb "$v" int
 
   if [ "$(transport_family "$tr")" = stream ]; then
     if tunnel_listens "$cfg"; then
@@ -2517,10 +2820,12 @@ manage_tunnels(){
       echo "   4) Live logs   5) Show config   6) Edit config (nano)"
       echo "   7) Delete   8) Live stats"
       echo -e "   ${C_G}9) Change transport${C_N}   ${C_G}10) Change peer IP${C_N}   ${C_G}11) Tune settings (MTU/FEC/window...)${C_N}"
-      echo -e "   ${C_G}13) Change direction${C_N}  ${C_D}[$(tunnel_direction "$CFG_DIR/$n.json")]${C_N}"
+      echo -e "   ${C_G}13) Change direction${C_N}  ${C_D}[$(tunnel_direction "$CFG_DIR/$n.json")]${C_N}   ${C_G}14) Encryption & stealth${C_N}  ${C_D}(token, tls, reality, fingerprint, fragment, pad)${C_N}"
       echo -e "   ${C_G}15) Speed test${C_N}  ${C_D}(download/upload/ping through this tunnel)${C_N}"
       echo -e "   ${C_G}16) Apply preset${C_N}  ${C_D}(Optimized/High-Speed/Stable/Low-Latency/Eco)${C_N}   ${C_G}17) Port-forwards${C_N}  ${C_D}(add / remove / replace)${C_N}"
       echo -e "   ${C_G}18) Diagnose${C_N}  ${C_D}(connected but users get nothing? checks every port end to end, firewall, NAT rules)${C_N}"
+      local sx; sx="$(jget "$CFG_DIR/$n.json" socks)"
+      [ "$(jget "$CFG_DIR/$n.json" mode)" = server ] && echo -e "   ${C_G}19) Proxy${C_N}  ${C_D}(SOCKS5/HTTP proxy on this server: on/off, port, login) [${sx:-off}]${C_N}"
       echo "   0) Back"
       case "$(menu_ask 'Choice')" in
         1) systemctl enable --now "brokennode@$n" >/dev/null 2>&1; systemctl start "brokennode@$n"; info "started";;
@@ -2544,10 +2849,12 @@ manage_tunnels(){
         11) tune_tunnel "$n";;
         12) warn "Duplicate UDP packets was removed with quic in 2.3.22 (only quic could carry it).";;
         13) change_direction "$n";;
+        14) edit_security "$n";;
         15) speed_test "$n"; read -t 120 -rp "  ▶ press ENTER to continue... " _;;
         16) apply_preset "$n";;
         17) manage_ports "$n";;
         18) diagnose "$n";;
+        19) edit_proxy "$n";;
         __eof__) return;;
         0) break;;
         *) warn "Invalid.";;

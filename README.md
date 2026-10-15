@@ -115,16 +115,28 @@ Direction applies to the stream transports (`tcp` `mtcp` `mptcp` `ws`
 Install on **both** servers. Both ends must agree on the transport, the
 encryption layer and the token.
 
-### Pairing code — set up the foreign server without typing anything
+### Every setting is asked, and can be changed later
 
-Create the tunnel on the **Iran** server first. The manager picks every value
-that must not clash with this server's other tunnels by itself — tunnel subnet,
-gre key, l2tp ids and port, carrier ports, listen port — and prints a one-line
-**pairing code** (`BN1:…`). On the **foreign** server choose *Create CLIENT
-tunnel* and paste it: the whole config is built from it, checked against what
-that server already uses, started, and the manager waits until it connects.
-*Manage → 14) Pairing code* shows it again. The code contains the token — share
-it like the token.
+Creating a tunnel asks for everything it can use, on the end it belongs to:
+the encryption layer (`aead`, `obfs`, `tls`, `reality`, `none`), the tls
+certificate, the site `reality` borrows, the browser fingerprint and the split
+ClientHello (on the end that connects), padding, and on the Iran server an
+optional SOCKS5/HTTP proxy with a login. Afterwards, under *Manage tunnels → a
+tunnel*:
+
+| Item | Changes |
+|---|---|
+| 9) Change transport | the transport and the encryption layer |
+| 10) Change peer IP | the other server's IP (stream and point-to-point tunnels) |
+| 11) Tune settings | keepalive, kcp, links, pool, ws path and headers, smux windows, addresses, quota, MTU, gre key, l2tp ids, carrier port, `target_host`, log level |
+| 13) Change direction | reverse ↔ direct |
+| 14) Encryption & stealth | encryption layer, token, tls name and ALPN, `reality_dest`, fingerprint, `tls_fragment`, `pad` |
+| 17) Port-forwards | add, remove or replace the forwarded ports |
+| 19) Proxy | the SOCKS5/HTTP proxy on/off, its port and login (Iran server) |
+
+Every change is checked by the core before it replaces the config; a change it
+refuses leaves the tunnel as it was. Settings marked "same on both ends" must be
+changed on the other server too.
 
 **Which transport under load?** On a path that loses packets, every user sharing
 one TCP link waits behind each loss (head-of-line blocking). `mtcp` therefore
@@ -144,7 +156,11 @@ encryption layer decides what they look like on the way.
 `gre` · `gretap` · `ipip` · `sit` · `l2tp` (kernel) · `udp` · `icmp` (TUN)
 
 **Encryption:** `none` · `obfs` (AES-CTR keystream) · `aead`
-(ChaCha20-Poly1305, authenticated — recommended)
+(ChaCha20-Poly1305, authenticated — recommended) · `tls` (real HTTPS with a
+certificate: self-signed, from files or Let's Encrypt) · `reality` (borrows a
+real site's HTTPS, no domain or certificate; a prober is passed through to that
+site). On top of any of them: `pad` (hides packet sizes and timing, both ends)
+and, on the end that connects, `tls_fingerprint` and `tls_fragment`.
 
 | Transport | What it is | Needs |
 |---|---|---|
@@ -373,7 +389,12 @@ Per-transport: `pool_size`, `pool_min_idle`, `links` (mtcp; for kcp the
 number of parallel sessions, default 4, 1 in gaming mode), `links_max`,
 `links_per_link`, `kcp_mode`, `kcp_data`, `kcp_parity`, `kcp_mtu`, `kcp_sndwnd`,
 `kcp_rcvwnd`, `smux_recv_mb`, `smux_stream_mb`, `smux_frame_kb`, `server_name`, `alpn`,
-`sctp_streams`, `sctp_multihoming`
+`sctp_streams`, `sctp_multihoming`, `ws_path`, `ws_host`, `ws_user_agent`
+
+Encryption extras: `tls_selfsigned`, `tls_cert` + `tls_key`, `tls_auto_email`,
+`tls_insecure`, `tls_fingerprint` (`chrome` `firefox` `safari` `edge` `ios`
+`random`), `tls_fragment`, `reality_dest` (`host:443`, same on both ends),
+`reality_server_name`, `pad` (same on both ends)
 
 Point-to-point tunnels: `local_ip`, `remote_ip` (the two servers' real IPv4
 addresses), `tun_local`, `tun_remote` (the pair on the tunnel — IPv6 for `sit`),
@@ -520,15 +541,26 @@ user ──► Iran relay :2052 ──[ tunnel ]──► foreign node ──►
 روی **هر دو** سرور نصب کن. دو طرف باید روی ترنسپورت، لایهٔ رمزنگاری و توکن
 یکسان توافق داشته باشند.
 
-### کد جفت‌سازی — راه‌اندازی سرور خارج بدون تایپ هیچ تنظیمی
+### همهٔ تنظیمات پرسیده می‌شوند و بعداً قابل تغییرند
 
-اول تانل را روی سرور **ایران** بساز. منیجر هر مقداری را که نباید با تانل‌های دیگر
-این سرور تداخل کند خودش انتخاب می‌کند — زیرشبکهٔ تانل، کلید gre، شناسه و پورت
-l2tp، پورت حامل، پورت شنود — و در آخر یک **کد جفت‌سازی** یک‌خطی (`BN1:…`) نشان
-می‌دهد. روی سرور **خارج** گزینهٔ *Create CLIENT tunnel* را بزن و کد را بچسبان:
-کل کانفیگ از روی آن ساخته می‌شود، با چیزهایی که آن سرور از قبل استفاده می‌کند
-مقایسه می‌شود، اجرا می‌شود و منیجر تا وصل شدن صبر می‌کند. در *Manage → 14) Pairing
-code* دوباره نمایش داده می‌شود. کد شامل توکن است — مثل توکن از آن محافظت کن.
+ساخت تانل هر تنظیمی را که به کار می‌آید، روی همان طرفی که لازم است می‌پرسد: لایهٔ
+رمزنگاری (`aead`، `obfs`، `tls`، `reality`، `none`)، گواهی tls، سایتی که `reality`
+از آن استفاده می‌کند، اثرانگشت مرورگر و تکه‌تکه کردن ClientHello (روی طرفی که وصل
+می‌شود)، padding، و روی سرور ایران پروکسی اختیاری SOCKS5/HTTP با نام کاربری و رمز.
+بعداً در *Manage tunnels ← یک تانل*:
+
+| گزینه | چه چیزی را عوض می‌کند |
+|---|---|
+| 9) Change transport | ترنسپورت و لایهٔ رمزنگاری |
+| 10) Change peer IP | IP سرور مقابل (تانل‌های استریم و نقطه‌به‌نقطه) |
+| 11) Tune settings | keepalive، kcp، links، pool، مسیر و هدرهای ws، پنجره‌های smux، آدرس‌ها، سهمیه، MTU، کلید gre، شناسه‌های l2tp، پورت حامل، `target_host`، سطح لاگ |
+| 13) Change direction | ریورس ↔ دایرکت |
+| 14) Encryption & stealth | لایهٔ رمزنگاری، توکن، نام و ALPN در tls، `reality_dest`، اثرانگشت، `tls_fragment`، `pad` |
+| 17) Port-forwards | افزودن، حذف یا جایگزینی پورت‌ها |
+| 19) Proxy | روشن/خاموش کردن پروکسی SOCKS5/HTTP، پورت و نام کاربری و رمز (سرور ایران) |
+
+هر تغییر قبل از جایگزین شدن توسط هسته چک می‌شود؛ تغییری که رد شود تانل را دست‌نخورده
+می‌گذارد. تنظیماتی که «در هر دو طرف یکسان» هستند را روی سرور دیگر هم عوض کن.
 
 **زیر بار کدام ترنسپورت؟** در مسیری که بسته گم می‌کند، هر کاربری که روی یک لینک TCP
 مشترک است پشت هر بستهٔ گم‌شده منتظر می‌ماند. برای همین `mtcp` حالا به‌طور پیش‌فرض
@@ -548,7 +580,11 @@ code* دوباره نمایش داده می‌شود. کد شامل توکن ا�
 `gre` · `gretap` · `ipip` · `sit` · `l2tp` (کرنلی) · `udp` · `icmp` (TUN)
 
 **رمزنگاری:** `none` · `obfs` (کی‌استریم AES-CTR) · `aead`
-(ChaCha20-Poly1305 با احراز اصالت — پیشنهادی)
+(ChaCha20-Poly1305 با احراز اصالت — پیشنهادی) · `tls` (HTTPS واقعی با گواهی:
+self-signed، فایل یا Let's Encrypt) · `reality` (HTTPS یک سایت واقعی را قرض می‌گیرد،
+بدون دامنه و گواهی؛ کسی که پورت را بررسی کند به همان سایت فرستاده می‌شود). روی هر
+کدام: `pad` (اندازه و زمان‌بندی بسته‌ها را پنهان می‌کند، هر دو طرف) و روی طرفی که وصل
+می‌شود `tls_fingerprint` و `tls_fragment`.
 
 | ترنسپورت | چیست | پیش‌نیاز |
 |---|---|---|
@@ -778,7 +814,12 @@ brokennode version
 مخصوص هر ترنسپورت: `pool_size`، `pool_min_idle`، `links`، `links_max`،
 `links_per_link`، `kcp_mode`، `kcp_data`، `kcp_parity`، `kcp_mtu`،
 `kcp_sndwnd`، `kcp_rcvwnd`، `smux_recv_mb`، `smux_stream_mb`، `smux_frame_kb`، `server_name`،
-`alpn`، `sctp_streams`، `sctp_multihoming`
+`alpn`، `sctp_streams`، `sctp_multihoming`، `ws_path`، `ws_host`، `ws_user_agent`
+
+رمزنگاری: `tls_selfsigned`، `tls_cert` + `tls_key`، `tls_auto_email`،
+`tls_insecure`، `tls_fingerprint` (`chrome` `firefox` `safari` `edge` `ios`
+`random`)، `tls_fragment`، `reality_dest` (`host:443`، در هر دو طرف یکسان)،
+`reality_server_name`، `pad` (در هر دو طرف یکسان)
 
 تونل‌های نقطه‌به‌نقطه: `local_ip`، `remote_ip` (IPv4 واقعی دو سرور)،
 `tun_local`، `tun_remote` (جفت آدرس روی تونل — برای `sit` از نوع IPv6)،
