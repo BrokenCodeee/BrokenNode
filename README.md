@@ -401,6 +401,12 @@ number of parallel sessions, default 4, 1 in gaming mode), `links_max`,
 `kcp_rcvwnd`, `smux_recv_mb`, `smux_stream_mb`, `smux_frame_kb`, `server_name`, `alpn`,
 `sctp_streams`, `sctp_multihoming`, `ws_path`, `ws_host`, `ws_user_agent`
 
+The smux windows are what each link may buffer for users who read slower than
+the tunnel delivers. One session carries every user on `tcp`, `ws` and `kcp`
+(16 MB or more by default); `mtcp` has a session per link, so its default
+scales with RAM — 1 MB per stream on a server of less than 4 GB, up to 4 MB — and
+a stream carries about window ÷ ping (1 MB: ~70 Mbit/s at 120 ms).
+
 Encryption extras: `tls_selfsigned`, `tls_cert` + `tls_key`, `tls_auto_email`,
 `tls_insecure`, `tls_fingerprint` (`chrome` `firefox` `safari` `edge` `ios`
 `random`), `tls_fragment`, `reality_dest` (`host:443`, same on both ends),
@@ -833,6 +839,12 @@ brokennode version
 `links_per_link`، `kcp_mode`، `kcp_data`، `kcp_parity`، `kcp_mtu`،
 `kcp_sndwnd`، `kcp_rcvwnd`، `smux_recv_mb`، `smux_stream_mb`، `smux_frame_kb`، `server_name`،
 `alpn`، `sctp_streams`، `sctp_multihoming`، `ws_path`، `ws_host`، `ws_user_agent`
+
+پنجره‌های smux مقداری است که هر لینک می‌تواند برای کاربرانی که کندتر از تانل داده را می‌خوانند
+نگه دارد. در `tcp`، `ws` و `kcp` یک session همهٔ کاربران را می‌برد (پیش‌فرض ۱۶ مگابایت یا بیشتر)؛
+`mtcp` برای هر لینک یک session دارد، پس پیش‌فرضش با RAM تغییر می‌کند — روی سرور کمتر از ۴ گیگابایت
+۱ مگابایت برای هر stream، و حداکثر ۴ — و هر stream حدود پنجره ÷ پینگ سرعت دارد (۱ مگابایت: حدود
+۷۰ مگابیت با پینگ ۱۲۰ میلی‌ثانیه).
 
 رمزنگاری: `tls_selfsigned`، `tls_cert` + `tls_key`، `tls_auto_email`،
 `tls_insecure`، `tls_fingerprint` (`chrome` `firefox` `safari` `edge` `ios`

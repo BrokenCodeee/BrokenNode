@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.10"
+VERSION="2.8.11"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -2642,9 +2642,9 @@ tune_tunnel(){
   esac
 
   cur="$(jget "$cfg" smux_recv_mb)"
-  v=$(ask "  smux_recv_mb (session window MB; larger = more throughput on long links) [${cur:-16}]" ""); [ -n "$v" ] && jset "$work" smux_recv_mb "$v" int
+  v=$(ask "  smux_recv_mb (session window MB; larger = more throughput on long links, more memory; 0 = auto: 16+, mtcp 2-8 by RAM) [${cur:-auto}]" ""); [ -n "$v" ] && jset "$work" smux_recv_mb "$v" int
   cur="$(jget "$cfg" smux_stream_mb)"
-  v=$(ask "  smux_stream_mb (per-stream window MB) [${cur:-8}]" ""); [ -n "$v" ] && jset "$work" smux_stream_mb "$v" int
+  v=$(ask "  smux_stream_mb (per-stream window MB; 0 = auto: half the session's) [${cur:-auto}]" ""); [ -n "$v" ] && jset "$work" smux_stream_mb "$v" int
   cur="$(jget "$cfg" smux_frame_kb)"
   v=$(ask "  smux_frame_kb (largest frame KB; 0 = default) [${cur:-0}]" ""); [ -n "$v" ] && jset "$work" smux_frame_kb "$v" int
 

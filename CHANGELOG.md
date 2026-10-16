@@ -3,6 +3,72 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.11
+
+### Fixed
+- **mtcp uses far less memory.** Every mtcp link is its own smux session, one
+  per concurrent user connection, and each got the full 16/8 MB windows (more
+  on large servers). Users who read slower than the tunnel delivers — a weak
+  mobile link — fill them: 60 such users held 310-342 MB on the relay where
+  tcp held 52 MB and tcpnomux 35 MB, and a relay of 1-2 GB with a few hundred
+  users runs out of memory and stalls. Unless `smux_recv_mb` / `smux_stream_mb`
+  are set, mtcp's windows now scale with RAM, 1 MB per stream on a server of
+  less than 4 GB and at most 4 MB: the same 60 users hold 43 MB. A connection carries
+  about window ÷ ping (1 MB: ~70 Mbit/s at 120 ms); each has a link of its own.
+  Update both servers: each end buffers with its own windows.
+- **A path that goes silent is reported as such.** When nothing arrives from
+  the other end for the keepalive window (a filter dropping the traffic, a
+  dead route), the disconnect line said "session closed locally (restart or
+  reconfiguration)"; it now says "keepalive timeout — no data from the peer".
+  Same for kcp's silence watchdog.
+- **A dial that times out after the tunnel had been up** no longer tells you to
+  open the port in the firewall (it was open — the tunnel used it): it says
+  the server answered earlier and packets between the servers are being
+  dropped on the way, and that it reconnects by itself when that clears.
+- **mtcp: one dial-error line per 10 s** instead of one per link — a dropped
+  tunnel redials every link at once, which wrote dozens of identical lines a
+  second; the line now counts the ones held back.
+
+### Tests
+- `TestMtcpWindowsAreSmallByDefault`; `TestSlowReadersMemory` (end-to-end,
+  `BN_SLOWREAD=1`) measures what slow-reading users cost each transport.
+- `TestPathGoesDark` (end-to-end): an mtcp tunnel whose path is cut for 40 s
+  comes back by itself within a second of the path, and the log says what
+  happened.
+
+---
+
+## فارسی — 2.8.11
+
+### رفع‌شده
+- **mtcp خیلی کمتر حافظه مصرف می‌کند.** هر لینک mtcp یک session جداگانهٔ smux است، یکی برای هر
+  اتصال همزمان کاربر، و هر کدام پنجرهٔ کامل ۱۶/۸ مگابایت می‌گرفت (روی سرورهای بزرگ بیشتر). کاربرانی که
+  کندتر از تانل داده را می‌خوانند — اینترنت ضعیف موبایل — این پنجره‌ها را پر می‌کنند: ۶۰ کاربر این‌چنینی
+  روی رله ۳۱۰ تا ۳۴۲ مگابایت گرفتند، در حالی که tcp ۵۲ و tcpnomux ۳۵ مگابایت؛ و رلهٔ ۱ تا ۲ گیگابایتی
+  با چند صد کاربر حافظه کم می‌آورد و قفل می‌شود. اگر `smux_recv_mb` / `smux_stream_mb` تنظیم نشده
+  باشند، پنجره‌های mtcp حالا با RAM تغییر می‌کنند، ۱ مگابایت برای هر stream روی سرور کمتر از ۴ گیگابایت و
+  حداکثر ۴ مگابایت: همان ۶۰ کاربر ۴۳ مگابایت می‌گیرند. هر اتصال حدود پنجره ÷ پینگ سرعت دارد
+  (۱ مگابایت: حدود ۷۰ مگابیت با پینگ ۱۲۰ میلی‌ثانیه)؛ هر اتصال لینک خودش را دارد. هر دو سرور را
+  به‌روز کن: هر طرف با پنجره‌های خودش بافر می‌کند.
+- **مسیری که ساکت می‌شود درست گزارش می‌شود.** وقتی در بازهٔ keepalive هیچ چیز از سرور مقابل
+  نمی‌رسد (فیلتری که ترافیک را دور می‌ریزد، مسیر قطع)، پیام قطع می‌گفت «session closed locally
+  (restart or reconfiguration)»؛ حالا می‌گوید «keepalive timeout — no data from the peer».
+  برای ناظر سکوت kcp هم همین‌طور.
+- **dial ای که بعد از وصل بودن تانل timeout می‌خورد** دیگر نمی‌گوید پورت را در فایروال باز کن
+  (باز بود — تانل از آن استفاده می‌کرد): می‌گوید سرور قبلاً جواب داده و بسته‌ها بین دو سرور در
+  مسیر دور ریخته می‌شوند، و خودش وقتی برطرف شد دوباره وصل می‌شود.
+- **mtcp: هر ۱۰ ثانیه یک خط خطای dial** به جای یک خط برای هر لینک — تانلی که قطع می‌شود همهٔ
+  لینک‌ها را با هم دوباره dial می‌کند و ده‌ها خط یکسان در ثانیه می‌نوشت؛ حالا خط، تعداد خط‌های
+  نوشته‌نشده را می‌گوید.
+
+### تست‌ها
+- `TestMtcpWindowsAreSmallByDefault`؛ `TestSlowReadersMemory` (end-to-end، با `BN_SLOWREAD=1`)
+  هزینهٔ کاربران کندخوان را برای هر ترنسپورت اندازه می‌گیرد.
+- `TestPathGoesDark` (end-to-end): تانل mtcp که مسیرش ۴۰ ثانیه قطع می‌شود، کمتر از یک ثانیه بعد
+  از برگشتن مسیر خودش برمی‌گردد، و لاگ درست می‌گوید چه شد.
+
+---
+
 ## 2.8.10
 
 From a full re-audit of the source; every fix comes with a test that failed
