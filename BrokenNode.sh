@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.9"
+VERSION="2.8.10"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -388,17 +388,6 @@ next_free_int(){
   echo "$v"
 }
 
-# next_free_net EXCLUDE — N such that 10.10.N.x is not used by another tunnel.
-next_free_net(){
-  local used n; used=" $( { cfg_scan values "$1" tun_local; cfg_scan values "$1" tun_remote; } | tr '\n' ' ') "
-  for n in $(seq "${2:-30}" 254); do
-    [[ "$used" == *" 10.10.$n."* || "$used" == *" fd00:10:$n::"* ]] || { echo "$n"; return; }
-  done
-  echo 30
-}
-
-
-
 # auto_or_ask ROLE PROMPT VALUE — on the relay a value that must not clash
 # with anything else on this server is chosen, not asked (the operator asked
 # not to have to pick them); it is shown so the other end can be set up by hand.
@@ -425,12 +414,9 @@ auto_or_ask(){
 # "the first free" would all choose the same subnet, id and port.
 bnpy(){
   python3 - "$CFG_DIR" "$@" <<'PYEOF'
-import base64, glob, json, os, random, re, subprocess, sys, zlib
+import glob, json, os, random, re, subprocess, sys
 
 cfgdir, cmd, args = sys.argv[1], sys.argv[2], sys.argv[3:]
-P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp")
-KNOWN = P2P + ("tcp", "mtcp", "mptcp", "ws", "tcpnomux", "kcp", "sctp",
-               "tcpobf", "mtcpobf", "wsobf", "rawmux")
 
 def configs(excl=""):
     out = []
@@ -502,86 +488,6 @@ def used_l2tp(excl):
 def pick(lo, hi, used):
     free = [v for v in range(lo, hi + 1) if v not in used]
     return random.choice(free) if free else lo
-
-def mirror(r, relay_ip, target):
-    """The foreign server's config: the relay's, seen from the other end."""
-    c = {k: v for k, v in r.items() if k not in ("ports", "quota_total_gb", "quota_up_gb", "quota_down_gb", "public_ip")}
-    c["mode"] = "client"
-    t = c.get("transport")
-    sw = lambda a, b: c.update({a: r.get(b), b: r.get(a)}) if (a in r or b in r) else None
-    if t in P2P:
-        sw("local_ip", "remote_ip"); sw("tun_local", "tun_remote")
-    else:
-        if str(r.get("direction") or "").lower() == "direct":
-            port = str(r.get("remote_addr") or ":8443").rsplit(":", 1)[-1] or "8443"
-            c["bind_addr"] = "0.0.0.0:" + port
-            c.pop("remote_addr", None)
-        else:
-            port = str(r.get("bind_addr") or ":8443").rsplit(":", 1)[-1] or "8443"
-            host = "[" + relay_ip + "]" if ":" in relay_ip and not relay_ip.startswith("[") else relay_ip
-            c["remote_addr"] = host + ":" + port
-            c.pop("bind_addr", None)
-    c["target_host"] = target or ("::1" if t == "sit" else "127.0.0.1")
-    return {k: v for k, v in c.items() if v is not None}
-
-def own_values(name):
-    """Values the existing config NAME (about to be replaced) holds: its running
-    tunnel shows them on this machine, but they are not a conflict with it."""
-    try:
-        o = json.load(open(os.path.join(cfgdir, name + ".json")))
-    except Exception:
-        return set(), set(), set()
-    nets, ports, ids = set(), set(), set()
-    m = re.match(r"10\.10\.(\d+)\.", str(o.get("tun_local") or ""))
-    if m:
-        nets.add(int(m.group(1)))
-    for k in ("carrier_port", "l2tp_port"):
-        if o.get(k):
-            ports.add(int(o[k]))
-    for k in ("bind_addr",):
-        v = str(o.get(k) or "")
-        if v.rsplit(":", 1)[-1].isdigit():
-            ports.add(int(v.rsplit(":", 1)[-1]))
-    for k in ("l2tp_tunnel_id", "l2tp_session_id"):
-        if o.get(k):
-            ids.add(int(o[k]))
-    return nets, ports, ids
-
-def conflicts(name, c):
-    """What in config c is already taken on THIS machine."""
-    out = []
-    own_nets, own_ports, own_ids = own_values(name)
-    used_nets_ = lambda n: used_nets(n) - own_nets
-    used_ports_ = lambda pr, n: used_ports(pr, n) - own_ports
-    used_l2tp_ = lambda n: used_l2tp(n) - own_ids
-    t = c.get("transport")
-    for k in ("tun_local",):
-        m = re.match(r"10\.10\.(\d+)\.", str(c.get(k) or ""))
-        if m and int(m.group(1)) in used_nets_(name):
-            out.append("tunnel subnet 10.10.%s.x is already used here" % m.group(1))
-    if t == "l2tp":
-        for k in ("l2tp_tunnel_id", "l2tp_session_id"):
-            if c.get(k) and int(c[k]) in used_l2tp_(name):
-                out.append("%s %s is already used here" % (k, c[k]))
-        if (c.get("l2tp_encap") or "udp") == "udp" and int(c.get("l2tp_port") or 1701) in used_ports_("udp", name):
-            out.append("l2tp udp port %s is already used here" % (c.get("l2tp_port") or 1701))
-    if t in ("gre", "gretap"):
-        for n, o in configs(name):
-            if o.get("transport") == t and o.get("remote_ip") == c.get("remote_ip") and int(o.get("gre_key") or 0) == int(c.get("gre_key") or 0):
-                out.append("%s tunnel '%s' to %s already uses gre key %s" % (t, n, c.get("remote_ip"), int(c.get("gre_key") or 0)))
-    if t in ("ipip", "sit"):
-        for n, o in configs(name):
-            if o.get("transport") == t and o.get("remote_ip") == c.get("remote_ip"):
-                out.append("%s tunnel '%s' to %s exists — the kernel allows only one" % (t, n, c.get("remote_ip")))
-    if t == "udp":
-        if int(c.get("carrier_port") or 6262) in used_ports_("udp", name):
-            out.append("udp carrier port %s is already used here" % (c.get("carrier_port") or 6262))
-    b = str(c.get("bind_addr") or "")
-    if c.get("mode") == "client" and ":" in b:
-        proto = "udp" if t == "kcp" else "tcp"
-        if int(b.rsplit(":", 1)[1]) in used_ports_(proto, name):
-            out.append("port %s/%s (to listen on) is already used here" % (b.rsplit(":", 1)[1], proto))
-    return out
 
 if cmd == "alloc":
     what = args[0]
@@ -2545,8 +2451,8 @@ PYEOF
           if [ "$hit" = 1 ]; then removed=$((removed+1)); else keep+=("${ports[$i]}"); fi
         done
         [ "$removed" = 0 ] && { warn "no matching entries"; continue; }
-        if [ "${#keep[@]}" -eq 0 ]; then
-          warn "A relay needs at least one port. Use c) to replace the whole list instead."
+        if [ "${#keep[@]}" -eq 0 ] && [ -z "$(jget "$cfg" socks)" ]; then
+          warn "A relay needs at least one port (or proxy mode: 13 Change direction → 3). Use c) to replace the whole list instead."
           continue
         fi
         if ports_apply "$cfg" "$n" "${keep[@]}"; then

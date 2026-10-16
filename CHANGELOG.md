@@ -3,6 +3,104 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.10
+
+From a full re-audit of the source; every fix comes with a test that failed
+before it. Works with an older release on the other server in both
+directions (tested against the published 2.8.4 and 2.8.6–2.8.9 over aead and
+tls, and over reality from 2.8.6, the first published release with it); update
+both servers to get every fix.
+
+### Fixed
+- **reality: the server that dials now requires the other to prove it holds
+  the token** (the BN3 mutual-auth proof), as it already did over `none` and
+  `tls` — the foreign server in reverse mode, the relay in direct mode. The
+  reality client accepts any certificate, so someone in the middle could
+  terminate the TLS and pose as the listening server. Every release with
+  reality already sends the proof.
+- **UDP ports of the relay** no longer freeze for every user while an idle
+  session on a stalled link is being closed.
+- **tcpnomux: after the relay restarts, the pool refills at once.** It used to
+  wait out a one-second pause first, so users arriving right after the relay
+  came back waited about a second each.
+- **udp/icmp tunnels: a forwarded port another program holds is retried** and
+  shown in red in the menu, as the other transports' ports are; IPv6 users get
+  in too. It used to be tried once.
+- **l2tp: a tunnel no longer deletes another running tunnel that uses the same
+  tunnel id**; it says so and stops instead. (Two relays with the same id for
+  one foreign server used to cut each other in a loop.)
+- **The "other server runs an older release" warning** no longer appears when
+  the link merely dropped during the version check.
+- **pad**: the padding is random instead of zeros, which with encryption
+  `none` was a pattern DPI could match.
+- **Proxy (HTTP CONNECT)**: a destination that is not host:port is refused
+  with 400 instead of being sent to the foreign server (found by fuzzing).
+- The foreign server refuses streams it does not know instead of dialing
+  them as TCP connections to the service.
+- Diagnose reads at most 512 bytes of a port's answer.
+- Manager: on a relay with the proxy on, *Port-forwards* can remove the last
+  forwarded port (the proxy alone carries the users); elsewhere the refusal
+  now points to proxy mode.
+- Config check: the `socks` address is validated; the encryption error lists
+  `reality`.
+
+### Tests
+- `scripts/menu_test.sh` drives the menu's create/edit flows with scripted
+  answers and has the core check every config they write; it runs in CI.
+- Fuzz targets for the proxy handshake, pad framing and the ClientHello
+  parsers.
+- The end-to-end mixed-version test required the "older than 2.8.6" warning,
+  which cannot appear once the published release itself is 2.8.6 or newer;
+  it now expects what the old binary's version calls for, covers tls and
+  reality as well, and passes against 2.8.4 and 2.8.6–2.8.9 both ways round.
+
+---
+
+## فارسی — 2.8.10
+
+حاصل بازبینی کامل دوبارهٔ سورس؛ هر رفع با تستی همراه است که پیش از آن شکست می‌خورد.
+با نسخهٔ قدیمی‌تر روی سرور دیگر در هر دو جهت کار می‌کند (با نسخه‌های منتشرشدهٔ 2.8.4 و
+2.8.6 تا 2.8.9 روی aead و tls، و روی reality از 2.8.6 که اولین نسخهٔ منتشرشدهٔ دارای آن است،
+تست شد)؛ برای گرفتن همهٔ رفع‌ها هر دو سرور را به‌روز کن.
+
+### رفع‌شده
+- **reality: سروری که وصل می‌شود (dial می‌کند) حالا از سرور دیگر اثبات توکن را می‌خواهد**
+  (اثبات mutual-auth در BN3)، همان‌طور که در `none` و `tls` می‌خواست — در حالت reverse
+  سرور خارج و در حالت direct رله. کلاینت reality هر گواهی را می‌پذیرد، پس کسی در مسیر
+  می‌توانست TLS را باز کند و خود را جای سرور مقابل جا بزند. همهٔ نسخه‌های دارای reality
+  این اثبات را از قبل می‌فرستند.
+- **پورت‌های UDP رله** دیگر هنگام بستن یک session بیکار روی لینک گیرکرده برای همهٔ
+  کاربران قفل نمی‌شوند.
+- **tcpnomux: بعد از ری‌استارت رله، pool فوراً پر می‌شود.** قبلاً اول یک ثانیه صبر می‌کرد
+  و کاربرانی که درست بعد از برگشتن رله می‌آمدند هر کدام حدود یک ثانیه منتظر می‌ماندند.
+- **تانل‌های udp/icmp: پورتی که برنامهٔ دیگری گرفته دوباره امتحان می‌شود** و در منو
+  قرمز نشان داده می‌شود، مثل پورت‌های بقیهٔ ترنسپورت‌ها؛ کاربر IPv6 هم وصل می‌شود.
+  قبلاً فقط یک بار امتحان می‌شد.
+- **l2tp: تانل دیگر تانل در حال اجرای دیگری با همان tunnel id را پاک نمی‌کند**؛ پیام
+  می‌دهد و متوقف می‌شود. (دو رله با id یکسان برای یک سرور خارج همدیگر را در حلقه قطع
+  می‌کردند.)
+- **هشدار «سرور دیگر نسخهٔ قدیمی‌تر دارد»** دیگر وقتی فقط لینک وسط بررسی نسخه قطع شده
+  ظاهر نمی‌شود.
+- **pad**: padding تصادفی است نه صفر، که با رمزنگاری `none` الگویی قابل تشخیص برای DPI بود.
+- **پروکسی (HTTP CONNECT)**: مقصدی که host:port نیست با 400 رد می‌شود و به سرور خارج
+  فرستاده نمی‌شود (با fuzzing پیدا شد).
+- سرور خارج stream ناشناخته را رد می‌کند و آن را به‌عنوان اتصال TCP به سرویس dial نمی‌کند.
+- Diagnose حداکثر ۵۱۲ بایت از پاسخ یک پورت را می‌خواند.
+- منیجر: روی رله‌ای که پروکسی‌اش روشن است، *Port-forwards* می‌تواند آخرین پورت فوروارد را هم
+  حذف کند (کاربران فقط از پروکسی رد می‌شوند)؛ در بقیهٔ حالت‌ها پیام رد، حالت پروکسی را پیشنهاد می‌دهد.
+- بررسی کانفیگ: آدرس `socks` اعتبارسنجی می‌شود؛ پیام خطای رمزنگاری `reality` را هم نام می‌برد.
+
+### تست‌ها
+- `scripts/menu_test.sh` مسیرهای ساخت و ویرایش منو را با پاسخ‌های از پیش نوشته اجرا
+  می‌کند و هسته هر کانفیگی را که می‌نویسند چک می‌کند؛ در CI اجرا می‌شود.
+- fuzz برای handshake پروکسی، قاب‌بندی pad و پارسرهای ClientHello.
+- تست end-to-end نسخه‌های مختلط هشدار «older than 2.8.6» را می‌خواست که وقتی خود نسخهٔ
+  منتشرشده 2.8.6 یا جدیدتر است دیگر ظاهر نمی‌شود؛ حالا همان پیامی را انتظار دارد که نسخهٔ
+  باینری قدیمی ایجاب می‌کند، tls و reality را هم پوشش می‌دهد، و با 2.8.4 و 2.8.6 تا 2.8.9 در هر
+  دو جهت قبول می‌شود.
+
+---
+
 ## 2.8.9
 
 ### Changed

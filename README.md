@@ -238,7 +238,9 @@ unencrypted `udp`/`icmp` still work with older releases.
 **Update both servers together.** Since 2.3.20 a stream tunnel with
 encryption `none` connects only when the other server proves it
 holds the token too, which needs 2.3.14 or newer on both ends. Against an older
-server the log says so and the tunnel stays down.
+server the log says so and the tunnel stays down. The same proof is required
+over `tls`, and since 2.8.10 over `reality` (its client accepts any
+certificate); every release that has reality already sends it.
 
 **Old names still work.** `tcpobf`, `mtcpobf`, `wsobf` and `rawmux` are
 translated automatically (`tcpobf` becomes `tcp` + `obfs`), so existing tunnels
@@ -666,7 +668,8 @@ self-signed، فایل یا Let's Encrypt) · `reality` (HTTPS یک سایت و�
 **هر دو سرور را با هم به‌روز کن.** از 2.3.20 تانل جریانی با رمزنگاری `none`
 فقط وقتی وصل می‌شود که سرور مقابل هم ثابت کند توکن را دارد؛ این
 یعنی هر دو طرف باید 2.3.14 یا جدیدتر باشند. با سرور قدیمی‌تر، لاگ همین را می‌گوید
-و تانل وصل نمی‌شود.
+و تانل وصل نمی‌شود. همین اثبات روی `tls`، و از 2.8.10 روی `reality` هم لازم است (کلاینت
+reality هر گواهی را می‌پذیرد)؛ همهٔ نسخه‌هایی که reality دارند این اثبات را از قبل می‌فرستند.
 
 **نام‌های قدیمی هنوز کار می‌کنند.** `tcpobf`، `mtcpobf`، `wsobf` و `rawmux`
 به‌طور خودکار ترجمه می‌شوند (`tcpobf` می‌شود `tcp` + `obfs`)، پس تونل‌های موجود
