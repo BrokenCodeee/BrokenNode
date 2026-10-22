@@ -16,8 +16,11 @@
 set -euo pipefail
 
 REPO="BrokenCodeee/BrokenNode"
-BRANCH="main"
-BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
+# BROKENNODE_REF installs another commit of the public repository than the
+# latest (an earlier release, to go back to it); BROKENNODE_BASE a mirror of
+# it (and what the installer's tests point at).
+BRANCH="${BROKENNODE_REF:-main}"
+BASE="${BROKENNODE_BASE:-https://raw.githubusercontent.com/${REPO}/${BRANCH}}"
 # Where to install. Run from INSIDE an existing BrokenNode folder, update that
 # folder in place: creating ./BrokenNode there left a nested second copy, and
 # the old folder — the one opened with "cd BrokenNode && bash BrokenNode.sh" —
@@ -56,10 +59,21 @@ esac
 info "CPU: $(uname -m) → brokennode-linux-${ARCH}"
 
 # --- how do we fetch ---------------------------------------------------------
+# An https source stays https: a redirect to plain http (a captive portal, a
+# meddling middlebox) is refused rather than followed.
+case "$BASE" in https://*) https_only=1 ;; *) https_only=0; warn "Downloading over plain $BASE — not encrypted." ;; esac
 if command -v curl >/dev/null 2>&1; then
-  fetch(){ curl -fsSL --retry 3 --retry-delay 2 -o "$2" "$1"; }
+  if [ "$https_only" = 1 ]; then
+    fetch(){ curl -fsSL --proto '=https' --proto-redir '=https' --retry 3 --retry-delay 2 -o "$2" "$1"; }
+  else
+    fetch(){ curl -fsSL --retry 3 --retry-delay 2 -o "$2" "$1"; }
+  fi
 elif command -v wget >/dev/null 2>&1; then
-  fetch(){ wget -q --tries=3 -O "$2" "$1"; }
+  if [ "$https_only" = 1 ]; then
+    fetch(){ wget -q --https-only --tries=3 -O "$2" "$1"; }
+  else
+    fetch(){ wget -q --tries=3 -O "$2" "$1"; }
+  fi
 else
   die "Neither curl nor wget is installed. Install one:  apt install -y curl   |   yum install -y curl"
 fi
@@ -73,6 +87,15 @@ if [ "$DIR" = . ]; then info "Updating this folder ($(pwd))"; else info "Downloa
 TMP="$(mktemp -d "$DIR/.download.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
+# sha256 FILE — its SHA-256, from whichever tool this system has. Without one
+# the download used to be installed unverified.
+if command -v sha256sum >/dev/null 2>&1; then sha256(){ sha256sum "$1" | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then sha256(){ shasum -a 256 "$1" | awk '{print $1}'; }
+elif command -v openssl >/dev/null 2>&1; then sha256(){ openssl dgst -sha256 -r "$1" | awk '{print $1}'; }
+elif command -v busybox >/dev/null 2>&1; then sha256(){ busybox sha256sum "$1" | awk '{print $1}'; }
+else die "No SHA-256 tool (sha256sum, shasum, openssl) — the download cannot be verified. Install coreutils first."
+fi
+
 # checksum_ok FILE PATH-IN-SUMS — FILE matches its line in SHA256SUMS. A list
 # with no line for it (an error page served in its place, a cut-off download)
 # is a failure too: it used to count as verified.
@@ -80,7 +103,7 @@ checksum_ok(){
   local want got
   want="$(awk -v f="$2" '$2 == f || $2 == "*"f {print $1}' "$TMP/SHA256SUMS" | head -1)"
   [[ "$want" =~ ^[0-9a-f]{64}$ ]] || return 1
-  got="$(sha256sum "$1" | awk '{print $1}')"
+  got="$(sha256 "$1")"
   [ "$want" = "$got" ]
 }
 
@@ -96,10 +119,6 @@ for attempt in 1 2 3 4; do
   fetch "$BASE/bin/brokennode-linux-${ARCH}$q" "$TMP/brokennode-linux-${ARCH}" \
     || die "Download failed. Check the server's internet access, or grab the file manually from https://github.com/${REPO}"
   fetch "$BASE/BrokenNode.sh$q" "$TMP/BrokenNode.sh" || die "Could not download BrokenNode.sh"
-  if ! command -v sha256sum >/dev/null 2>&1; then
-    warn "sha256sum is not installed — cannot verify the download, continuing unverified"
-    verified=1; break
-  fi
   # No checksum list is treated like a mismatch (retried, then refused): an
   # unverified binary is exactly what the list is there to prevent.
   fetch "$BASE/SHA256SUMS$q" "$TMP/SHA256SUMS" || : > "$TMP/SHA256SUMS"
@@ -110,8 +129,8 @@ for attempt in 1 2 3 4; do
     info "Checksum verified"; verified=1; break
   fi
   [ "$attempt" = 4 ] && break
-  warn "Checksum mismatch — GitHub's cache may still be serving the previous release. Retrying in $((attempt * 10))s..."
-  sleep $((attempt * 10))
+  warn "Checksum mismatch — GitHub's cache may still be serving the previous release. Retrying in $((attempt * ${BROKENNODE_RETRY_SECS:-10}))s..."
+  sleep $((attempt * ${BROKENNODE_RETRY_SECS:-10}))
 done
 [ "$verified" = 1 ] || die "Checksum mismatch (or no checksum list) — the download is corrupt, incomplete or tampered with. Nothing was changed; retry in a few minutes."
 fetch "$BASE/VERSION$q"   "$TMP/VERSION"   || true

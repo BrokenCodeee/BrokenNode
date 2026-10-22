@@ -3,6 +3,111 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.13
+
+**Update both servers.** The security fix and the half-close fix take effect
+only when both ends run 2.8.13; an updated end still works with an older one.
+
+### Security
+- **tls (self-signed) and reality: an attacker on the path between the two
+  servers could read and change the tunnel.** The dialing end cannot verify a
+  self-signed (or reality's) certificate, and the token check did not cover
+  the TLS session, so a device that ended the TLS on both sides and passed the
+  token check along was trusted by both servers and saw every connection in
+  the clear. The token check is now bound to the TLS session itself: such a
+  device gets nothing, and both servers log that the token differs or the TLS
+  is being intercepted. Until the other server is updated too, the updated one
+  logs once that the tunnel is still exposed. aead was not affected.
+- **The installer never installs files it could not verify.** Without a
+  SHA-256 tool it used to install unchecked; it now stops and says which tool
+  to install. Downloads stay on https (a redirect to http is refused).
+- Built with Go 1.26.10 (crypto/x509 fix, GO-2026-6809).
+
+### Fixed
+- **Cut-off replies on every multiplexed transport** (tcp, mtcp, ws, kcp, …).
+  A user program that finishes sending and closes its sending side before the
+  reply arrives (common for scripted HTTP, uploads, rsync, `nc -N`) got only
+  part of the reply. Three causes, including a bug in the smux library (fixed
+  in a bundled copy). Both ends must be updated.
+- **kcp comes back in about a second after the link between the servers
+  drops**, instead of about 20 seconds: a failed send now ends the dead link
+  at once.
+- **After an outage, users are no longer sent down links the other server has
+  already given up** (mtcp, kcp): the relay prefers links it still hears from.
+- **A tunnel never deletes a network interface it did not create.** Starting a
+  kernel or packet tunnel deleted any device with its name (tun_name), taken
+  for a leftover — wg0, docker0, another VPN's tun0, or another running
+  tunnel's device. Now only a leftover of BrokenNode's own is removed; anything
+  else stops the start with the reason.
+- Settings a config has that this release does not know are named in a
+  warning (a typo used to be ignored silently). A point-to-point tunnel whose
+  local_ip and remote_ip are the same address is refused.
+- A backup code shows each proxy it would open (and whether it has a
+  password) before restoring; one with an open proxy asks with "No" as the
+  default. A setting stored as null in a backup survives the round trip.
+- The menu run from a script whose input has ended no longer asks for the
+  user ports for ever when the default list clashes with another tunnel.
+- A tunnel started right after another tunnel on its ports was killed is no
+  longer refused as if that one still ran.
+- The SOCKS5 proxy refuses a destination name that cannot be dialed (such as
+  `]`) at once, as the HTTP proxy already did, instead of sending it through
+  the tunnel to fail there.
+
+### New
+- **Roll back the core:** `BrokenNode rollback` (or menu 7) puts the previous
+  core back, keeps it there across menu starts and restarts the tunnels;
+  `BrokenNode unpin` or Update ends that.
+
+---
+
+## فارسی — 2.8.13
+
+**هر دو سرور را به‌روز کن.** رفع مشکل امنیتی و رفع قطع‌شدن پاسخ‌ها فقط وقتی اثر دارد که هر دو طرف
+2.8.13 باشند؛ طرف به‌روزشده با طرف قدیمی هم کار می‌کند.
+
+### امنیتی
+- **tls (خودامضا) و reality: کسی که روی مسیر بین دو سرور است می‌توانست تانل را بخواند و تغییر دهد.**
+  طرفی که وصل می‌شود گواهی خودامضا (و گواهی reality) را نمی‌تواند بررسی کند، و بررسی توکن به خود
+  نشست TLS گره نخورده بود؛ دستگاهی که TLS را از هر دو طرف باز می‌کرد و بررسی توکن را دست‌نخورده
+  رد می‌کرد، مورد اعتماد هر دو سرور بود و همهٔ اتصال‌ها را بدون رمز می‌دید. حالا بررسی توکن به خود
+  نشست TLS گره خورده است: چنین دستگاهی هیچ چیز به دست نمی‌آورد و هر دو سرور در لاگ می‌نویسند که
+  توکن فرق دارد یا TLS در مسیر شنود می‌شود. تا وقتی سرور دیگر هم به‌روز نشده، سرور به‌روزشده یک بار
+  می‌نویسد که تانل هنوز در معرض است. aead تحت تأثیر نبود.
+- **نصب‌کننده هیچ‌وقت فایل تأییدنشده نصب نمی‌کند.** بدون ابزار SHA-256 قبلاً بدون بررسی نصب می‌کرد؛
+  حالا متوقف می‌شود و می‌گوید چه چیزی نصب شود. دانلودها روی https می‌مانند (ریدایرکت به http رد می‌شود).
+- ساخته‌شده با Go 1.26.10 (رفع مشکل crypto/x509، GO-2026-6809).
+
+### رفع‌شده
+- **پاسخ‌های نصفه روی همهٔ ترنسپورت‌های مالتی‌پلکس** (tcp، mtcp، ws، kcp، …). برنامه‌ای که ارسالش
+  تمام می‌شود و قبل از رسیدن پاسخ سمت ارسالش را می‌بندد (رایج در HTTP اسکریپتی، آپلود، rsync،
+  `nc -N`) فقط بخشی از پاسخ را می‌گرفت. سه علت داشت، از جمله یک باگ در کتابخانهٔ smux (در یک نسخهٔ
+  همراه رفع شده). هر دو طرف باید به‌روز شوند.
+- **kcp بعد از قطع‌شدن ارتباط بین دو سرور حدود یک ثانیه‌ای برمی‌گردد**، نه حدود ۲۰ ثانیه: ارسالِ
+  ناموفق حالا لینک مرده را فوراً می‌بندد.
+- **بعد از قطعی، کاربرها دیگر به لینک‌هایی که سرور دیگر رهایشان کرده فرستاده نمی‌شوند** (mtcp،
+  kcp): رله لینک‌هایی را ترجیح می‌دهد که هنوز از آن‌ها چیزی می‌شنود.
+- **تانل هیچ‌وقت اینترفیس شبکه‌ای را که خودش نساخته پاک نمی‌کند.** روشن‌کردن تانل کرنلی یا پکتی هر
+  دستگاهی با همان نام (tun_name) را به‌عنوان باقی‌مانده پاک می‌کرد — wg0، docker0، tun0 یک VPN
+  دیگر، یا دستگاه تانلی که در حال کار است. حالا فقط باقی‌ماندهٔ خود BrokenNode پاک می‌شود؛ هر چیز
+  دیگری روشن‌شدن را با ذکر دلیل متوقف می‌کند.
+- تنظیماتی در کانفیگ که این نسخه نمی‌شناسد در یک هشدار نام برده می‌شوند (غلط تایپی قبلاً بی‌صدا
+  نادیده گرفته می‌شد). تانل نقطه‌به‌نقطه‌ای که local_ip و remote_ip آن یکی است رد می‌شود.
+- کد پشتیبان قبل از بازگردانی هر پروکسی‌ای را که باز می‌کند (و این‌که رمز دارد یا نه) نشان می‌دهد؛
+  اگر پروکسی باز بدون رمز داشته باشد، پیش‌فرض سؤال «نه» است. تنظیمی که در پشتیبان null ذخیره شده
+  سالم برمی‌گردد.
+- منو وقتی از اسکریپتی اجرا شود که ورودی‌اش تمام شده، اگر پورت‌های پیش‌فرض با تانل دیگری تداخل داشته
+  باشند دیگر سؤال پورت‌ها را بی‌پایان تکرار نمی‌کند.
+- تانلی که درست بعد از kill شدن تانل دیگری روی همان پورت‌ها روشن شود، دیگر طوری رد نمی‌شود که انگار
+  آن تانل هنوز در حال کار است.
+- پروکسی SOCKS5 مقصدی را که نمی‌شود به آن وصل شد (مثل `]`) همان اول رد می‌کند، همان‌طور که پروکسی
+  HTTP از قبل می‌کرد، به‌جای این‌که آن را از تانل بفرستد تا آن‌جا شکست بخورد.
+
+### جدید
+- **برگرداندن هسته:** `BrokenNode rollback` (یا گزینهٔ 7 منو) هستهٔ قبلی را برمی‌گرداند، با شروع
+  دوبارهٔ منو هم همان می‌ماند و تانل‌ها را ری‌استارت می‌کند؛ `BrokenNode unpin` یا Update این را تمام می‌کند.
+
+---
+
 ## 2.8.12
 
 ### New

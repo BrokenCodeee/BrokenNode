@@ -50,6 +50,11 @@ again from inside the folder (`cd BrokenNode` first) — both update that folder
 in place, and the menu then applies the new core and restarts the tunnels. The
 menu never puts an older core over a newer one; an old folder only says so.
 
+**Rolling back:** if an update misbehaves, `BrokenNode rollback` (or menu
+**7) Roll back the core**) puts the previous core back and restarts the
+tunnels; it stays until `BrokenNode unpin` or the next Update. Configs are never
+touched by an update or a rollback.
+
 Or take the whole folder at once:
 
 ```bash
@@ -487,6 +492,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/BrokenCodeee/BrokenNode/main
 از **داخل** همان پوشه (اول `cd BrokenNode`) — هر دو همان پوشه را به‌روز می‌کنند و
 منو هستهٔ جدید را اعمال و تانل‌ها را ری‌استارت می‌کند. منو هیچ‌وقت هستهٔ قدیمی‌تر
 را روی جدیدتر نمی‌گذارد؛ پوشهٔ قدیمی فقط هشدار می‌دهد.
+
+**برگرداندن:** اگر به‌روزرسانی مشکل ساخت، `BrokenNode rollback` (یا گزینهٔ **7) Roll back
+the core** منو) هستهٔ قبلی را برمی‌گرداند و تانل‌ها را ری‌استارت می‌کند؛ تا `BrokenNode unpin`
+یا Update بعدی همان می‌ماند. کانفیگ‌ها با به‌روزرسانی یا برگرداندن هیچ‌وقت تغییر نمی‌کنند.
 
 **بعد از اولین اجرا، منو را از هر جایی باز کن** (بدون `cd`):
 

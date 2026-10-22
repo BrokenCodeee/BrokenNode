@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.12"
+VERSION="2.8.13"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -149,7 +149,45 @@ install_core(){
     err "The core in this folder ($1) does not run on this machine — not installed; the current one stays."
     return 1
   fi
+  # The core being replaced is kept as $BIN.prev, so a release that turns out
+  # bad can be undone in one step (rollback_core) — there is nothing else to
+  # go back to: older releases are not kept anywhere for download.
+  if [ -x "$BIN" ] && [ -n "$(core_version "$BIN")" ] && [ "$(core_version "$BIN")" != "$(core_version "$1")" ]; then
+    cp -p "$BIN" "$BIN.prev.new" && mv -f "$BIN.prev.new" "$BIN.prev" || rm -f "$BIN.prev.new"
+  fi
   install -m0755 "$1" "$BIN.new" && mv -f "$BIN.new" "$BIN" || { rm -f "$BIN.new"; err "Could not install the core to $BIN."; return 1; }
+}
+
+# A rollback pins the core: $CFG_DIR/.core-pin holds the version it went back to, and
+# the bundled core is not applied over it until the operator updates (menu 5,
+# which removes the pin) or runs "BrokenNode unpin".
+pinned_skip(){ # SRC — true (and says so) when a pin keeps SRC from being applied
+  [ -f "$CFG_DIR/.core-pin" ] || return 1
+  local pin new; pin="$(cat "$CFG_DIR/.core-pin" 2>/dev/null)"; new="$(core_version "$1")"
+  [ -n "$pin" ] && [ "$new" != "$pin" ] || return 1
+  warn "The core is pinned to v$pin by a rollback — the bundled v$new is not applied. Update (menu 5) or run 'BrokenNode unpin' to use it."
+  return 0
+}
+
+# rollback_core [--yes] — put the previous core back (the one install_core
+# kept), pin it, and restart every tunnel on it. The newer core becomes the
+# previous one, so the rollback itself can be undone the same way.
+rollback_core(){
+  need_root
+  if [ ! -x "$BIN.prev" ] || [ -z "$(core_version "$BIN.prev")" ]; then
+    err "There is no previous core to go back to ($BIN.prev). One is kept from the next update on."
+    return 1
+  fi
+  local cur old; cur="$(core_version "$BIN")"; old="$(core_version "$BIN.prev")"
+  info "Current core: v${cur:-?}   previous core: v$old"
+  if [ "${1:-}" != --yes ]; then
+    yes_no "Go back to v$old and restart every tunnel on it? y/N" n || { warn "Cancelled."; return 1; }
+  fi
+  cp -p "$BIN" "$BIN.next" && cp -p "$BIN.prev" "$BIN.new" && mv -f "$BIN.new" "$BIN" && mv -f "$BIN.next" "$BIN.prev" \
+    || { rm -f "$BIN.new" "$BIN.next"; err "Could not swap the cores — nothing was changed."; return 1; }
+  mkdir -p "$CFG_DIR" && printf '%s\n' "$old" > "$CFG_DIR/.core-pin"
+  info "Core is now v$old (pinned). v${cur:-?} is kept as the previous core."
+  restart_all_tunnels
 }
 
 warn_old_folder(){
@@ -161,6 +199,7 @@ ensure_core(){
   local src; src="$(detect_bin)"
   if [ -n "$src" ] && [ -f "$src" ]; then
     if bundled_is_older "$src"; then warn_old_folder "$src"; return 0; fi
+    [ -x "$BIN" ] && pinned_skip "$src" && return 0
     if [ ! -x "$BIN" ] || ! cmp -s "$src" "$BIN"; then
       install_core "$src" || { [ -x "$BIN" ] && return 0; return 1; }
       info "Core updated: $("$BIN" version)"
@@ -562,13 +601,28 @@ warn_port_clash(){
 # by another tunnel here. Two tunnels on one port cannot both work: the second
 # fails to bind at every start and systemd restarts it for ever.
 ask_ports(){
-  local p
+  local p last=""
   while :; do
     p=$(build_ports)
     warn_port_clash "$p" "$1" >&2 && break
+    input_ended "$p" "$last" && return 1
+    last="$p"
     echo -e "  ${C_D}Enter the port list again.${C_N}" >&2
   done
   echo "$p"
+}
+
+# input_ended ANSWER PREVIOUS — stops a question that is asked again until the
+# answer changes, once input has ended: with no terminal, the same answer
+# twice is the default an ended input gives every time. ask() stops the script
+# itself on end of input, but not when the shell ignores SIGTERM (as some
+# supervisors run it), and the question then came back for ever.
+input_ended(){
+  [ -t 0 ] && return 1
+  [ -n "$2" ] && [ "$1" = "$2" ] || return 1
+  err "The same answer again and no more input — stopped."
+  kill -TERM "$$" 2>/dev/null
+  return 0
 }
 
 # cfg_begin CFG / cfg_commit CFG — bracket an edit of a tunnel's config: the
@@ -1162,7 +1216,7 @@ write_tunnel_cfg(){
   tokline="\"token\": \"$(jstr "$token")\","
 
   local portsjson=""
-  if [ "$role" = server ]; then portsjson=$(ask_ports "$name"); fi
+  if [ "$role" = server ]; then portsjson=$(ask_ports "$name") || return 1; fi
 
   new_cfg_file "$cfg"
   if [ "$role" = server ]; then
@@ -1254,7 +1308,7 @@ create_tunnel(){
         ports=""
         echo -e "  ${C_D}No port forwards in proxy mode (add some later with 17 Port-forwards if you want both).${C_N}"
       else
-        ports=$(ask_ports "$name")
+        ports=$(ask_ports "$name") || return 1
       fi
       [ "$dir" = direct ] || warn_port_clash "" "$name" "${bind##*:}" "$bproto"
       token=$(ask "Shared token" "$(gen_token)")
@@ -3127,13 +3181,10 @@ def pack_cfg(c):
     c = dict(c)
     head = b""
     for k in HEAD:
-        v = c.pop(k, None)
-        if isinstance(v, str) and v in WORDS:
-            head += uvar(WORDS.index(v) + 1)
+        if isinstance(c.get(k), str) and c[k] in WORDS:
+            head += uvar(WORDS.index(c.pop(k)) + 1)
         else:
-            head += uvar(0)
-            if v is not None:
-                c[k] = v
+            head += uvar(0)  # absent, or a value packed with the rest as it is
     return head + pack(c)
 
 
@@ -3459,6 +3510,7 @@ share_name(){
 # in a backup. KEEP (the tunnel's current local_ip, on an update) is kept when
 # this server holds it; otherwise asked once per address family, the
 # detected address offered.
+# shellcheck disable=SC2178,SC2128  # keep is a local string here, not edit_ports' array
 share_local_ip(){
   local f="$1" keep="${2:-}" cur fam=4 isfam=is_ipv4 d def var
   cur="$(jget "$f" local_ip)"; [ -n "$cur" ] || return 0
@@ -3584,12 +3636,15 @@ import_pair(){
   fi
   if [ "$mode" = server ] && [ -z "$(jget "$final" socks)" ] && [ -z "$(jq_ports "$final")" ]; then
     echo -e "  ${C_D}The code comes from the foreign server, which does not know the user ports: give them here.${C_N}"
-    local p
+    local p last=""
     while :; do
-      p="$(ask_ports "$target")"
+      p="$(ask_ports "$target")" || return 1
       # The tunnel's own port cannot also be a user port (the core refuses it).
       case ",$(printf '%s' "$p" | tr -d '"' | sed 's#=[0-9]*##g; s#/[a-z]*##g')," in
-        *",$own,"*) [ -n "$own" ] && { warn "Port $own is the tunnel's own port here — give the users another one."; continue; } ;;
+        *",$own,"*) [ -n "$own" ] && {
+            warn "Port $own is the tunnel's own port here — give the users another one."
+            input_ended "$p" "$last" && return 1
+            last="$p"; continue; } ;;
       esac
       break
     done
@@ -3613,12 +3668,26 @@ import_backup(){
   [ "$oip4" = - ] && oip4=""; [ "$oip6" = - ] && oip6=""; [ "$ohost" = - ] && ohost="another server"
   echo
   echo -e "  ${C_B}Backup of $count tunnel(s)${C_N} from ${C_Y}$ohost${C_N}${C_D}${oip4:+ ($oip4)}${C_N}:"
-  local on
+  local on sx risky=""
   while IFS=$'\t' read -r i name on; do
     f="$tmp/$i.json"
     printf "   %-16s ${C_D}%s/%s + %s, %s%s${C_N}\n" "$name" "$(jget "$f" mode)" "$(jget "$f" transport)" "$(jget "$f" encryption)" "$(direction_label "$f")" "$([ "$on" = off ] && echo ', stopped')"
+    # What a restore opens on THIS server, beyond the tunnel itself: a backup
+    # restores every setting, and one made by someone else could carry any.
+    sx="$(jget "$f" socks)"
+    if [ -n "$sx" ] && [ -z "$(jget "$f" socks_user)" ] && [ "$(jget "$f" socks_open)" = True ]; then
+      echo -e "   ${C_R}  ↳ opens a proxy on $sx with NO password, open to anyone who finds it${C_N}"; risky=1
+    elif [ -n "$sx" ]; then
+      echo -e "   ${C_D}  ↳ opens a proxy on $sx$([ -n "$(jget "$f" socks_user)" ] && echo ' (password protected)')${C_N}"
+    fi
+    [ -n "$(jget "$f" tun_name)" ] && echo -e "   ${C_D}  ↳ uses the network interface name $(jget "$f" tun_name)${C_N}"
   done < <(tail -n +2 "$tmp/list")
-  yes_no "Restore them on this server? Y/n" y || { warn "Cancelled."; return 1; }
+  if [ -n "$risky" ]; then
+    warn "A backup you did not make yourself can carry settings like these: restore only your own."
+    yes_no "Restore them on this server? y/N" n || { warn "Cancelled."; return 1; }
+  else
+    yes_no "Restore them on this server? Y/n" y || { warn "Cancelled."; return 1; }
+  fi
 
   local restored=() peers=() target was pub=""
   while IFS=$'\t' read -r i name on <&3; do
@@ -3690,7 +3759,8 @@ import_code(){
   fi
   [ -n "${code//[[:space:]]/}" ] || { warn "Nothing pasted — cancelled."; return 1; }
   tmp="$(mktemp -d "$CFG_DIR/.import.XXXXXX")" || return 1
-  SHARE_IP4=""; SHARE_IP6=""; SHARE_PUB=""
+  # shellcheck disable=SC2034  # share_local_ip reads them as ${!var}
+  SHARE_IP4="" SHARE_IP6="" SHARE_PUB=""
   if bnshare unpack "$code" "$tmp" > "$tmp/list"; then
     kind="$(head -n 1 "$tmp/list" | cut -f1)"
     if [ "$kind" = pair ]; then import_pair "$tmp" || rc=1; else import_backup "$tmp" || rc=1; fi
@@ -3892,6 +3962,7 @@ auto_apply_bundled(){
     read -t 15 -rp "  ▶ Press ENTER to continue (auto-continuing in 15s)... " _ 2>/dev/null || true
     return 0
   fi
+  [ -x "$BIN" ] && pinned_skip "$src" && return 0
   if [ ! -x "$BIN" ] || ! cmp -s "$src" "$BIN"; then
     warn "New core bundled with this package — applying automatically..."
     install_core "$src" || return 0
@@ -3913,6 +3984,7 @@ update_self(){
   if command -v curl >/dev/null 2>&1; then curl -fsSL --retry 3 -o "$tmp" "$INSTALL_URL"
   else wget -q --tries=3 -O "$tmp" "$INSTALL_URL"; fi || { err "Could not download the installer ($INSTALL_URL)."; rm -f "$tmp"; return; }
   info "Updating $SRC_DIR ..."
+  rm -f "$CFG_DIR/.core-pin"   # an update is the operator choosing the new release
   cd "$(dirname "$SRC_DIR")" || return
   BROKENNODE_DIR="$(basename "$SRC_DIR")" exec bash "$tmp"
 }
@@ -3936,7 +4008,7 @@ uninstall_all(){
   rm -f "$AU_SVC" "$AU_TIMER" "$HEALTH_SVC" "$HEALTH_TMR" "$TPL"; rm -rf "${HEALTH_SH%/*}"
   rm -rf /run/brokennode /var/lib/brokennode
   systemctl daemon-reload 2>/dev/null; systemctl reset-failed 2>/dev/null
-  rm -f "$BIN" "$BIN.bak"
+  rm -f "$BIN" "$BIN.bak" "$BIN.prev"
   remove_command
   rm -rf "$CFG_DIR"
   info "BrokenNode fully removed — core, tunnels, configs and units are gone."
@@ -4262,6 +4334,7 @@ main_menu(){
     echo "   4) Health check           (doctor: BBR / ports / loss / IP)"
     echo "   5) Update BrokenNode      (download the latest into this folder)"
     echo "   6) Share codes            (set up the other server, or move every tunnel, with one paste)"
+    [ -x "$BIN.prev" ] && echo "   7) Roll back the core     (to v$(core_version "$BIN.prev"), the one before the last update)"
     echo "   0) Exit"
     echo -e "  ${C_D}(the core in this folder is applied automatically on start)${C_N}"
     echo
@@ -4272,6 +4345,7 @@ main_menu(){
       4) doctor; read -t 30 -rp "  ▶ press ENTER to continue... " _ ;;
       5) update_self ;;
       6) share_menu ;;
+      7) [ -x "$BIN.prev" ] && rollback_core; read -t 30 -rp "  ▶ press ENTER to continue... " _ ;;
       0|__eof__) echo; exit 0 ;;
       *) warn "Invalid." ;;
     esac
@@ -4305,9 +4379,11 @@ case "${1:-}" in
     [ -n "${2:-}" ] || { echo "usage: BrokenNode share <tunnel name>"; exit 1; }
     show_pair_code "$2" 0 ;;
   backup) show_backup_code ;;
+  rollback) rollback_core "${2:-}" ;;
+  unpin) need_root; rm -f "$CFG_DIR/.core-pin"; info "Unpinned: the next menu start applies the bundled core." ;;
   uninstall|purge) uninstall_all ;;
   version) echo "BrokenNode manager v$VERSION" ;;
   update) update_self ;;
   ""|menu) main_menu ;;
-  *) echo "usage: sudo bash $SELF [server|client|manage|import <code>|share <tunnel>|backup|transports|tune|restart-all|start-all|stop-all|doctor|update|uninstall|version]"; exit 1 ;;
+  *) echo "usage: sudo bash $SELF [server|client|manage|import <code>|share <tunnel>|backup|rollback|unpin|transports|tune|restart-all|start-all|stop-all|doctor|update|uninstall|version]"; exit 1 ;;
 esac
