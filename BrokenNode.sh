@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.11"
+VERSION="2.8.12"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -208,7 +208,8 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
 }
-gen_token(){ ( head -c 24 /dev/urandom | base64 2>/dev/null | tr -d '/+=' | head -c 24 ) || echo "bn$(date +%s)$RANDOM"; }
+# 16 letters and digits: about 95 random bits, and short in a share code.
+gen_token(){ ( head -c 24 /dev/urandom | base64 2>/dev/null | tr -d '/+=' | head -c 16 ) || echo "bn$(date +%s)$RANDOM"; }
 
 # new_cfg_file creates an EMPTY config at 0600 before anything is written into
 # it. Configs hold the shared token, so they must never be world-readable. The
@@ -1208,9 +1209,9 @@ EOF
   fi
   core_check "$cfg" || return 1
   install_health
-  systemctl enable "brokennode@$name" >/dev/null 2>&1; systemctl restart "brokennode@$name"; sleep 1.5
-  if [ "$(systemctl is-active "brokennode@$name" 2>/dev/null)" = active ]; then info "Tunnel '$name' is ${C_G}active${C_N}."
-  else err "Tunnel '$name' failed to start. Recent log:"; journalctl -u "brokennode@$name" -n 10 --no-pager 2>/dev/null | sed 's/^/    /'; fi
+  start_tunnel_unit "$name"
+  # The other end, as one paste: nothing to retype on the other server.
+  show_pair_code "$name" 0
 }
 
 create_tunnel(){
@@ -1335,9 +1336,9 @@ EOF
   fi
 
   install_health
-  systemctl enable "brokennode@$name" >/dev/null 2>&1; systemctl restart "brokennode@$name"; sleep 1.5
-  if [ "$(systemctl is-active "brokennode@$name" 2>/dev/null)" = active ]; then info "Tunnel '$name' is ${C_G}active${C_N}."
-  else err "Tunnel '$name' failed to start. Recent log:"; journalctl -u "brokennode@$name" -n 10 --no-pager 2>/dev/null | sed 's/^/    /'; fi
+  start_tunnel_unit "$name"
+  # The other end, as one paste: nothing to retype on the other server.
+  show_pair_code "$name" 0
 }
 
 # link_state reports the REAL connection state by looking at the most recent
@@ -2752,6 +2753,7 @@ manage_tunnels(){
       echo -e "   ${C_G}15) Speed test${C_N}  ${C_D}(download/upload/ping through this tunnel)${C_N}"
       echo -e "   ${C_G}16) Apply preset${C_N}  ${C_D}(Optimized/High-Speed/Stable/Low-Latency/Eco)${C_N}   ${C_G}17) Port-forwards${C_N}  ${C_D}(add / remove / replace)${C_N}"
       echo -e "   ${C_G}18) Diagnose${C_N}  ${C_D}(connected but users get nothing? checks every port end to end, firewall, NAT rules)${C_N}"
+      echo -e "   ${C_G}19) Share code${C_N}  ${C_D}(one line to paste on the other server: it sets up its end of this tunnel)${C_N}"
       echo "   0) Back"
       case "$(menu_ask 'Choice')" in
         1) systemctl enable --now "brokennode@$n" >/dev/null 2>&1; systemctl start "brokennode@$n"; info "started";;
@@ -2780,11 +2782,951 @@ manage_tunnels(){
         16) apply_preset "$n";;
         17) manage_ports "$n";;
         18) diagnose "$n";;
+        19) SHARE_PUB=""; show_pair_code "$n" 1; read -rp "  ▶ press ENTER to continue... " _;;
         __eof__) return;;
         0) break;;
         *) warn "Invalid.";;
       esac
     done
+  done
+}
+
+
+# --- Share codes ---------------------------------------------------------------
+#
+# Setting up the second server of a tunnel used to mean retyping everything the
+# first one was given (transport, encryption, token, tunnel addresses, ports,
+# keys) and one typo kept the tunnel down. And when a server's IP got filtered,
+# every tunnel on it had to be built again on the new one by hand.
+#
+# A share code carries that instead, as one line to paste into the other
+# server's terminal:
+#   pair    the OTHER end of one tunnel, already mirrored for that server:
+#           mode swapped, addresses swapped, the address it must dial filled
+#           in. Made on either end. Pasted on a server that already has this
+#           tunnel (same token), it updates it in place.
+#   backup  every tunnel on this server, as they are. Pasted on a new server
+#           it rebuilds them all, and prints a pair code for every other
+#           server that has to learn the new address.
+# A code is a short line of letters and digits in groups of six (the format is
+# described at encode() below). It holds the tunnels' tokens: it is a secret.
+
+# bnshare SUBCOMMAND ... — the share code helpers:
+#   pair CFG NAME PUBIP        the pair code of tunnel NAME (PUBIP: this
+#                              server's public IP, for the end that dials it)
+#   backup CFGDIR IP4 IP6 HOST OFF
+#                              the backup code of every tunnel in CFGDIR;
+#                              OFF: the stopped ones, comma-separated
+#   probe TEXT                 succeeds when TEXT holds a whole, valid code
+#   encode FILE                the code of the body in FILE (for the tests)
+#   unpack TEXT DIR            one config per tunnel into DIR/<i>.json; prints
+#                              "kind count ip4 ip6 host", then "i name on|off"
+#   match CFGDIR TOKEN         "name mode" of every tunnel with TOKEN
+#   merge CFG NEW OUT          CFG updated from the pair code's NEW into OUT
+bnshare(){
+  python3 - "$@" <<'PYEOF'
+import glob, ipaddress, json, os, re, sys, zlib
+
+P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp")
+# What belongs to ONE server and never travels to the other: its user ports,
+# quotas and proxy, where it delivers, its device name, its extra local
+# addresses and its certificate files.
+LOCAL = {"ports", "quota_total_gb", "quota_up_gb", "quota_down_gb", "socks",
+         "socks_user", "socks_pass", "socks_open", "target_host", "tun_name",
+         "sctp_multihoming", "tls_cert", "tls_key", "tls_auto_email",
+         "tls_auto_cache"}
+# What the two ends must agree on. The code speaks for the other end: one of
+# these it does not carry is unset there, so an update removes it here too
+# (padding left on at one end alone would keep the tunnel down).
+MATCH = {"transport", "encryption", "token", "direction", "pad", "ws_path",
+         "server_name", "alpn", "reality_dest", "reality_server_name",
+         "kcp_mode", "kcp_data", "kcp_parity", "kcp_mtu", "keepalive", "mtu",
+         "carrier_port", "gre_key", "l2tp_tunnel_id", "l2tp_session_id",
+         "l2tp_encap", "l2tp_port", "tls_selfsigned", "tls_insecure"}
+SWAP = {"local_ip": "remote_ip", "remote_ip": "local_ip",
+        "tun_local": "tun_remote", "tun_remote": "tun_local"}
+WILD = ("", "0.0.0.0", "::", "*")
+
+
+def fail(msg):
+    sys.stderr.write("\033[0;31m  [x]\033[0m %s\n" % msg)
+    sys.exit(1)
+
+
+def load(path):
+    with open(path) as f:
+        d = json.load(f)
+    if not isinstance(d, dict):
+        raise ValueError("not a JSON object")
+    return d
+
+
+def save(path, d):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as o:
+        json.dump(d, o, indent=2)
+        o.write("\n")
+
+
+def split_hp(addr):
+    addr = str(addr or "").strip()
+    if ":" not in addr:
+        return None, None
+    host, port = addr.rsplit(":", 1)
+    return host.strip("[]"), port
+
+
+def hostport(host, port):
+    return ("[%s]:%s" if ":" in host else "%s:%s") % (host, port)
+
+
+def private(host):
+    """An address other servers cannot dial (a VPS behind NAT listens on one)."""
+    try:
+        a = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(a in ipaddress.ip_network(n) for n in (
+        "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8",
+        "169.254.0.0/16", "fc00::/7", "fe80::/10", "::1/128"))
+
+
+def mirror(src, pubip):
+    """The other end of tunnel src, as that server must run it."""
+    out = {}
+    for k, v in src.items():
+        if k in LOCAL or k in SWAP or k in ("mode", "bind_addr", "remote_addr", "tls_selfsigned", "tls_insecure"):
+            continue
+        out[k] = v
+    out["mode"] = "client" if src.get("mode") == "server" else "server"
+    for k, other in SWAP.items():
+        if src.get(k) not in (None, ""):
+            out[other] = src[k]
+    if src.get("transport") not in P2P:
+        # Where this end listens, the other dials; where this end dials, the
+        # other listens. Both addresses are kept when a tunnel is flipped, so
+        # both are mirrored, and flipping back works on either server.
+        stream_direct = str(src.get("direction") or "").strip().lower() == "direct"
+        listens = (src.get("mode") == "server") != stream_direct
+        host, port = split_hp(src.get("bind_addr"))
+        if port:
+            if host in WILD or private(host):
+                host = pubip
+            if host:
+                out["remote_addr"] = hostport(host, port)
+            elif listens:
+                fail("the other server dials this one: this server's public IP is needed")
+        host, port = split_hp(src.get("remote_addr"))
+        if port:
+            out["bind_addr"] = ("[::]:%s" if host and ":" in host else "0.0.0.0:%s") % port
+    # tls_selfsigned (the listening end) and tls_insecure (the dialing end)
+    # both mean "a self-signed pair" and the core honours either on either
+    # end, so the mirror carries both: it stays right after a direction flip.
+    if src.get("tls_selfsigned") or src.get("tls_insecure"):
+        out["tls_selfsigned"] = True
+        out["tls_insecure"] = True
+    # Nothing that says nothing, so the code stays short: kcp's settings on
+    # another transport, the default log level, tuning left at 0 (= auto).
+    if out.get("transport") != "kcp":
+        for k in ("kcp_mode", "kcp_data", "kcp_parity", "kcp_sndwnd", "kcp_rcvwnd", "kcp_mtu"):
+            out.pop(k, None)
+    # The core's defaults: unset at the other end means the same.
+    for k, d in (("log_level", "info"), ("keepalive", 10), ("mtu", 0)):
+        if out.get(k) == d:
+            del out[k]
+    for k in list(out):
+        if k not in MATCH and k not in SWAP and out[k] in (0, "", False, None) and out[k] is not True:
+            del out[k]
+    return out
+
+
+def clean(v):
+    """v without control characters: values from a pasted code are printed
+    on the terminal, and an escape sequence in one would act on it."""
+    if isinstance(v, str):
+        return re.sub(r"[\x00-\x1f\x7f]", "", v)
+    if isinstance(v, list):
+        return [clean(x) for x in v]
+    if isinstance(v, dict):
+        return dict((clean(k), clean(x)) for k, x in v.items())
+    return v
+
+
+# --- the code format ----------------------------------------------------------
+# A code is short enough to read: the body (a dict) packed into bytes — every
+# known key and common value a single byte, addresses as their bytes, a
+# token as 6 bits a character — deflated when that is shorter, a 3-byte
+# checksum after it, written in base58 (no 0 O I l to confuse) in groups of 6.
+# KEYS and WORDS are append-only: a code names keys and words by position.
+KEYS = ["v", "k", "m", "t", "n", "c", "off", "from", "ip4", "ip6", "host",
+        "mode", "transport", "encryption", "token", "log_level", "direction",
+        "bind_addr", "ports", "remote_addr", "target_host", "ws_path",
+        "keepalive", "server_name", "alpn", "tls_cert", "tls_key",
+        "tls_selfsigned", "tls_auto_email", "tls_auto_cache", "tls_insecure",
+        "tls_fingerprint", "tls_fragment", "reality_dest", "reality_server_name",
+        "socks", "socks_user", "socks_pass", "socks_open", "pad", "pool_size",
+        "pool_min_idle", "links", "links_max", "links_per_link", "quota_total_gb",
+        "quota_up_gb", "quota_down_gb", "smux_recv_mb", "smux_stream_mb",
+        "smux_frame_kb", "kcp_mode", "kcp_data", "kcp_parity", "carrier_port",
+        "tun_name", "tun_local", "tun_remote", "mtu", "local_ip", "remote_ip",
+        "gre_key", "tun_ttl", "sctp_streams", "sctp_multihoming",
+        "l2tp_tunnel_id", "l2tp_session_id", "l2tp_encap", "l2tp_port",
+        "ws_host", "ws_user_agent", "kcp_sndwnd", "kcp_rcvwnd", "kcp_mtu"]
+WORDS = ["pair", "backup", "server", "client", "reverse", "direct", "tcp", "mtcp",
+         "mptcp", "ws", "tcpnomux", "kcp", "sctp", "udp", "icmp", "gre", "gretap",
+         "ipip", "sit", "l2tp", "none", "aead", "obfs", "tls", "reality", "fast",
+         "normal", "turbo", "gaming", "info", "debug", "warn", "error", "chrome",
+         "firefox", "safari", "edge", "ios", "random", "127.0.0.1", "::1",
+         "www.microsoft.com:443", "/", "h2,http/1.1", "443/both", "443", "ip",
+         "tcpobf", "mtcpobf", "wsobf", "rawmux", "0.0.0.0:1080", "127.0.0.1:1080"]
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+(T_NULL, T_FALSE, T_TRUE, T_UINT, T_NEG, T_FLOAT, T_STR, T_WORD, T_IP4, T_IP6,
+ T_HP4, T_HP6, T_ANYPORT, T_HOSTPORT, T_B64, T_LIST, T_DICT) = range(17)
+
+
+def uvar(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7f
+        n >>= 7
+        out.append(b | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def pack(v):
+    if v is None:
+        return bytes([T_NULL])
+    if v is True or v is False:
+        return bytes([T_TRUE if v else T_FALSE])
+    if isinstance(v, int):
+        return bytes([T_UINT]) + uvar(v) if v >= 0 else bytes([T_NEG]) + uvar(-v)
+    if isinstance(v, float):
+        s = repr(v).encode()
+        return bytes([T_FLOAT]) + uvar(len(s)) + s
+    if isinstance(v, list):
+        return bytes([T_LIST]) + uvar(len(v)) + b"".join(pack(x) for x in v)
+    if isinstance(v, dict):
+        out = bytearray([T_DICT]) + uvar(len(v))
+        for k, x in v.items():
+            if k in KEYS:
+                out += uvar(KEYS.index(k) + 1)
+            else:
+                kb = k.encode()
+                out += uvar(0) + uvar(len(kb)) + kb
+            out += pack(x)
+        return bytes(out)
+    s = str(v)
+    if s in WORDS:
+        return bytes([T_WORD]) + uvar(WORDS.index(s))
+    try:
+        a = ipaddress.ip_address(s)
+        if str(a) == s:
+            return bytes([T_IP6 if a.version == 6 else T_IP4]) + a.packed
+    except ValueError:
+        pass
+    host, port = split_hp(s)
+    if port and port.isdigit() and 0 < int(port) < 65536 and str(int(port)) == port:
+        p = int(port).to_bytes(2, "big")
+        if host in ("0.0.0.0",):
+            return bytes([T_ANYPORT]) + p
+        try:
+            a = ipaddress.ip_address(host)
+            if str(a) == host and s == hostport(host, port):
+                return bytes([T_HP6 if a.version == 6 else T_HP4]) + a.packed + p
+        except ValueError:
+            pass
+        if s == host + ":" + port:
+            hb = host.encode()
+            return bytes([T_HOSTPORT]) + uvar(len(hb)) + hb + p
+    if s and len(s) <= 255 and all(ch in B64 for ch in s):
+        n = 0
+        for ch in s:
+            n = n * 64 + B64.index(ch)
+        return bytes([T_B64, len(s)]) + n.to_bytes((len(s) * 6 + 7) // 8, "big")
+    b = s.encode()
+    return bytes([T_STR]) + uvar(len(b)) + b
+
+
+class Reader(object):
+    def __init__(self, b):
+        self.b, self.i = b, 0
+
+    def take(self, n):
+        if self.i + n > len(self.b):
+            raise ValueError("short")
+        out = self.b[self.i:self.i + n]
+        self.i += n
+        return out
+
+    def uvar(self):
+        n = shift = 0
+        while True:
+            c = self.take(1)[0]
+            n |= (c & 0x7f) << shift
+            shift += 7
+            if not c & 0x80:
+                return n
+            if shift > 63:
+                raise ValueError("varint")
+
+    def value(self, depth=0):
+        if depth > 8:
+            raise ValueError("too deep")
+        t = self.take(1)[0]
+        if t == T_NULL:
+            return None
+        if t in (T_FALSE, T_TRUE):
+            return t == T_TRUE
+        if t == T_UINT:
+            return self.uvar()
+        if t == T_NEG:
+            return -self.uvar()
+        if t == T_FLOAT:
+            return float(self.take(self.uvar()).decode())
+        if t == T_STR:
+            return self.take(self.uvar()).decode()
+        if t == T_WORD:
+            return WORDS[self.uvar()]
+        if t in (T_IP4, T_IP6):
+            return str(ipaddress.ip_address(bytes(self.take(4 if t == T_IP4 else 16))))
+        if t in (T_HP4, T_HP6):
+            a = str(ipaddress.ip_address(bytes(self.take(4 if t == T_HP4 else 16))))
+            return hostport(a, int.from_bytes(self.take(2), "big"))
+        if t == T_ANYPORT:
+            return "0.0.0.0:%d" % int.from_bytes(self.take(2), "big")
+        if t == T_HOSTPORT:
+            h = self.take(self.uvar()).decode()
+            return "%s:%d" % (h, int.from_bytes(self.take(2), "big"))
+        if t == T_B64:
+            ln = self.take(1)[0]
+            n = int.from_bytes(self.take((ln * 6 + 7) // 8), "big")
+            s = ""
+            for _ in range(ln):
+                n, r = divmod(n, 64)
+                s = B64[r] + s
+            return s
+        if t == T_LIST:
+            return [self.value(depth + 1) for _ in range(self.uvar())]
+        if t == T_DICT:
+            d = {}
+            for _ in range(self.uvar()):
+                k = self.uvar()
+                k = self.take(self.uvar()).decode() if k == 0 else KEYS[k - 1]
+                d[k] = self.value(depth + 1)
+            return d
+        raise ValueError("type %d" % t)
+
+
+HEAD = ("mode", "transport", "encryption", "direction")
+
+
+def pack_cfg(c):
+    """A config: its four main settings a byte each, then the rest."""
+    c = dict(c)
+    head = b""
+    for k in HEAD:
+        v = c.pop(k, None)
+        if isinstance(v, str) and v in WORDS:
+            head += uvar(WORDS.index(v) + 1)
+        else:
+            head += uvar(0)
+            if v is not None:
+                c[k] = v
+    return head + pack(c)
+
+
+def read_cfg(r):
+    head = [r.uvar() for _ in HEAD]
+    c = r.value()
+    if not isinstance(c, dict):
+        raise ValueError("config")
+    for k, w in zip(HEAD, head):
+        if w:
+            c[k] = WORDS[w - 1]
+    return c
+
+
+def pack_body(body):
+    """version and kind in one byte, then the tunnels."""
+    kind = body["k"]
+    out = bytearray([0x10 | (1 if kind == "backup" else 0)])
+    if kind == "backup":
+        m = body.get("m") or {}
+        out += pack(m.get("ip4") or "") + pack(m.get("ip6") or "") + pack(m.get("host") or "")
+        out += uvar(len(body["t"]))
+    for t in body["t"]:
+        out += pack(str(t["n"]))
+        if kind == "backup":
+            out.append(1 if t.get("off") else 0)
+        out += pack_cfg(t["c"])
+    return bytes(out)
+
+
+def read_body(raw):
+    r = Reader(raw)
+    vk = r.take(1)[0]
+    if vk >> 4 != 1:
+        raise KeyError("version")
+    kind = "backup" if vk & 1 else "pair"
+    body = {"v": 1, "k": kind, "m": {}, "t": []}
+    n = 1
+    if kind == "backup":
+        body["m"] = {"ip4": r.value(), "ip6": r.value(), "host": r.value()}
+        n = r.uvar()
+        if n > 1000:
+            raise ValueError("count")
+    for _ in range(n):
+        t = {"n": r.value()}
+        if kind == "backup" and r.take(1)[0]:
+            t["off"] = True
+        t["c"] = read_cfg(r)
+        body["t"].append(t)
+    if r.i != len(raw):
+        raise ValueError("trailing bytes")
+    return body
+
+
+def encode(body):
+    raw = pack_body(body)
+    z = zlib.compressobj(9, zlib.DEFLATED, -15)
+    zd = z.compress(raw) + z.flush()
+    data = bytes([2]) + zd if len(zd) < len(raw) else bytes([1]) + raw
+    data += (zlib.crc32(data) & 0xffffff).to_bytes(3, "big")
+    n, s = int.from_bytes(data, "big"), ""
+    while n:
+        n, r = divmod(n, 58)
+        s = B58[r] + s
+    return "-".join(s[i:i + 6] for i in range(0, len(s), 6))
+
+
+def unbase58(s):
+    n = 0
+    for ch in s:
+        n = n * 58 + B58.index(ch)
+    return n.to_bytes((n.bit_length() + 7) // 8, "big")
+
+
+def decode(text):
+    # What was pasted may be the whole line ("BrokenNode import <code>"), or
+    # the code broken over several lines: the code is everything else, joined.
+    words = [w for w in text.split() if w.lower() not in ("brokennode", "import", "sudo", "bash")]
+    s = "".join(words).replace("-", "")
+    if not s:
+        fail("no share code in what was pasted")
+    if any(ch not in B58 for ch in s):
+        fail("that is not a share code: it has characters a code never has")
+    try:
+        data = unbase58(s)
+        if len(data) < 5 or (zlib.crc32(data[:-3]) & 0xffffff).to_bytes(3, "big") != data[-3:]:
+            raise ValueError("checksum")
+        if data[0] not in (1, 2):
+            raise KeyError("version")
+        raw = data[1:-3]
+        if data[0] == 2:
+            z = zlib.decompressobj(-15)
+            # Capped: a short code must not unpack into gigabytes.
+            raw = z.decompress(raw, 4 << 20)
+            if z.unconsumed_tail or not z.eof:
+                raise ValueError("incomplete")
+        body = clean(read_body(raw))
+    except KeyError:
+        fail("the code was made by a newer BrokenNode: update this server first (menu 5)")
+    except Exception:
+        fail("the code is damaged or incomplete: copy it again, all of it")
+    if not isinstance(body, dict) or body.get("k") not in ("pair", "backup"):
+        fail("this is not a BrokenNode share code")
+    if body.get("v") != 1:
+        fail("the code was made by a newer BrokenNode: update this server first (menu 5)")
+    tunnels = body.get("t")
+    if not isinstance(tunnels, list) or not tunnels:
+        fail("the code holds no tunnel")
+    for t in tunnels:
+        if not isinstance(t, dict) or not isinstance(t.get("c"), dict):
+            fail("the code is damaged: a tunnel in it is not a config")
+        # The name becomes a file name here: only what a tunnel name may be.
+        t["n"] = re.sub(r"[^A-Za-z0-9_-]", "", str(t.get("n") or ""))[:40] or "main"
+    return body
+
+
+cmd, args = sys.argv[1], sys.argv[2:]
+if cmd == "pair":
+    path, name, pubip = args
+    try:
+        src = load(path)
+    except Exception as e:
+        fail("cannot read %s: %s" % (path, e))
+    print(encode({"v": 1, "k": "pair", "t": [{"n": name, "c": mirror(src, pubip)}]}))
+elif cmd == "backup":
+    cfgdir, ip4, ip6, host, off = args
+    off = set(off.split(","))
+    tunnels = []
+    for f in sorted(glob.glob(os.path.join(cfgdir, "*.json"))):
+        n = os.path.basename(f)[:-5]
+        try:
+            t = {"n": n, "c": load(f)}
+            if n in off:
+                t["off"] = True
+            tunnels.append(t)
+        except Exception as e:
+            sys.stderr.write("\033[1;33m  [!]\033[0m %s is not a valid config (%s) — left out\n" % (f, e))
+    if not tunnels:
+        fail("there is no tunnel on this server to back up")
+    print(encode({"v": 1, "k": "backup", "m": {"ip4": ip4, "ip6": ip6, "host": host}, "t": tunnels}))
+elif cmd == "encode":
+    # The body of a code from a JSON file, as it is: for the tests.
+    print(encode(load(args[0])))
+elif cmd == "probe":
+    devnull = open(os.devnull, "w")
+    sys.stderr = devnull
+    decode(args[0])
+elif cmd == "unpack":
+    body = decode(args[0])
+    m = body.get("m") if isinstance(body.get("m"), dict) else {}
+    field = lambda v: re.sub(r"[\s]", "", str(v or "")) or "-"
+    print("\t".join([body["k"], str(len(body["t"])), field(m.get("ip4")), field(m.get("ip6")), field(m.get("host") or m.get("from"))]))
+    for i, t in enumerate(body["t"], 1):
+        if body["k"] == "pair":
+            # Never in a pair code made here; dropped from any other, so a
+            # code cannot open a proxy or point at files on this server.
+            for k in LOCAL:
+                t["c"].pop(k, None)
+        save(os.path.join(args[1], "%d.json" % i), t["c"])
+        print("%d\t%s\t%s" % (i, t["n"], "off" if t.get("off") else "on"))
+elif cmd == "match":
+    cfgdir, token = args
+    for f in sorted(glob.glob(os.path.join(cfgdir, "*.json"))):
+        try:
+            c = load(f)
+        except Exception:
+            continue
+        if token and c.get("token") == token:
+            print("%s\t%s" % (os.path.basename(f)[:-5], c.get("mode") or "-"))
+elif cmd == "merge":
+    cur, new = load(args[0]), load(args[1])
+    stream = lambda c: c.get("transport") not in P2P
+    if stream(cur) != stream(new):
+        # A switch between a stream transport and a point-to-point tunnel:
+        # the old kind's addresses mean nothing any more.
+        for k in (("local_ip", "remote_ip", "tun_local", "tun_remote") if stream(new) else ("bind_addr", "remote_addr")):
+            cur.pop(k, None)
+    for k in MATCH:
+        if k not in new:
+            cur.pop(k, None)
+    cur.update(new)
+    save(args[2], cur)
+else:
+    fail("bnshare: unknown command %s" % cmd)
+PYEOF
+}
+
+# is_private_ip ADDR — ADDR is one no other server can reach directly: RFC 1918,
+# carrier-grade NAT, loopback, link-local or a v6 ULA. A VPS behind NAT reports
+# such an address as its own.
+is_private_ip(){
+  python3 - "$1" <<'PYEOF' 2>/dev/null
+import ipaddress, sys
+a = ipaddress.ip_address(sys.argv[1])
+nets = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8",
+        "169.254.0.0/16", "fc00::/7", "fe80::/10", "::1/128"]
+sys.exit(0 if any(a in ipaddress.ip_network(n) for n in nets) else 1)
+PYEOF
+}
+
+# has_local_addr ADDR — an interface of this machine holds ADDR.
+has_local_addr(){ ip -o addr show 2>/dev/null | awk '{print $4}' | sed 's#/.*##' | grep -qxF "$1"; }
+
+# share_pubip ASK — this server's public IP, the one the other server dials.
+# Detected; asked (the detected one offered) when ASK is 1 or when detection
+# finds none or a private address. Asked once per run.
+share_pubip(){
+  if [ -n "${SHARE_PUB:-}" ]; then echo "$SHARE_PUB"; return 0; fi
+  local d def; d="$(detect_ip)"
+  if [ "${1:-0}" = 1 ] || [ -z "$d" ] || is_private_ip "$d"; then
+    [ -n "$d" ] && is_private_ip "$d" && echo -e "  ${C_D}$d is a private address (this server is behind NAT): give its PUBLIC IP.${C_N}" >&2
+    def="$d"
+    while :; do
+      d=$(ask "This server's public IP (the other server connects to it)" "$def"); d="${d// /}"; d="${d#[}"; d="${d%]}"
+      { is_ipv4 "$d" || is_ipv6 "$d"; } && break
+      warn "'$d' is not an IPv4 or IPv6 address." >&2
+    done
+  fi
+  SHARE_PUB="$d"; echo "$d"
+}
+
+# pair_code NAME ASK — the pair code of tunnel NAME. This server's public IP
+# goes in only when the other end dials this one and the listen address is
+# not one it can dial (the wildcard, or a private address behind NAT).
+pair_code(){
+  local n="$1" cfg="$CFG_DIR/$1.json" ip="" b h
+  [ -f "$cfg" ] || { err "There is no tunnel '$n' on this server."; return 1; }
+  if [ "$(transport_family "$(jget "$cfg" transport)")" = stream ] && tunnel_listens "$cfg"; then
+    b="$(jget "$cfg" bind_addr)"; h="${b%:*}"; h="${h#[}"; h="${h%]}"
+    case "$h" in
+      ""|0.0.0.0|::|"*") ip="$(share_pubip "${2:-0}")" ;;
+      *) is_private_ip "$h" && ip="$(share_pubip "${2:-0}")" ;;
+    esac
+  fi
+  bnshare pair "$cfg" "$n" "$ip"
+}
+
+# print_code CODE — the line that imports CODE on another server, and the one
+# for a server without BrokenNode yet (the installer installs, then imports).
+print_code(){
+  echo
+  echo "    BrokenNode import $1"
+  echo
+  echo -e "  ${C_D}No BrokenNode on that server yet? This line installs it and imports:${C_N}"
+  echo
+  echo "    bash <(curl -fsSL $INSTALL_URL) import $1"
+  echo
+  echo -e "  ${C_D}Or there: BrokenNode → 6) Share codes → 3) Paste a code, and paste just the code.${C_N}"
+}
+
+# show_pair_code NAME ASK — the code that sets up the other end of NAME.
+show_pair_code(){
+  local n="$1" cfg="$CFG_DIR/$1.json" code other="FOREIGN server"
+  code="$(pair_code "$n" "${2:-0}")" || return 1
+  [ "$(jget "$cfg" mode)" = client ] && other="IRAN server"
+  echo
+  echo -e "  ${C_B}Share code — sets up the other end of '$n' with one paste.${C_N}"
+  echo -e "  On the ${C_Y}$other${C_N}, paste this line into its terminal:"
+  print_code "$code"
+  [ -n "${SHARE_PUB:-}" ] && echo -e "  ${C_D}The other server will connect to this one at ${C_N}$SHARE_PUB${C_D}.${C_N}"
+  echo -e "  ${C_Y}The code holds this tunnel's secret token — keep it private.${C_N}"
+}
+
+# show_backup_code — one code with every tunnel on this server.
+show_backup_code(){
+  local f n=0 code
+  for f in "$CFG_DIR"/*.json; do [ -e "$f" ] && n=$((n+1)); done
+  [ "$n" -gt 0 ] || { warn "There are no tunnels on this server yet."; return 1; }
+  # Stopped tunnels are restored stopped.
+  local off="" t
+  for f in "$CFG_DIR"/*.json; do
+    [ -e "$f" ] || continue; t="$(basename "$f" .json)"
+    [ "$(systemctl is-enabled "brokennode@$t" 2>/dev/null)" = disabled ] && off="$off,$t"
+  done
+  code="$(bnshare backup "$CFG_DIR" "$(detect_ip)" "$(detect_ip6)" "$(hostname 2>/dev/null)" "${off#,}")" || return 1
+  echo
+  echo -e "  ${C_B}Backup code — all $n tunnel(s) of this server in one line.${C_N}"
+  echo -e "  ${C_D}Copy it NOW and keep it somewhere safe (Saved Messages, a note): once this server's IP${C_N}"
+  echo -e "  ${C_D}is filtered you may not reach it any more. On the new server, paste:${C_N}"
+  print_code "$code"
+  echo -e "  ${C_D}Every tunnel comes back as it was, and the new server prints a code for each other${C_N}"
+  echo -e "  ${C_D}server that has to learn its new IP.${C_N}"
+  echo -e "  ${C_Y}The code holds every tunnel's secret token — keep it private.${C_N}"
+}
+
+# read_code — a pasted code. Read with readline (-e): a terminal's line buffer
+# otherwise cuts a pasted line at 4095 characters, and a backup of many tunnels
+# is longer. Lines are joined until they make a whole code, so one a terminal
+# broke over several lines still comes through.
+read_code(){
+  local acc="" line
+  echo -e "  ${C_D}Paste the code, then press Enter (an empty line cancels).${C_N}" >&2
+  while :; do
+    if [ -t 0 ]; then IFS= read -r -e -p "  > " line || break
+    else IFS= read -r line || break; fi
+    [ -n "${line//[[:space:]]/}" ] || break
+    acc="$acc$line"
+    bnshare probe "$acc" && break
+    echo -e "  ${C_D}Not a whole code yet — paste the rest, or an empty line to stop.${C_N}" >&2
+  done
+  echo "$acc"
+}
+
+# share_name NAME — the name to import a tunnel under: NAME when no tunnel here
+# has it; otherwise asked, a free variant offered. A taken name is used only
+# when the operator agrees to replace that tunnel.
+share_name(){
+  local n="$1" alt i=2
+  [ -f "$CFG_DIR/$n.json" ] || { echo "$n"; return 0; }
+  while [ -f "$CFG_DIR/$n-$i.json" ]; do i=$((i+1)); done
+  warn "This server already has a different tunnel named '$n'." >&2
+  while :; do
+    alt=$(ask "Name for the imported tunnel" "$n-$i"); alt="$(echo "$alt" | tr -cd 'A-Za-z0-9_-')"
+    [ -n "$alt" ] || continue
+    [ -f "$CFG_DIR/$alt.json" ] || { echo "$alt"; return 0; }
+    yes_no "Replace the tunnel '$alt' that is here with this one? y/N" n && { echo "$alt"; return 0; }
+  done
+}
+
+# share_local_ip FILE KEEP — a point-to-point tunnel's local_ip must be an
+# address of this server. The one in a code may not be: the other server's
+# idea of this one (behind NAT it is the public address), or the OLD server's
+# in a backup. KEEP (the tunnel's current local_ip, on an update) is kept when
+# this server holds it; otherwise asked once per address family, the
+# detected address offered.
+share_local_ip(){
+  local f="$1" keep="${2:-}" cur fam=4 isfam=is_ipv4 d def var
+  cur="$(jget "$f" local_ip)"; [ -n "$cur" ] || return 0
+  has_local_addr "$cur" && return 0
+  case "$cur" in *:*) fam=6; isfam=is_ipv6 ;; esac
+  if [ -n "$keep" ] && $isfam "$keep" && has_local_addr "$keep"; then jset "$f" local_ip "$keep"; return 0; fi
+  var="SHARE_IP$fam"
+  if [ -z "${!var:-}" ]; then
+    if [ "$fam" = 6 ]; then def="$(detect_ip6)"; else def="$(detect_ip)"; fi
+    echo -e "  ${C_D}The code names $cur as this server's address, but no interface here holds it.${C_N}" >&2
+    while :; do
+      d=$(ask "This server's IPv$fam for point-to-point tunnels" "$def"); d="${d// /}"; d="${d#[}"; d="${d%]}"
+      $isfam "$d" && break
+      warn "'$d' is not an IPv$fam address." >&2
+    done
+    printf -v "$var" '%s' "$d"
+  fi
+  jset "$f" local_ip "${!var}"
+}
+
+# share_bind FILE — a listen address naming an IP this server does not have
+# (the old server's, in a backup) becomes the wildcard on the same port.
+share_bind(){
+  local f="$1" b h p w; b="$(jget "$f" bind_addr)"; [ -n "$b" ] || return 0
+  h="${b%:*}"; p="${b##*:}"; h="${h#[}"; h="${h%]}"
+  case "$h" in ""|0.0.0.0|::|"*") return 0 ;; esac
+  has_local_addr "$h" && return 0
+  w="0.0.0.0:$p"; case "$h" in *:*) w="[::]:$p" ;; esac
+  jset "$f" bind_addr "$w"
+  info "Listen address $b is not one of this server's: it listens on $w instead."
+}
+
+# start_tunnel_unit NAME — enable and (re)start the tunnel and say whether it
+# came up.
+start_tunnel_unit(){
+  local n="$1"
+  systemctl enable "brokennode@$n" >/dev/null 2>&1; systemctl restart "brokennode@$n"; sleep 1.5
+  if [ "$(systemctl is-active "brokennode@$n" 2>/dev/null)" = active ]; then info "Tunnel '$n' is ${C_G}active${C_N}."; return 0; fi
+  err "Tunnel '$n' failed to start. Recent log:"; journalctl -u "brokennode@$n" -n 10 --no-pager 2>/dev/null | sed 's/^/    /'
+  return 1
+}
+
+# share_install FILE NAME [off] — FILE becomes tunnel NAME and starts (with
+# "off": stays stopped, as it was on the server the backup came from).
+# Replacing a tunnel goes through cfg_begin/cfg_commit: one the core refuses
+# is rolled back rather than lost.
+share_install(){
+  local f="$1" n="$2" cfg="$CFG_DIR/$2.json"
+  if [ -f "$cfg" ]; then
+    cfg_begin "$cfg"; cat "$f" > "$cfg"; cfg_commit "$cfg" || return 1
+  else
+    new_cfg_file "$cfg"; cat "$f" > "$cfg"; core_check "$cfg" || return 1
+  fi
+  install_health
+  if [ "${3:-}" = off ]; then
+    systemctl disable --now "brokennode@$n" >/dev/null 2>&1
+    info "Tunnel '$n' restored, stopped (it was stopped there too)."
+    return 0
+  fi
+  start_tunnel_unit "$n"
+}
+
+# import_note CFG — what this server still needs after an import.
+import_note(){
+  local cfg="$1" dir listens addr ports ip proto=tcp
+  IFS=$'\t' read -r dir listens addr ports < <(tunnel_summary "$cfg")
+  if [ "$(jget "$cfg" mode)" = server ] && [ "$ports" != "?" ]; then
+    ip="$(detect_ip)"
+    echo -e "  ${C_G}Users / client configs connect to${C_N} ${C_Y}${ip:-THIS-SERVER-IP}${C_N} ${C_D}ports${C_N} ${C_Y}$(printf '%s' "$ports" | sed 's#=[0-9]*##g; s#/[a-z]*##g')${C_N}"
+  fi
+  [ -n "$(jget "$cfg" socks)" ] && socks_summary "$cfg"
+  if [ "$(transport_family "$(jget "$cfg" transport)")" = stream ] && [ "$listens" = 1 ]; then
+    [ "$(jget "$cfg" transport)" = kcp ] && proto=udp
+    echo -e "  ${C_D}The other server connects to this one on ${proto^^} ${addr##*:}: allow it inbound in the firewall (e.g. ufw allow ${addr##*:}/$proto).${C_N}"
+  fi
+}
+
+# import_pair DIR — set up (or update) this end of the tunnel in a pair code.
+import_pair(){
+  local tmp="$1" i name f mode tr enc
+  IFS=$'\t' read -r i name _ < <(sed -n 2p "$tmp/list")
+  f="$tmp/$i.json"
+  mode="$(jget "$f" mode)"; tr="$(jget "$f" transport)"; enc="$(jget "$f" encryption)"
+  local role="the FOREIGN server (client)" other="the Iran server"
+  [ "$mode" = server ] && { role="the IRAN relay (server)"; other="the foreign server"; }
+  echo
+  echo -e "  ${C_B}Tunnel '$name'${C_N}: ${C_Y}$tr${C_N} + ${C_Y}${enc:-none}${C_N}${C_D}, direction $(direction_label "$f")${C_N}"
+  echo -e "  This server becomes ${C_Y}$role${C_N} of it."
+
+  # The same tunnel (same token) already here: update it in place. The same
+  # tunnel as the OTHER end: the code was pasted back on the server that made it.
+  local tok en em same="" self=""; tok="$(jget "$f" token)"
+  while IFS=$'\t' read -r en em; do
+    [ -n "$en" ] || continue
+    if [ "$em" = "$mode" ]; then same="$en"; else self="$en"; fi
+  done < <(bnshare match "$CFG_DIR" "$tok")
+  if [ -z "$same" ] && [ -n "$self" ]; then
+    warn "This code was made on THIS server (from its tunnel '$self'): paste it on $other."
+    yes_no "Import it here anyway? y/N" n || { warn "Cancelled."; return 1; }
+  fi
+  local target update=0 cfg
+  if [ -n "$same" ]; then
+    echo -e "  ${C_D}This server already has this tunnel, as '$same' (same token).${C_N}"
+    yes_no "Update '$same' to match the other server? Y/n" y || { warn "Cancelled."; return 1; }
+    target="$same"; update=1
+  else
+    target="$(share_name "$name")" || return 1
+  fi
+  cfg="$CFG_DIR/$target.json"
+
+  [ "$(transport_family "$tr")" = stream ] || share_local_ip "$f" "$([ "$update" = 1 ] && jget "$cfg" local_ip)"
+  local final="$f"
+  if [ "$update" = 1 ]; then bnshare merge "$cfg" "$f" "$f.new" || return 1; final="$f.new"; fi
+  # What a code cannot carry: where the foreign end delivers, and the user
+  # ports of the relay (the foreign server does not know them).
+  if [ "$mode" = client ] && [ -z "$(jget "$final" target_host)" ]; then
+    if [ "$tr" = sit ]; then jset "$final" target_host ::1; else jset "$final" target_host 127.0.0.1; fi
+  fi
+  local own=""
+  if [ "$(transport_family "$tr")" = stream ] && tunnel_listens "$final"; then
+    own="$(jget "$final" bind_addr)"; own="${own##*:}"
+    warn_port_clash "" "$target" "$own" "$([ "$tr" = kcp ] && echo udp || echo tcp)" || true
+  fi
+  if [ "$mode" = server ] && [ -z "$(jget "$final" socks)" ] && [ -z "$(jq_ports "$final")" ]; then
+    echo -e "  ${C_D}The code comes from the foreign server, which does not know the user ports: give them here.${C_N}"
+    local p
+    while :; do
+      p="$(ask_ports "$target")"
+      # The tunnel's own port cannot also be a user port (the core refuses it).
+      case ",$(printf '%s' "$p" | tr -d '"' | sed 's#=[0-9]*##g; s#/[a-z]*##g')," in
+        *",$own,"*) [ -n "$own" ] && { warn "Port $own is the tunnel's own port here — give the users another one."; continue; } ;;
+      esac
+      break
+    done
+    jmerge "$final" "{\"ports\":[$p]}"
+  fi
+  if [ "$enc" = tls ] && tunnel_listens "$final" && [ "$(onoff "$final" tls_selfsigned)" = off ] && [ "$(onoff "$final" tls_insecure)" = off ] && [ -z "$(jget "$final" tls_cert)" ]; then
+    warn "This end shows the TLS certificate, and the other server checks it against a real CA:"
+    echo -e "  ${C_D}it is fetched from Let's Encrypt, so ${C_N}$(jget "$final" server_name)${C_D} must point to this server and the tunnel must${C_N}"
+    echo -e "  ${C_D}listen on port 443 — or set certificate files later in 14) Encryption & stealth.${C_N}"
+  fi
+  share_install "$final" "$target" || return 1
+  [ "$update" = 1 ] && info "Updated '$target' to match the other server."
+  import_note "$cfg"
+}
+
+# import_backup DIR — rebuild every tunnel of a backup code on this server,
+# then print the code each other server needs to learn this server's address.
+import_backup(){
+  local tmp="$1" kind count oip4 oip6 ohost i name f
+  IFS=$'\t' read -r kind count oip4 oip6 ohost < <(head -n 1 "$tmp/list")
+  [ "$oip4" = - ] && oip4=""; [ "$oip6" = - ] && oip6=""; [ "$ohost" = - ] && ohost="another server"
+  echo
+  echo -e "  ${C_B}Backup of $count tunnel(s)${C_N} from ${C_Y}$ohost${C_N}${C_D}${oip4:+ ($oip4)}${C_N}:"
+  local on
+  while IFS=$'\t' read -r i name on; do
+    f="$tmp/$i.json"
+    printf "   %-16s ${C_D}%s/%s + %s, %s%s${C_N}\n" "$name" "$(jget "$f" mode)" "$(jget "$f" transport)" "$(jget "$f" encryption)" "$(direction_label "$f")" "$([ "$on" = off ] && echo ', stopped')"
+  done < <(tail -n +2 "$tmp/list")
+  yes_no "Restore them on this server? Y/n" y || { warn "Cancelled."; return 1; }
+
+  local restored=() peers=() target was pub=""
+  while IFS=$'\t' read -r i name on <&3; do
+    f="$tmp/$i.json"; target="$name"
+    echo; echo -e "  ${C_B}$name${C_N}"
+    if [ -f "$CFG_DIR/$name.json" ]; then
+      if [ "$(jget "$CFG_DIR/$name.json" token)" = "$(jget "$f" token)" ]; then
+        yes_no "'$name' is already on this server. Replace it with the backup? y/N" n || { info "Kept '$name' as it is."; continue; }
+      else
+        target="$(share_name "$name")" || continue
+      fi
+    fi
+    was="$(jget "$f" local_ip)"
+    if [ "$(transport_family "$(jget "$f" transport)")" = stream ]; then share_bind "$f"; else share_local_ip "$f"; fi
+    if [ -n "$(jget "$f" sctp_multihoming)" ]; then
+      jset "$f" sctp_multihoming "" del
+      warn "Dropped sctp_multihoming: those were the old server's extra addresses."
+    fi
+    local k p
+    for k in tls_cert tls_key; do
+      p="$(jget "$f" "$k")"
+      [ -n "$p" ] && [ ! -f "$p" ] && warn "$k $p does not exist on this server: copy it here, or switch to self-signed (14 Encryption & stealth)."
+    done
+    share_install "$f" "$target" "$on" || continue
+    restored+=("$target")
+    # Does the other end have to learn this server's address? It does when it
+    # dials this one (a stream tunnel that listens here) or names it (every
+    # point-to-point tunnel), and the address changed.
+    local cfg="$CFG_DIR/$target.json"
+    if [ "$(transport_family "$(jget "$cfg" transport)")" = stream ]; then
+      if tunnel_listens "$cfg"; then
+        [ -n "$pub" ] || pub="$(share_pubip 0)"
+        [ "$pub" != "$oip4" ] && [ "$pub" != "$oip6" ] && peers+=("$target")
+      fi
+    elif [ "$(jget "$cfg" local_ip)" != "$was" ]; then
+      peers+=("$target")
+    fi
+  done 3< <(tail -n +2 "$tmp/list")
+
+  echo
+  if [ "${#restored[@]}" -gt 0 ]; then info "Restored ${#restored[@]} of $count tunnel(s): ${restored[*]}."
+  else warn "No tunnel was restored."; fi
+  [ "${#peers[@]}" -gt 0 ] || return 0
+  echo
+  echo -e "  ${C_B}The other servers still know this server's OLD address.${C_N}"
+  echo -e "  ${C_D}Paste each line on the server named: it updates its end of that tunnel in place.${C_N}"
+  local n code who
+  for n in "${peers[@]}"; do
+    cfg="$CFG_DIR/$n.json"
+    who="the foreign server"; [ "$(jget "$cfg" mode)" = client ] && who="the Iran server"
+    [ "$(transport_family "$(jget "$cfg" transport)")" = stream ] || who="$who ($(jget "$cfg" remote_ip))"
+    code="$(bnshare pair "$cfg" "$n" "$pub")" || continue
+    echo
+    echo -e "  ${C_Y}$n${C_N} — on $who:"
+    echo
+    echo "    BrokenNode import $code"
+  done
+  echo
+}
+
+# import_code [CODE] — import a pair or backup code; asked for when not given.
+import_code(){
+  need_root; ensure_core || return 1; mkdir -p "$CFG_DIR"; harden_cfg_dir; write_template
+  install_command; auto_tune_once
+  local code="$*" tmp rc=0 kind
+  if [ -z "${code//[[:space:]]/}" ]; then
+    echo; echo -e "${C_B}  Paste a share or backup code${C_N}"
+    code="$(read_code)"
+  fi
+  [ -n "${code//[[:space:]]/}" ] || { warn "Nothing pasted — cancelled."; return 1; }
+  tmp="$(mktemp -d "$CFG_DIR/.import.XXXXXX")" || return 1
+  SHARE_IP4=""; SHARE_IP6=""; SHARE_PUB=""
+  if bnshare unpack "$code" "$tmp" > "$tmp/list"; then
+    kind="$(head -n 1 "$tmp/list" | cut -f1)"
+    if [ "$kind" = pair ]; then import_pair "$tmp" || rc=1; else import_backup "$tmp" || rc=1; fi
+  else
+    rc=1
+  fi
+  rm -rf "$tmp"
+  return "$rc"
+}
+
+# pick_tunnel — list the tunnels; PICKED is the one chosen (fails when there
+# is none or nothing is chosen).
+pick_tunnel(){
+  PICKED=""; list_tunnels
+  [ "${#TUNNELS[@]}" -gt 0 ] || return 1
+  local sel; sel="$(menu_ask 'Tunnel number (empty=back)')"
+  case "$sel" in ''|__eof__|*[!0-9]*) return 1 ;; esac
+  [ "$sel" -ge 1 ] && [ "$sel" -le "${#TUNNELS[@]}" ] || { err "Out of range."; return 1; }
+  PICKED="${TUNNELS[$((sel-1))]}"
+}
+
+share_menu(){
+  while true; do
+    echo
+    echo -e "${C_B}  Share codes${C_N}  ${C_D}(one line to paste into another server's terminal)${C_N}"
+    echo "   1) Code for the OTHER end of a tunnel   (pasted there, it sets up that server's side)"
+    echo "   2) Backup code of ALL tunnels here      (pasted on a new server when this one's IP is filtered)"
+    echo "   3) Paste a code                         (a share or backup code from another server)"
+    echo "   0) Back"
+    case "$(menu_ask 'Choice')" in
+      1) SHARE_PUB=""; pick_tunnel && show_pair_code "$PICKED" 1; read -rp "  ▶ press ENTER to continue... " _ ;;
+      2) show_backup_code; read -rp "  ▶ press ENTER to continue... " _ ;;
+      3) import_code; read -t 60 -rp "  ▶ press ENTER to continue... " _ ;;
+      0|__eof__) return ;;
+      *) warn "Invalid." ;;
+    esac
   done
 }
 
@@ -3229,7 +4171,7 @@ warn_removed_transports(){
 }
 
 # sweep_temp removes the hidden working files an edit uses (.tune-/.undo-/
-# .pair-/.check-). A clean edit deletes its own; one left behind means the
+# .pair-/.check-, and an import's .import. folder). A clean edit deletes its own; one left behind means the
 # manager was killed mid-edit (input ended at a prompt), so it is stale and
 # safe to drop — the live <name>.json was never touched.
 # The menu shortcut: "BrokenNode" (or "brokennode", in any mix of upper and
@@ -3301,7 +4243,7 @@ remove_command(){
   return 0
 }
 
-sweep_temp(){ rm -f "$CFG_DIR"/.tune-*.json "$CFG_DIR"/.undo-*.json "$CFG_DIR"/.pair-*.json "$CFG_DIR"/.check-*.json 2>/dev/null; }
+sweep_temp(){ rm -f "$CFG_DIR"/.tune-*.json "$CFG_DIR"/.undo-*.json "$CFG_DIR"/.pair-*.json "$CFG_DIR"/.check-*.json 2>/dev/null; rm -rf "$CFG_DIR"/.import.* 2>/dev/null; }
 
 main_menu(){
   auto_apply_bundled
@@ -3319,6 +4261,7 @@ main_menu(){
     echo "   3) Manage tunnels         (edit / transport / IP / logs / stats)"
     echo "   4) Health check           (doctor: BBR / ports / loss / IP)"
     echo "   5) Update BrokenNode      (download the latest into this folder)"
+    echo "   6) Share codes            (set up the other server, or move every tunnel, with one paste)"
     echo "   0) Exit"
     echo -e "  ${C_D}(the core in this folder is applied automatically on start)${C_N}"
     echo
@@ -3328,6 +4271,7 @@ main_menu(){
       3) manage_tunnels ;;
       4) doctor; read -t 30 -rp "  ▶ press ENTER to continue... " _ ;;
       5) update_self ;;
+      6) share_menu ;;
       0|__eof__) echo; exit 0 ;;
       *) warn "Invalid." ;;
     esac
@@ -3356,9 +4300,14 @@ case "${1:-}" in
       start) systemctl enable --now $units >/dev/null 2>&1 ;;
       *)     systemctl enable $units >/dev/null 2>&1; systemctl restart $units ;;
     esac && echo "done." ;;
+  import) shift; import_code "$@" ;;
+  share)
+    [ -n "${2:-}" ] || { echo "usage: BrokenNode share <tunnel name>"; exit 1; }
+    show_pair_code "$2" 0 ;;
+  backup) show_backup_code ;;
   uninstall|purge) uninstall_all ;;
   version) echo "BrokenNode manager v$VERSION" ;;
   update) update_self ;;
   ""|menu) main_menu ;;
-  *) echo "usage: sudo bash $SELF [server|client|manage|transports|tune|restart-all|start-all|stop-all|doctor|update|uninstall|version]"; exit 1 ;;
+  *) echo "usage: sudo bash $SELF [server|client|manage|import <code>|share <tunnel>|backup|transports|tune|restart-all|start-all|stop-all|doctor|update|uninstall|version]"; exit 1 ;;
 esac

@@ -3,6 +3,60 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.12
+
+### New
+- **Share codes.** After you create a tunnel the manager prints one line to
+  paste into the other server's terminal: it sets up that end — transport,
+  encryption, token, direction, tunnel addresses, keys, the address to dial —
+  mirrored for that side, and starts it. Works from either end; on a server
+  without BrokenNode the same line installs it first; pasted where the tunnel
+  already exists it updates it in place. Also under Manage tunnels → 19) Share
+  code, and the new main menu item 6) Share codes.
+- **Backup codes.** 6) Share codes → 2) gives one line with every tunnel on
+  the server. Pasted on a new server (when the old one's IP is filtered) it
+  rebuilds them all — stopped ones stay stopped — and prints a line for each
+  other server that has to learn the new IP.
+- A code is a short line such as `2XTQE9-7Ry49o-HcbpAz-…` (about 60
+  characters for a tunnel), with a checksum: a mistyped or half-copied code
+  is refused, never half-imported. New tunnels get 16-character tokens, which
+  keeps their codes short.
+- Command line: `BrokenNode share <tunnel>`, `BrokenNode backup`,
+  `BrokenNode import <code>`; the installer passes its arguments on, so
+  `bash <(curl ... install.sh) import <code>` installs and imports.
+
+### Fixed
+- **A kernel tunnel on a server without iptables** no longer comes up
+  "connected" while forwarding nothing: it stops with "iptables is not
+  installed … apt install -y iptables", and Diagnose says the same instead of
+  "restart it".
+
+---
+
+## فارسی — 2.8.12
+
+### جدید
+- **کد اشتراک.** بعد از ساختن هر تانل، منو یک خط چاپ می‌کند که در ترمینال سرور دوم paste می‌شود و
+  طرف دیگر تانل را می‌سازد — ترنسپورت، رمزنگاری، توکن، جهت، آدرس‌های تانل، کلیدها و آدرسی که باید
+  به آن وصل شود — برای آن طرف برعکس‌شده، و روشنش می‌کند. از هر دو طرف کار می‌کند؛ روی سروری که
+  BrokenNode ندارد همان خط اول نصبش می‌کند؛ اگر تانل از قبل باشد همان را به‌روز می‌کند. در Manage
+  tunnels ← 19) Share code و گزینهٔ جدید 6) Share codes در منوی اصلی هم هست.
+- **کد پشتیبان.** 6) Share codes ← 2) یک خط با همهٔ تانل‌های سرور می‌دهد. روی سرور جدید (وقتی آی‌پی
+  قبلی فیلتر شد) paste کن: همه دوباره ساخته می‌شوند — تانل‌های خاموش خاموش می‌مانند — و برای هر سرور
+  دیگری که باید آی‌پی جدید را بداند یک خط چاپ می‌شود.
+- کد یک خط کوتاه است مثل `2XTQE9-7Ry49o-HcbpAz-…` (برای یک تانل حدود ۶۰ کاراکتر) با checksum:
+  کدی که اشتباه تایپ یا نصفه کپی شود رد می‌شود و هیچ‌وقت نصفه import نمی‌شود. تانل‌های جدید توکن
+  ۱۶ کاراکتری می‌گیرند تا کدشان کوتاه بماند.
+- خط فرمان: `BrokenNode share <tunnel>`، `BrokenNode backup`، `BrokenNode import <code>`؛ نصب‌کننده
+  آرگومان‌ها را به منو می‌دهد، پس `bash <(curl ... install.sh) import <code>` نصب و import را یک‌جا انجام می‌دهد.
+
+### رفع‌شده
+- **تانل کرنلی روی سروری که iptables ندارد** دیگر «وصل» نشان داده نمی‌شود در حالی که هیچ پورتی را
+  رد نمی‌کند: با پیام «iptables is not installed … apt install -y iptables» متوقف می‌شود و Diagnose
+  هم همین را می‌گوید، نه «ری‌استارت کن».
+
+---
+
 ## 2.8.11
 
 ### Fixed

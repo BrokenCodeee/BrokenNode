@@ -7,6 +7,9 @@
 #
 #      bash <(curl -fsSL https://raw.githubusercontent.com/BrokenCodeee/BrokenNode/main/install.sh)
 #
+#  Anything after it is passed to the manager, e.g. "... install.sh) import
+#  <code>" installs and imports a share code from another server.
+#
 #  Works on every Linux distribution — Debian, Ubuntu, Alpine, CentOS, Rocky,
 #  Arch — because the binaries are statically linked and depend on no libc.
 # ============================================================================
@@ -135,11 +138,13 @@ if [ "$(id -u)" -ne 0 ]; then
   echo -e "${C_D}    cd $DIR && sudo bash BrokenNode.sh${C_N}"
   exit 0
 fi
-if [ ! -t 0 ]; then
+if [ ! -t 0 ] && [ "$#" -eq 0 ]; then
   # Piping the installer into bash leaves the menu with no keyboard.
   warn "No terminal attached — start the menu yourself:"
   echo -e "${C_D}    cd $DIR && bash BrokenNode.sh${C_N}"
   exit 0
 fi
 info "From now on, type ${C_Y}BrokenNode${C_N} anywhere to open the menu."
-exec bash BrokenNode.sh
+# Arguments go to the manager: "bash <(curl ... install.sh) import <code>"
+# installs and then imports a share code in one paste.
+exec bash BrokenNode.sh "$@"

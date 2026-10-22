@@ -246,6 +246,34 @@ certificate); every release that has reality already sends it.
 translated automatically (`tcpobf` becomes `tcp` + `obfs`), so existing tunnels
 keep running untouched.
 
+## Share codes: one paste sets up the other server
+
+Every tunnel has two ends, and setting up the second one meant typing again
+what the first one was given. Now the first server gives you **one line**;
+paste it into the other server's terminal and its end is set up and started:
+transport, encryption, token, direction, tunnel addresses, keys and ports,
+mirrored for that side.
+
+- After you create a tunnel the line is printed for you. Later: **Manage
+  tunnels → the tunnel → 19) Share code**, or **6) Share codes → 1**.
+- It works from either end: made on the Iran server, it sets up the foreign
+  one, and the other way round (the Iran server then asks only for the user
+  ports, which the foreign server does not know).
+- On a server that does not have BrokenNode yet the same line installs it
+  first.
+- Pasted on a server that already has that tunnel, it **updates it in place**
+  — handy after you change the transport or the encryption on one end.
+
+**Moving to a new server when one gets filtered:** **6) Share codes → 2)
+Backup code** gives one line with **every** tunnel on the server. Copy it
+while you can still reach the server and keep it somewhere safe. On the new
+server paste it: all the tunnels come back as they were, and it prints a line
+for each other server that has to learn the new IP — paste each one there.
+
+You can also paste a code into the menu: **6) Share codes → 3) Paste a code**
+(useful when a terminal breaks a long line up). A code contains the tunnels'
+secret tokens: share it only with yourself.
+
 ## Several tunnels between the same two servers
 
 Different types run side by side between the same pair of servers — `gre`,
@@ -377,6 +405,9 @@ brokennode speedtest -c /etc/brokennode/main.json [-t 10] [-p 4]
 brokennode doctor -c /etc/brokennode/main.json   # why does a tunnel carry no users?
 brokennode cleanup                        # remove NAT rules left by deleted tunnels
 brokennode version
+BrokenNode share <tunnel>                 # the share code of a tunnel (its other end)
+BrokenNode backup                         # one code with every tunnel on this server
+BrokenNode import <code>                  # set up / restore from a share or backup code
 ```
 
 ## Config reference (JSON)
@@ -681,6 +712,29 @@ reality هر گواهی را می‌پذیرد)؛ همهٔ نسخه‌هایی �
 به‌طور خودکار ترجمه می‌شوند (`tcpobf` می‌شود `tcp` + `obfs`)، پس تونل‌های موجود
 بدون هیچ تغییری به کار خود ادامه می‌دهند.
 
+## کد اشتراک: یک paste و سرور دوم آماده است
+
+هر تانل دو طرف دارد و برای طرف دوم باید همه‌چیزهایی را که به طرف اول داده بودی دوباره تایپ می‌کردی.
+حالا سرور اول **یک خط** به تو می‌دهد؛ آن را در ترمینال سرور دوم paste کن و طرف دوم تانل ساخته و
+روشن می‌شود: ترنسپورت، رمزنگاری، توکن، جهت اتصال، آدرس‌های تانل، کلیدها و پورت‌ها، همه برای آن طرف
+برعکس و تنظیم‌شده.
+
+- بعد از ساختن هر تانل، این خط خودش چاپ می‌شود. بعداً هم: **Manage tunnels ← تانل ← 19) Share code**
+  یا **6) Share codes ← 1**.
+- از هر دو طرف کار می‌کند: اگر روی سرور ایران ساخته شود سرور خارج را تنظیم می‌کند، و برعکس (در این
+  حالت سرور ایران فقط پورت‌های کاربران را می‌پرسد، چون سرور خارج آن‌ها را نمی‌داند).
+- روی سروری که هنوز BrokenNode ندارد، همان خط اول نصبش می‌کند.
+- اگر روی سروری paste شود که همین تانل را دارد، **همان را به‌روز می‌کند** — مثلاً بعد از عوض کردن
+  ترنسپورت یا رمزنگاری روی یک طرف.
+
+**انتقال به سرور جدید وقتی یکی فیلتر می‌شود:** **6) Share codes ← 2) Backup code** یک خط می‌دهد که
+**همهٔ** تانل‌های سرور در آن است. تا وقتی به سرور دسترسی داری کپی‌اش کن و جای امنی نگه دار. روی سرور
+جدید paste کن: همهٔ تانل‌ها همان‌طور که بودند برمی‌گردند، و برای هر سرور دیگری که باید آی‌پی جدید را
+بداند یک خط چاپ می‌کند — هر کدام را روی همان سرور paste کن.
+
+کد را در منو هم می‌شود paste کرد: **6) Share codes ← 3) Paste a code** (وقتی ترمینال یک خط بلند را
+می‌شکند به کار می‌آید). کد شامل توکن‌های مخفی تانل‌هاست: فقط برای خودت نگهش دار.
+
 ## چند تانل بین همان دو سرور
 
 انواع مختلف کنار هم بین یک جفت سرور کار می‌کنند — `gre`، `gretap`، `ipip`، `sit`،
@@ -815,6 +869,9 @@ brokennode speedtest -c /etc/brokennode/main.json [-t 10] [-p 4]   # تست سر
 brokennode doctor -c /etc/brokennode/main.json   # چرا تانل کاربر رد نمی‌کند؟
 brokennode cleanup                        # پاک کردن قوانین NAT تانل‌های حذف‌شده
 brokennode version
+BrokenNode share <tunnel>                 # کد اشتراک یک تانل (برای طرف دیگرش)
+BrokenNode backup                         # یک کد با همهٔ تانل‌های این سرور
+BrokenNode import <code>                  # ساختن / بازگرداندن از روی کد اشتراک یا پشتیبان
 ```
 
 <div dir="rtl">
