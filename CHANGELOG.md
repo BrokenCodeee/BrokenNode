@@ -3,6 +3,39 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.14
+
+### Changed
+- **The share line asks nothing on the other server.** Pasted as printed
+  (`BrokenNode import …` or the install line), every question it could raise
+  takes its usual answer, shown on the screen: a tunnel name already taken
+  there gets a free one, the same tunnel is updated, a point-to-point tunnel
+  behind NAT uses that server's own address, and a line pasted back on the
+  server that made it is refused. Still asked: the user ports when the line
+  comes from the foreign server, and a backup that would open a proxy without
+  a password. Pasted at the menu's prompt, the questions are asked as before.
+- **An update is complete.** Rolling the core back (menu 7, `BrokenNode
+  rollback`, `BrokenNode unpin`) is removed: no older core is kept, and a
+  server that 2.8.13 left on an older core is brought up to date at the next
+  start or update.
+
+---
+
+## فارسی — 2.8.14
+
+### تغییرات
+- **خط اشتراک روی سرور دوم هیچ سؤالی نمی‌پرسد.** وقتی همان‌طور که چاپ شده paste شود (`BrokenNode import …`
+  یا خط نصب)، هر سؤالی که پیش بیاید جواب معمولش را می‌گیرد و روی صفحه نشان داده می‌شود: اسمی که آن‌جا
+  گرفته شده یک اسم آزاد می‌گیرد، همان تانل به‌روز می‌شود، تانل نقطه‌به‌نقطه پشت NAT آدرس خود آن سرور را
+  می‌گیرد، و خطی که روی همان سرور سازنده paste شود رد می‌شود. هنوز پرسیده می‌شود: پورت‌های کاربران وقتی
+  خط از سرور خارج آمده، و پشتیبانی که پروکسی بدون رمز باز می‌کند. اگر کد در منو paste شود، سؤال‌ها مثل
+  قبل پرسیده می‌شوند.
+- **به‌روزرسانی کامل است.** برگرداندن هسته (گزینهٔ 7 منو، `BrokenNode rollback`، `BrokenNode unpin`) حذف
+  شد: هیچ هستهٔ قدیمی‌ای نگه داشته نمی‌شود، و سروری که 2.8.13 روی هستهٔ قدیمی گذاشته بود در اجرای بعدی
+  منو یا به‌روزرسانی بعدی به نسخهٔ جدید می‌رسد.
+
+---
+
 ## 2.8.13
 
 **Update both servers.** The security fix and the half-close fix take effect

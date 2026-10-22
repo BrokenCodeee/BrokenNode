@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.13"
+VERSION="2.8.14"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -37,6 +37,12 @@ err(){ echo -e "${C_R}  [x]${C_N} $*" >&2; }
 # "ask again" loops otherwise spun for ever at full CPU once stdin was closed.
 ask(){
   local p="$1" d="${2:-}" a
+  # A code given on the command line (the line printed for the other server)
+  # is imported without questions: each one with a default takes it, shown.
+  if [ -n "$d" ] && [ "${IMPORT_AUTO:-0}" = 1 ]; then
+    echo -e "${C_B}  ?${C_N} $p: ${C_Y}$d${C_N} ${C_D}(chosen automatically)${C_N}" >&2
+    echo "$d"; return 0
+  fi
   if [ -n "$d" ]; then read -rp "$(echo -e "${C_B}  ?${C_N} $p [${C_D}$d${C_N}]: ")" a; echo "${a:-$d}"; return 0; fi
   if ! read -rp "$(echo -e "${C_B}  ?${C_N} $p: ")" a && [ -z "$a" ]; then
     echo >&2; err "Input ended — stopped (nothing was saved from this question on)."
@@ -149,46 +155,15 @@ install_core(){
     err "The core in this folder ($1) does not run on this machine — not installed; the current one stays."
     return 1
   fi
-  # The core being replaced is kept as $BIN.prev, so a release that turns out
-  # bad can be undone in one step (rollback_core) — there is nothing else to
-  # go back to: older releases are not kept anywhere for download.
-  if [ -x "$BIN" ] && [ -n "$(core_version "$BIN")" ] && [ "$(core_version "$BIN")" != "$(core_version "$1")" ]; then
-    cp -p "$BIN" "$BIN.prev.new" && mv -f "$BIN.prev.new" "$BIN.prev" || rm -f "$BIN.prev.new"
-  fi
   install -m0755 "$1" "$BIN.new" && mv -f "$BIN.new" "$BIN" || { rm -f "$BIN.new"; err "Could not install the core to $BIN."; return 1; }
+  forget_old_core
 }
 
-# A rollback pins the core: $CFG_DIR/.core-pin holds the version it went back to, and
-# the bundled core is not applied over it until the operator updates (menu 5,
-# which removes the pin) or runs "BrokenNode unpin".
-pinned_skip(){ # SRC — true (and says so) when a pin keeps SRC from being applied
-  [ -f "$CFG_DIR/.core-pin" ] || return 1
-  local pin new; pin="$(cat "$CFG_DIR/.core-pin" 2>/dev/null)"; new="$(core_version "$1")"
-  [ -n "$pin" ] && [ "$new" != "$pin" ] || return 1
-  warn "The core is pinned to v$pin by a rollback — the bundled v$new is not applied. Update (menu 5) or run 'BrokenNode unpin' to use it."
-  return 0
-}
-
-# rollback_core [--yes] — put the previous core back (the one install_core
-# kept), pin it, and restart every tunnel on it. The newer core becomes the
-# previous one, so the rollback itself can be undone the same way.
-rollback_core(){
-  need_root
-  if [ ! -x "$BIN.prev" ] || [ -z "$(core_version "$BIN.prev")" ]; then
-    err "There is no previous core to go back to ($BIN.prev). One is kept from the next update on."
-    return 1
-  fi
-  local cur old; cur="$(core_version "$BIN")"; old="$(core_version "$BIN.prev")"
-  info "Current core: v${cur:-?}   previous core: v$old"
-  if [ "${1:-}" != --yes ]; then
-    yes_no "Go back to v$old and restart every tunnel on it? y/N" n || { warn "Cancelled."; return 1; }
-  fi
-  cp -p "$BIN" "$BIN.next" && cp -p "$BIN.prev" "$BIN.new" && mv -f "$BIN.new" "$BIN" && mv -f "$BIN.next" "$BIN.prev" \
-    || { rm -f "$BIN.new" "$BIN.next"; err "Could not swap the cores — nothing was changed."; return 1; }
-  mkdir -p "$CFG_DIR" && printf '%s\n' "$old" > "$CFG_DIR/.core-pin"
-  info "Core is now v$old (pinned). v${cur:-?} is kept as the previous core."
-  restart_all_tunnels
-}
+# forget_old_core — an update is complete: no older core is kept, and nothing
+# holds a server on one. 2.8.13 kept the replaced core as $BIN.prev and let a
+# rollback pin it ($CFG_DIR/.core-pin), which then stopped every update from
+# applying; both are removed wherever the core is checked.
+forget_old_core(){ rm -f "$BIN.prev" "$CFG_DIR/.core-pin"; }
 
 warn_old_folder(){
   warn "This folder ($SRC_DIR) holds an OLDER BrokenNode (core v$(core_version "$1")) than the one installed (v$(core_version "$BIN")) — not downgrading."
@@ -199,7 +174,7 @@ ensure_core(){
   local src; src="$(detect_bin)"
   if [ -n "$src" ] && [ -f "$src" ]; then
     if bundled_is_older "$src"; then warn_old_folder "$src"; return 0; fi
-    [ -x "$BIN" ] && pinned_skip "$src" && return 0
+    forget_old_core
     if [ ! -x "$BIN" ] || ! cmp -s "$src" "$BIN"; then
       install_core "$src" || { [ -x "$BIN" ] && return 0; return 1; }
       info "Core updated: $("$BIN" version)"
@@ -3397,6 +3372,8 @@ share_pubip(){
   if [ "${1:-0}" = 1 ] || [ -z "$d" ] || is_private_ip "$d"; then
     [ -n "$d" ] && is_private_ip "$d" && echo -e "  ${C_D}$d is a private address (this server is behind NAT): give its PUBLIC IP.${C_N}" >&2
     def="$d"
+    # Not a public address this server knows: only the operator can say.
+    { [ -z "$d" ] || is_private_ip "$d"; } && local IMPORT_AUTO=0
     while :; do
       d=$(ask "This server's public IP (the other server connects to it)" "$def"); d="${d// /}"; d="${d#[}"; d="${d%]}"
       { is_ipv4 "$d" || is_ipv6 "$d"; } && break
@@ -3521,6 +3498,8 @@ share_local_ip(){
   if [ -z "${!var:-}" ]; then
     if [ "$fam" = 6 ]; then def="$(detect_ip6)"; else def="$(detect_ip)"; fi
     echo -e "  ${C_D}The code names $cur as this server's address, but no interface here holds it.${C_N}" >&2
+    # Chosen automatically only when this server holds the detected address.
+    { [ -n "$def" ] && has_local_addr "$def"; } || local IMPORT_AUTO=0
     while :; do
       d=$(ask "This server's IPv$fam for point-to-point tunnels" "$def"); d="${d// /}"; d="${d#[}"; d="${d%]}"
       $isfam "$d" && break
@@ -3636,7 +3615,7 @@ import_pair(){
   fi
   if [ "$mode" = server ] && [ -z "$(jget "$final" socks)" ] && [ -z "$(jq_ports "$final")" ]; then
     echo -e "  ${C_D}The code comes from the foreign server, which does not know the user ports: give them here.${C_N}"
-    local p last=""
+    local p last="" IMPORT_AUTO=0
     while :; do
       p="$(ask_ports "$target")" || return 1
       # The tunnel's own port cannot also be a user port (the core refuses it).
@@ -3683,6 +3662,7 @@ import_backup(){
     [ -n "$(jget "$f" tun_name)" ] && echo -e "   ${C_D}  ↳ uses the network interface name $(jget "$f" tun_name)${C_N}"
   done < <(tail -n +2 "$tmp/list")
   if [ -n "$risky" ]; then
+    local IMPORT_AUTO=0   # never restored without the operator saying so
     warn "A backup you did not make yourself can carry settings like these: restore only your own."
     yes_no "Restore them on this server? y/N" n || { warn "Cancelled."; return 1; }
   else
@@ -3752,10 +3732,12 @@ import_backup(){
 import_code(){
   need_root; ensure_core || return 1; mkdir -p "$CFG_DIR"; harden_cfg_dir; write_template
   install_command; auto_tune_once
-  local code="$*" tmp rc=0 kind
+  local code="$*" tmp rc=0 kind IMPORT_AUTO=0
   if [ -z "${code//[[:space:]]/}" ]; then
     echo; echo -e "${C_B}  Paste a share or backup code${C_N}"
     code="$(read_code)"
+  else
+    IMPORT_AUTO=1
   fi
   [ -n "${code//[[:space:]]/}" ] || { warn "Nothing pasted — cancelled."; return 1; }
   tmp="$(mktemp -d "$CFG_DIR/.import.XXXXXX")" || return 1
@@ -3962,7 +3944,7 @@ auto_apply_bundled(){
     read -t 15 -rp "  ▶ Press ENTER to continue (auto-continuing in 15s)... " _ 2>/dev/null || true
     return 0
   fi
-  [ -x "$BIN" ] && pinned_skip "$src" && return 0
+  forget_old_core
   if [ ! -x "$BIN" ] || ! cmp -s "$src" "$BIN"; then
     warn "New core bundled with this package — applying automatically..."
     install_core "$src" || return 0
@@ -3984,7 +3966,7 @@ update_self(){
   if command -v curl >/dev/null 2>&1; then curl -fsSL --retry 3 -o "$tmp" "$INSTALL_URL"
   else wget -q --tries=3 -O "$tmp" "$INSTALL_URL"; fi || { err "Could not download the installer ($INSTALL_URL)."; rm -f "$tmp"; return; }
   info "Updating $SRC_DIR ..."
-  rm -f "$CFG_DIR/.core-pin"   # an update is the operator choosing the new release
+  forget_old_core
   cd "$(dirname "$SRC_DIR")" || return
   BROKENNODE_DIR="$(basename "$SRC_DIR")" exec bash "$tmp"
 }
@@ -4334,7 +4316,6 @@ main_menu(){
     echo "   4) Health check           (doctor: BBR / ports / loss / IP)"
     echo "   5) Update BrokenNode      (download the latest into this folder)"
     echo "   6) Share codes            (set up the other server, or move every tunnel, with one paste)"
-    [ -x "$BIN.prev" ] && echo "   7) Roll back the core     (to v$(core_version "$BIN.prev"), the one before the last update)"
     echo "   0) Exit"
     echo -e "  ${C_D}(the core in this folder is applied automatically on start)${C_N}"
     echo
@@ -4345,7 +4326,6 @@ main_menu(){
       4) doctor; read -t 30 -rp "  ▶ press ENTER to continue... " _ ;;
       5) update_self ;;
       6) share_menu ;;
-      7) [ -x "$BIN.prev" ] && rollback_core; read -t 30 -rp "  ▶ press ENTER to continue... " _ ;;
       0|__eof__) echo; exit 0 ;;
       *) warn "Invalid." ;;
     esac
@@ -4379,11 +4359,9 @@ case "${1:-}" in
     [ -n "${2:-}" ] || { echo "usage: BrokenNode share <tunnel name>"; exit 1; }
     show_pair_code "$2" 0 ;;
   backup) show_backup_code ;;
-  rollback) rollback_core "${2:-}" ;;
-  unpin) need_root; rm -f "$CFG_DIR/.core-pin"; info "Unpinned: the next menu start applies the bundled core." ;;
   uninstall|purge) uninstall_all ;;
   version) echo "BrokenNode manager v$VERSION" ;;
   update) update_self ;;
   ""|menu) main_menu ;;
-  *) echo "usage: sudo bash $SELF [server|client|manage|import <code>|share <tunnel>|backup|rollback|unpin|transports|tune|restart-all|start-all|stop-all|doctor|update|uninstall|version]"; exit 1 ;;
+  *) echo "usage: sudo bash $SELF [server|client|manage|import <code>|share <tunnel>|backup|transports|tune|restart-all|start-all|stop-all|doctor|update|uninstall|version]"; exit 1 ;;
 esac

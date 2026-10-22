@@ -49,11 +49,8 @@ sudo bash BrokenNode.sh
 again from inside the folder (`cd BrokenNode` first) — both update that folder
 in place, and the menu then applies the new core and restarts the tunnels. The
 menu never puts an older core over a newer one; an old folder only says so.
-
-**Rolling back:** if an update misbehaves, `BrokenNode rollback` (or menu
-**7) Roll back the core**) puts the previous core back and restarts the
-tunnels; it stays until `BrokenNode unpin` or the next Update. Configs are never
-touched by an update or a rollback.
+An update is complete: no older core is kept and nothing goes back to one.
+Configs are never touched by an update.
 
 Or take the whole folder at once:
 
@@ -266,6 +263,13 @@ mirrored for that side.
   ports, which the foreign server does not know).
 - On a server that does not have BrokenNode yet the same line installs it
   first.
+- **The line asks nothing.** Every question it would have takes its usual
+  answer, shown on the screen: a tunnel name already taken here gets a free
+  one (`name-2`), the same tunnel is updated, a point-to-point tunnel behind
+  NAT uses this server's own address. A line pasted back on the server that
+  made it is refused. Only two things are still asked: the user ports, when
+  the line comes from the foreign server, and a backup that would open a proxy
+  without a password.
 - Pasted on a server that already has that tunnel, it **updates it in place**
   — handy after you change the transport or the encryption on one end.
 
@@ -491,11 +495,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/BrokenCodeee/BrokenNode/main
 **به‌روزرسانی:** گزینهٔ **5) Update BrokenNode** در منو، یا اجرای دوبارهٔ دستور نصب
 از **داخل** همان پوشه (اول `cd BrokenNode`) — هر دو همان پوشه را به‌روز می‌کنند و
 منو هستهٔ جدید را اعمال و تانل‌ها را ری‌استارت می‌کند. منو هیچ‌وقت هستهٔ قدیمی‌تر
-را روی جدیدتر نمی‌گذارد؛ پوشهٔ قدیمی فقط هشدار می‌دهد.
-
-**برگرداندن:** اگر به‌روزرسانی مشکل ساخت، `BrokenNode rollback` (یا گزینهٔ **7) Roll back
-the core** منو) هستهٔ قبلی را برمی‌گرداند و تانل‌ها را ری‌استارت می‌کند؛ تا `BrokenNode unpin`
-یا Update بعدی همان می‌ماند. کانفیگ‌ها با به‌روزرسانی یا برگرداندن هیچ‌وقت تغییر نمی‌کنند.
+را روی جدیدتر نمی‌گذارد؛ پوشهٔ قدیمی فقط هشدار می‌دهد. به‌روزرسانی کامل است: هیچ هستهٔ
+قدیمی‌ای نگه داشته نمی‌شود و چیزی به نسخهٔ قبل برنمی‌گردد. کانفیگ‌ها با به‌روزرسانی تغییر نمی‌کنند.
 
 **بعد از اولین اجرا، منو را از هر جایی باز کن** (بدون `cd`):
 
@@ -733,6 +734,11 @@ reality هر گواهی را می‌پذیرد)؛ همهٔ نسخه‌هایی �
 - از هر دو طرف کار می‌کند: اگر روی سرور ایران ساخته شود سرور خارج را تنظیم می‌کند، و برعکس (در این
   حالت سرور ایران فقط پورت‌های کاربران را می‌پرسد، چون سرور خارج آن‌ها را نمی‌داند).
 - روی سروری که هنوز BrokenNode ندارد، همان خط اول نصبش می‌کند.
+- **این خط هیچ سؤالی نمی‌پرسد.** هر سؤالی که پیش بیاید جواب معمولش را می‌گیرد و روی صفحه نشان داده
+  می‌شود: اگر اسم تانل این‌جا گرفته شده باشد اسم آزاد (`name-2`)، اگر همین تانل باشد به‌روز می‌شود،
+  و تانل نقطه‌به‌نقطه پشت NAT آدرس خود این سرور را می‌گیرد. اگر خط روی همان سروری paste شود که آن را
+  ساخته، رد می‌شود. فقط دو چیز هنوز پرسیده می‌شود: پورت‌های کاربران وقتی خط از سرور خارج آمده باشد،
+  و پشتیبانی که پروکسی بدون رمز باز می‌کند.
 - اگر روی سروری paste شود که همین تانل را دارد، **همان را به‌روز می‌کند** — مثلاً بعد از عوض کردن
   ترنسپورت یا رمزنگاری روی یک طرف.
 
