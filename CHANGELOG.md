@@ -3,6 +3,30 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.15
+
+### New
+- **GRE inside UDP (`fou_port`).** Many paths drop GRE's own protocol (IP
+  protocol 47) while UDP passes: the tunnel came up on both servers, the
+  servers pinged each other, and nothing went through. With `fou_port` the
+  same kernel tunnel (gre, gretap, ipip, sit) travels inside UDP to that
+  port, at the same speed. Asked when a tunnel is created; also in Tune; the
+  share code carries it. The health check now says so when a tunnel's own
+  protocol is the likely problem, and checks the firewall for the UDP port.
+
+---
+
+## فارسی — 2.8.15
+
+### جدید
+- **GRE داخل UDP (`fou_port`).** خیلی از مسیرها خود پروتکل GRE (شمارهٔ ۴۷) را می‌بندند ولی UDP را رد
+  می‌کنند: تانل روی هر دو سرور بالا می‌آمد، سرورها همدیگر را پینگ می‌کردند، ولی چیزی از تانل رد نمی‌شد.
+  با `fou_port` همان تانل کرنل (gre، gretap، ipip، sit) داخل UDP روی آن پورت می‌رود، با همان سرعت.
+  موقع ساختن تانل پرسیده می‌شود، در Tune هم هست، و کد اشتراک منتقلش می‌کند. گزارش عیب‌یابی هم حالا
+  وقتی مشکل از بسته بودن خود پروتکل تانل است این را می‌گوید، و فایروال را برای آن پورت UDP چک می‌کند.
+
+---
+
 ## 2.8.14
 
 ### Changed

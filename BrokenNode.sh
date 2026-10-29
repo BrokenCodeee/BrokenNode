@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.14"
+VERSION="2.8.15"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -1185,6 +1185,22 @@ write_tunnel_cfg(){
       extra="$extra\"carrier_port\": $cport,"
       ;;
   esac
+  # Many paths drop GRE's own IP protocol (47; ipip 4, sit 41) while UDP
+  # passes: the kernel can carry the same tunnel inside UDP (fou_port).
+  case "$tr" in
+    gre|gretap|ipip|sit)
+      if is_ipv4 "$rip"; then
+        echo -e "  ${C_D}Many paths (often inside Iran) drop $tr's own protocol but pass UDP.${C_N}"
+        if yes_no "Carry the tunnel inside UDP (the same kernel $tr, in UDP packets)? y/N" n; then
+          local dfp=5555 fp; [ "$role" = server ] && dfp=$(bnpy alloc port udp "$name")
+          fp=$(auto_or_ask "$role" "UDP port for the tunnel (same on both ends)" "$dfp")
+          case "$fp" in ''|*[!0-9]*) fp=$dfp ;; esac
+          if [ "$fp" -lt 1 ] || [ "$fp" -gt 65535 ]; then warn "Port must be 1-65535; using $dfp"; fp=$dfp; fi
+          extra="$extra \"fou_port\": $fp,"
+        fi
+      fi
+      ;;
+  esac
 
   local tokline=""; local token
   token=$(ask "Shared token (same on both ends)" "$(gen_token)")
@@ -1885,7 +1901,15 @@ doctor(){
         warnln "  tunnel peer $tr_ip: ping failed to run (no route to it?)"; warns=$((warns+1))
       elif [ "$l2" = 100 ]; then
         badln "  tunnel peer $tr_ip: no answer through the tunnel"; warns=$((warns+1))
-        [ -n "$l1" ] && [ "$l1" != 100 ] && echo -e "  ${C_Y}    The IP answers but the tunnel does not: is the other side running, with the addresses swapped?${C_N}"
+        if [ -n "$l1" ] && [ "$l1" != 100 ]; then
+          echo -e "  ${C_Y}    The IP answers but the tunnel does not: is the other side running, with the addresses swapped?${C_N}"
+          case "$trans" in gre|gretap|ipip|sit)
+            if [ "$(jget "$cf" fou_port)" = "" ] || [ "$(jget "$cf" fou_port)" = 0 ]; then
+              echo -e "  ${C_Y}    If both sides are right, the path drops $trans's own protocol (gre is IP protocol 47): many do,${C_N}"
+              echo -e "  ${C_Y}    while UDP passes. Carry the tunnel inside UDP: Manage tunnels → $n → tune → fou_port.${C_N}"
+            fi ;;
+          esac
+        fi
       else okln "  tunnel peer $tr_ip: answers through the tunnel (${l2}% loss)"; fi
       continue
     fi
@@ -2576,6 +2600,14 @@ tune_tunnel(){
       gre|gretap)
         cur="$(jget "$cfg" gre_key)"
         v=$(ask "  gre_key (0 = none, same on both ends) [${cur:-0}]" ""); [ -n "$v" ] && jset "$work" gre_key "$v" int ;;
+    esac
+    case "$tr" in
+      gre|gretap|ipip|sit)
+        cur="$(jget "$cfg" fou_port)"
+        v=$(ask "  fou_port (carry the tunnel inside UDP to this port, for paths that drop $tr; 0 = off; same on both ends) [${cur:-0}]" "")
+        [ -n "$v" ] && jset "$work" fou_port "$v" int ;;
+    esac
+    case "$tr" in
       l2tp)
         cur="$(jget "$cfg" l2tp_tunnel_id)"
         v=$(ask "  l2tp_tunnel_id (same on both ends) [${cur:-1000}]" ""); [ -n "$v" ] && jset "$work" l2tp_tunnel_id "$v" int
@@ -2870,7 +2902,7 @@ LOCAL = {"ports", "quota_total_gb", "quota_up_gb", "quota_down_gb", "socks",
 MATCH = {"transport", "encryption", "token", "direction", "pad", "ws_path",
          "server_name", "alpn", "reality_dest", "reality_server_name",
          "kcp_mode", "kcp_data", "kcp_parity", "kcp_mtu", "keepalive", "mtu",
-         "carrier_port", "gre_key", "l2tp_tunnel_id", "l2tp_session_id",
+         "carrier_port", "gre_key", "fou_port", "l2tp_tunnel_id", "l2tp_session_id",
          "l2tp_encap", "l2tp_port", "tls_selfsigned", "tls_insecure"}
 SWAP = {"local_ip": "remote_ip", "remote_ip": "local_ip",
         "tun_local": "tun_remote", "tun_remote": "tun_local"}
@@ -3000,7 +3032,8 @@ KEYS = ["v", "k", "m", "t", "n", "c", "off", "from", "ip4", "ip6", "host",
         "tun_name", "tun_local", "tun_remote", "mtu", "local_ip", "remote_ip",
         "gre_key", "tun_ttl", "sctp_streams", "sctp_multihoming",
         "l2tp_tunnel_id", "l2tp_session_id", "l2tp_encap", "l2tp_port",
-        "ws_host", "ws_user_agent", "kcp_sndwnd", "kcp_rcvwnd", "kcp_mtu"]
+        "ws_host", "ws_user_agent", "kcp_sndwnd", "kcp_rcvwnd", "kcp_mtu",
+        "fou_port"]
 WORDS = ["pair", "backup", "server", "client", "reverse", "direct", "tcp", "mtcp",
          "mptcp", "ws", "tcpnomux", "kcp", "sctp", "udp", "icmp", "gre", "gretap",
          "ipip", "sit", "l2tp", "none", "aead", "obfs", "tls", "reality", "fast",

@@ -139,7 +139,7 @@ tunnel*:
 |---|---|
 | 9) Change transport | the transport and the encryption layer |
 | 10) Change peer IP | the other server's IP (stream and point-to-point tunnels) |
-| 11) Tune settings | keepalive, kcp, links, pool, ws path and headers, smux windows, addresses, quota, MTU, gre key, l2tp ids, carrier port, `target_host`, log level |
+| 11) Tune settings | keepalive, kcp, links, pool, ws path and headers, smux windows, addresses, quota, MTU, gre key, fou_port (GRE inside UDP), l2tp ids, carrier port, `target_host`, log level |
 | 13) Change direction | reverse, direct or proxy (the SOCKS5/HTTP proxy on the Iran server: on/off, port, login) |
 | 14) Encryption & stealth | encryption layer, token, tls name and ALPN, `reality_dest`, fingerprint, `tls_fragment`, `pad` |
 | 17) Port-forwards | add, remove or replace the forwarded ports |
@@ -220,6 +220,13 @@ opens. *Duplicate UDP packets*, which only `quic` could carry, went with it.
 
 The kernel tunnels (`gre`, `gretap`, `ipip`, `sit`, `l2tp`) take no encryption
 layer: the kernel moves the packets, so encrypt at the service (TLS) if you need it.
+
+**GRE inside UDP (`fou_port`):** many paths (often inside Iran) drop GRE's own
+protocol (IP protocol 47) but pass UDP. With `fou_port` the same kernel GRE
+tunnel (or `gretap`, `ipip`, `sit`) travels inside UDP packets to that port —
+same speed, same ping. It is asked when you create the tunnel, or later in
+**Manage tunnels → the tunnel → Tune → fou_port** (the same on both servers;
+the share code carries it). IPv4 only.
 
 A point-to-point tunnel cannot be switched to a stream transport in place (or
 back) — they are configured with different fields. Create a new tunnel instead.
@@ -699,6 +706,12 @@ self-signed، فایل یا Let's Encrypt) · `reality` (HTTPS یک سایت و�
 
 تونل‌های کرنلی (`gre`، `gretap`، `ipip`، `sit`، `l2tp`) لایهٔ رمزنگاری نمی‌گیرند: بسته‌ها را
 خود کرنل جابه‌جا می‌کند، پس اگر رمزنگاری لازم است آن را در سرویس (TLS) انجام بده.
+
+**GRE داخل UDP (`fou_port`):** خیلی از مسیرها (به‌خصوص داخل ایران) خود پروتکل GRE (شمارهٔ ۴۷) را
+می‌بندند ولی UDP را رد می‌کنند. با `fou_port` همان تانل GRE کرنل (و همین‌طور `gretap`، `ipip`،
+`sit`) داخل بسته‌های UDP روی آن پورت فرستاده می‌شود؛ سرعت و پینگ همان است. موقع ساختن تانل
+پرسیده می‌شود، یا بعداً: **Manage tunnels ← تانل ← Tune ← fou_port** (روی هر دو سرور یکی؛ کد اشتراک
+خودش منتقلش می‌کند). فقط روی IPv4.
 
 تونل نقطه‌به‌نقطه را نمی‌شود درجا به ترنسپورت جریانی تبدیل کرد (و برعکس) —
 فیلدهای کانفیگشان فرق دارد. به‌جایش یک تونل جدید بساز.
