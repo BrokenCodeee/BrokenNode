@@ -3,6 +3,41 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.18
+
+### New
+- **GRE: plain, inside UDP or inside TCP.** Choosing gre now asks how it
+  travels between the servers. Plain and inside UDP are the kernel's GRE (as
+  before, `fou_port`). The kernel cannot carry GRE in TCP, so *inside TCP*
+  makes a new `tcptun` tunnel (also 17 in the transport list): the packets
+  ride one TCP connection that the foreign server opens to the Iran server's
+  carrier port, with aead or no encryption, reconnecting by itself. For paths
+  that drop both GRE and UDP; slower than either.
+- **Speed test: UDP like `iperf3 -u`.** On point-to-point tunnels (gre,
+  ipip, l2tp, udp, icmp, tcptun) the speed test can now also send UDP through
+  the tunnel at rising rates and show what arrives and the loss at each, then
+  the highest rate with at most 2% loss in each direction. The TCP part was
+  already measured through the tunnel itself; the 1 Mbit/s it showed on GRE
+  inside UDP was the GRO problem fixed in 2.8.17. Both servers need 2.8.18.
+
+---
+
+## فارسی — 2.8.18
+
+### جدید
+- **GRE: خالص، داخل UDP یا داخل TCP.** انتخاب gre حالا می‌پرسد بین دو سرور چطور برود. خالص و داخل
+  UDP همان GRE کرنل است (مثل قبل، `fou_port`). کرنل نمی‌تواند GRE را داخل TCP ببرد، پس *داخل TCP* یک
+  تانل جدید `tcptun` می‌سازد (در فهرست ترنسپورت‌ها هم شمارهٔ ۱۷): بسته‌ها روی یک اتصال TCP می‌روند که
+  سرور خارج به پورت سرور ایران باز می‌کند، با رمزنگاری aead یا بدون آن، و خودش دوباره وصل می‌شود. برای
+  مسیرهایی که هم GRE و هم UDP را می‌بندند؛ از هر دو کندتر است.
+- **تست سرعت: UDP مثل `iperf3 -u`.** روی تانل‌های نقطه‌به‌نقطه (gre، ipip، l2tp، udp، icmp، tcptun)
+  تست سرعت حالا UDP را هم با سرعت‌های بالارونده از داخل تانل می‌فرستد و نشان می‌دهد چقدر رسید و چند درصد
+  گم شد، و بعد بیشترین سرعت با حداکثر ۲٪ گم‌شدن در هر جهت. بخش TCP از قبل از داخل خود تانل اندازه‌گیری
+  می‌شد؛ عدد ۱ مگابیتی که روی GRE داخل UDP نشان می‌داد همان مشکل GRO بود که در 2.8.17 رفع شد. هر دو
+  سرور باید 2.8.18 باشند.
+
+---
+
 ## 2.8.17
 
 ### Fixed

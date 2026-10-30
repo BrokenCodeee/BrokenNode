@@ -163,7 +163,7 @@ encryption layer decides what they look like on the way.
 `tcp` · `mtcp` · `mptcp` · `ws` · `tcpnomux` · `kcp` · `sctp`
 
 **Point-to-point tunnels** (both servers' real IPs + a private address pair):
-`gre` · `gretap` · `ipip` · `sit` · `l2tp` (kernel) · `udp` · `icmp` (TUN)
+`gre` · `gretap` · `ipip` · `sit` · `l2tp` (kernel) · `udp` · `icmp` · `tcptun` (TUN)
 
 **Encryption:** `none` · `obfs` (AES-CTR keystream) · `aead`
 (ChaCha20-Poly1305, authenticated — recommended) · `tls` (real HTTPS with a
@@ -186,6 +186,7 @@ and, on the end that connects, `tls_fingerprint` and `tls_fragment`.
 | `sit` | Kernel 6in4: IPv6 over IPv4. Tunnel addresses are **IPv6** | `sit` module, root |
 | `l2tp` | Kernel L2TPv3 over UDP or IP | `l2tp_eth`/`l2tp_netlink`, root |
 | `udp` / `icmp` | TUN over plain UDP / ICMP echo between the two servers' real IPs | root; an `icmp` server stops answering normal pings while it runs |
+| `tcptun` | TUN over one TCP connection (the foreign server dials the Iran server's carrier port). For paths that drop GRE and UDP; slower than both (TCP inside TCP) | root |
 
 The manager asks for them separately: pick a transport, then answer whether it
 should be encrypted.
@@ -227,6 +228,12 @@ tunnel (or `gretap`, `ipip`, `sit`) travels inside UDP packets to that port —
 same speed, same ping. It is asked when you create the tunnel, or later in
 **Manage tunnels → the tunnel → Tune → fou_port** (the same on both servers;
 the share code carries it). IPv4 only.
+
+**How GRE travels:** choosing `gre` asks *plain* (GRE itself), *inside UDP*
+(the above) or *inside TCP*. The kernel cannot put GRE in TCP, so *inside TCP*
+makes a `tcptun` tunnel: the packets ride one TCP connection between the
+servers. Use it only where GRE and UDP are both dropped: TCP inside TCP is
+slower and suffers badly on lossy paths.
 
 A point-to-point tunnel cannot be switched to a stream transport in place (or
 back) — they are configured with different fields. Create a new tunnel instead.
@@ -315,8 +322,11 @@ encryption, so the numbers are what your users get. It first pings the other
 server outside the tunnel, so you see what the tunnel adds, and it keeps every
 result: the table at the end lists the last runs of all tunnels side by side,
 which is how you compare transports on your own path. Stream transports run it
-on the Iran server; `gre`, `ipip`, `l2tp`, `udp` and `icmp` on either.
-Both servers need 2.3.9 or newer.
+on the Iran server; `gre`, `ipip`, `l2tp`, `udp`, `icmp` and `tcptun` on either.
+Both servers need 2.3.9 or newer. On point-to-point tunnels it can also test
+**UDP** (games, calls), as `iperf3 -u` does: rising rates, the loss at each,
+and the highest rate with at most 2% loss, each way (both servers 2.8.18 or
+newer).
 
 **Live stats** (→ 8) shows the speed right now, the peak, a 40-second
 history, the links that are up and the users connected, on both servers and for
@@ -417,7 +427,7 @@ brokennode -c /etc/brokennode/main.json   # run a tunnel from a config
 brokennode -gen server                    # print a sample server config
 brokennode -gen client                    # print a sample client config
 brokennode -transports                    # list transports and encryption layers
-brokennode speedtest -c /etc/brokennode/main.json [-t 10] [-p 4]
+brokennode speedtest -c /etc/brokennode/main.json [-t 10] [-p 4] [-udp]
 brokennode doctor -c /etc/brokennode/main.json   # why does a tunnel carry no users?
 brokennode cleanup                        # remove NAT rules left by deleted tunnels
 brokennode version
@@ -713,6 +723,11 @@ self-signed، فایل یا Let's Encrypt) · `reality` (HTTPS یک سایت و�
 پرسیده می‌شود، یا بعداً: **Manage tunnels ← تانل ← Tune ← fou_port** (روی هر دو سرور یکی؛ کد اشتراک
 خودش منتقلش می‌کند). فقط روی IPv4.
 
+**GRE چطور برود:** انتخاب `gre` می‌پرسد *خالص* (خود GRE)، *داخل UDP* (همین بالا) یا *داخل TCP*.
+کرنل نمی‌تواند GRE را داخل TCP بفرستد، پس *داخل TCP* یک تانل `tcptun` می‌سازد: بسته‌ها روی یک
+اتصال TCP بین دو سرور می‌روند. فقط جایی استفاده کن که GRE و UDP هر دو بسته‌اند: TCP داخل TCP
+کندتر است و روی مسیر پرگم‌شدن خیلی افت می‌کند.
+
 تونل نقطه‌به‌نقطه را نمی‌شود درجا به ترنسپورت جریانی تبدیل کرد (و برعکس) —
 فیلدهای کانفیگشان فرق دارد. به‌جایش یک تونل جدید بساز.
 
@@ -788,7 +803,10 @@ reality هر گواهی را می‌پذیرد)؛ همهٔ نسخه‌هایی �
 تانل چقدر اضافه می‌کند، و هر نتیجه را نگه می‌دارد: جدول آخر، آخرین اجراهای همهٔ
 تانل‌ها را کنار هم نشان می‌دهد — این‌طوری ترنسپورت‌ها را روی مسیر خودت مقایسه
 می‌کنی. برای ترنسپورت‌های جریانی روی سرور ایران اجرا کن؛ برای `gre`، `ipip`،
-`l2tp`، `udp` و `icmp` روی هر کدام. هر دو سرور باید 2.3.9 یا جدیدتر باشند.
+`l2tp`، `udp`، `icmp` و `tcptun` روی هر کدام. هر دو سرور باید 2.3.9 یا جدیدتر باشند.
+روی تانل‌های نقطه‌به‌نقطه **UDP** را هم می‌سنجد (بازی، تماس)، مثل `iperf3 -u`: با
+سرعت‌های بالارونده، درصد گم‌شدن بسته در هر کدام، و بیشترین سرعت با حداکثر ۲٪ گم‌شدن، در هر
+دو جهت (هر دو سرور 2.8.18 یا جدیدتر).
 
 **آمار زنده** (← ۸) سرعت همین لحظه، بیشینه، تاریخچهٔ ۴۰ ثانیه، لینک‌های وصل و
 کاربرهای متصل را روی هر دو سرور و برای همهٔ ترنسپورت‌ها نشان می‌دهد. هر ثانیه
@@ -893,7 +911,7 @@ brokennode -c /etc/brokennode/main.json   # اجرای تونل از روی کا
 brokennode -gen server                    # چاپ یک کانفیگ نمونهٔ سرور
 brokennode -gen client                    # چاپ یک کانفیگ نمونهٔ کلاینت
 brokennode -transports                    # فهرست ترنسپورت‌ها و لایه‌های رمزنگاری
-brokennode speedtest -c /etc/brokennode/main.json [-t 10] [-p 4]   # تست سرعت از داخل تانل
+brokennode speedtest -c /etc/brokennode/main.json [-t 10] [-p 4] [-udp]   # تست سرعت از داخل تانل
 brokennode doctor -c /etc/brokennode/main.json   # چرا تانل کاربر رد نمی‌کند؟
 brokennode cleanup                        # پاک کردن قوانین NAT تانل‌های حذف‌شده
 brokennode version

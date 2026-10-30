@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.17"
+VERSION="2.8.18"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -252,7 +252,7 @@ harden_cfg_dir(){
 # is_tunnel_transport is true for the point-to-point tunnels that need address
 # fields rather than a bind port: the kernel tunnels and the raw udp/icmp carriers.
 is_tunnel_transport(){
-  case "$1" in gre|gretap|ipip|sit|l2tp|udp|icmp) return 0 ;; *) return 1 ;; esac
+  case "$1" in gre|gretap|ipip|sit|l2tp|udp|icmp|tcptun) return 0 ;; *) return 1 ;; esac
 }
 
 # transport_family groups transports by the config fields they need, which is
@@ -344,7 +344,7 @@ cfg_scan(){
   python3 - "$CFG_DIR" "$1" "$2" "${3:-}" <<'PYEOF2'
 import json, os, sys, glob
 d, mode, excl, key = sys.argv[1:5]
-P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp")
+P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp", "tcptun")
 for f in sorted(glob.glob(os.path.join(d, "*.json"))):
     if os.path.basename(f)[:-5] == excl:
         continue
@@ -385,7 +385,7 @@ for f in sorted(glob.glob(os.path.join(d, "*.json"))):
         if key in ("udp", "l2tp") and t == "l2tp" and (c.get("l2tp_encap") or "udp") == "udp":
             print(c.get("l2tp_port") or 1701)
             continue
-        cp = t if t in ("udp", "icmp") else None
+        cp = t if t in ("udp", "icmp") else ("tcp" if t == "tcptun" else None)
         if cp == key or (key == "l2tp" and cp == "udp"):
             print(c.get("carrier_port") or 6262)
 PYEOF2
@@ -479,7 +479,7 @@ def used_ports(proto, excl):
                 used.add(int(v.rsplit(":", 1)[1]))
         if t == "l2tp":
             used.add(int(c.get("l2tp_port") or 1701))
-        if t in ("udp", "icmp"):
+        if t in ("udp", "icmp", "tcptun"):
             used.add(int(c.get("carrier_port") or 6262))
     flag = "-Hlnu" if proto == "udp" else "-Hlnt"
     for line in sh("ss", flag).splitlines():
@@ -663,11 +663,12 @@ pick_transport(){
   echo -e "  ${C_D}── raw carriers (TUN over a protocol) ────────${C_N}" >&2
   echo    "  15) udp       TUN over UDP" >&2
   echo    "  16) icmp      TUN over ICMP echo" >&2
+  echo    "  17) tcptun    TUN over one TCP connection (paths that drop GRE and UDP)" >&2
   echo -e "  ${C_D}──────────────────────────────────────────────${C_N}" >&2
   echo -e "  ${C_D}Type a number or a name (e.g. mtcp). 0 = cancel.${C_N}" >&2
   local n
   while :; do
-    n=$(ask "Choice [1-16]" "1")
+    n=$(ask "Choice [1-17]" "1")
     case "$n" in
       0) echo ""; return ;;
       1|tcp) echo tcp; return ;;        2|mtcp) echo mtcp; return ;;
@@ -679,13 +680,28 @@ pick_transport(){
         # another transport by accident.
         err "quic was removed in 2.3.22 — it slowed to a few Mbit/s on lossy paths. Use 5) kcp (UDP) or 2) mtcp (TCP)." ;;
       8|mptcp) echo mptcp; return ;;    9|sctp) echo sctp; return ;;
-      10|gre) echo gre; return ;;       11|gretap) echo gretap; return ;;
+      10|gre) pick_gre_carrier; return ;; 11|gretap) echo gretap; return ;;
       12|ipip) echo ipip; return ;;     13|sit) echo sit; return ;;
       14|l2tp) echo l2tp; return ;;     15|udp) echo udp; return ;;
-      16|icmp) echo icmp; return ;;
+      16|icmp) echo icmp; return ;;     17|tcptun) echo tcptun; return ;;
       *) err "'$n' is not one of the choices." ;;
     esac
   done
+}
+
+# pick_gre_carrier: how a gre tunnel travels between the two servers. Prints
+# "gre" (plain, IP protocol 47), "gre+udp" (the same kernel gre inside UDP,
+# fou_port) or "tcptun" (the packets over one TCP connection: a userspace TUN
+# tunnel, since the kernel cannot carry gre in TCP).
+pick_gre_carrier(){
+  echo >&2
+  echo -e "${C_B}  How should GRE travel between the two servers?${C_N}" >&2
+  echo -e "   1) plain       GRE itself (IP protocol 47)   ${C_G}(fastest, if the path passes it)${C_N}" >&2
+  echo -e "   2) inside UDP  the same kernel GRE in UDP    ${C_G}(paths that drop GRE but pass UDP)${C_N}" >&2
+  echo -e "   3) inside TCP  the packets over one TCP connection ${C_Y}(paths that drop GRE and UDP; slower)${C_N}" >&2
+  echo -e "  ${C_D}Not sure? Make plain first; if nothing crosses the tunnel, Tune → fou_port moves it into UDP.${C_N}" >&2
+  local c; c=$(ask "Choice [1-3]" "1")
+  case "$c" in 2) echo gre+udp ;; 3) echo tcptun ;; *) echo gre ;; esac
 }
 
 # pick_encryption asks whether the chosen transport should be encrypted. The
@@ -699,7 +715,7 @@ pick_encryption(){
   # udp/icmp seal each datagram: offer aead/none (a stream cipher cannot key
   # packets that may be lost or reordered).
   case "$tr" in
-    udp|icmp)
+    udp|icmp|tcptun)
       echo >&2
       echo -e "${C_B}  Encrypt this '$tr' tunnel?${C_N}" >&2
       echo -e "   1) aead   ChaCha20-Poly1305   ${C_G}(encrypted + tamper-proof, Recommended)${C_N}" >&2
@@ -1062,7 +1078,7 @@ socks_summary(){
 # the tunnel; the client names the local backend.
 write_tunnel_cfg(){
   # Two statements: in one 'local', $name would expand before it is assigned.
-  local role="$1" name="$2" tr="$3" enc="$4"
+  local role="$1" name="$2" tr="$3" enc="$4" carrier="${5:-}"
   local cfg="$CFG_DIR/$name.json"
   echo
   echo -e "  ${C_D}$tr is a point-to-point tunnel. Give the two servers' real IPs and${C_N}"
@@ -1170,15 +1186,21 @@ write_tunnel_cfg(){
         extra="$extra \"l2tp_port\": $lp,"
       fi
       ;;
-    udp|icmp)
+    udp|icmp|tcptun)
       # Each tunnel on this server needs its own carrier port: a second udp
       # tunnel on a taken one cannot bind and will not start, and two icmp
       # tunnels with one identifier would receive each other's packets.
       local dcp=6262
       if [ "$role" = server ]; then
-        if [ "$tr" = udp ]; then dcp=$(bnpy alloc port udp "$name"); else dcp=$(next_free_int "carrier_port:$tr" 6262 "$name"); fi
+        case "$tr" in
+          udp)    dcp=$(bnpy alloc port udp "$name") ;;
+          tcptun) dcp=$(bnpy alloc port tcp "$name") ;;
+          *)      dcp=$(next_free_int "carrier_port:$tr" 6262 "$name") ;;
+        esac
       fi
-      local cport what="Carrier UDP port"; [ "$tr" = icmp ] && what="ICMP tunnel id"
+      local cport what="Carrier UDP port"
+      [ "$tr" = icmp ] && what="ICMP tunnel id"
+      [ "$tr" = tcptun ] && what="Carrier TCP port (the Iran server listens on it)"
       cport=$(auto_or_ask "$role" "$what (same on both ends)" "$dcp")
       case "$cport" in ''|*[!0-9]*) cport=$dcp ;; esac
       if [ "$cport" -lt 1 ] || [ "$cport" -gt 65535 ]; then warn "$what must be 1-65535; using $dcp"; cport=$dcp; fi
@@ -1189,9 +1211,12 @@ write_tunnel_cfg(){
   # passes: the kernel can carry the same tunnel inside UDP (fou_port).
   case "$tr" in
     gre|gretap|ipip|sit)
-      if is_ipv4 "$rip"; then
-        echo -e "  ${C_D}Many paths (often inside Iran) drop $tr's own protocol but pass UDP.${C_N}"
-        if yes_no "Carry the tunnel inside UDP (the same kernel $tr, in UDP packets)? y/N" n; then
+      if [ "$carrier" = udp ] && ! is_ipv4 "$rip"; then
+        warn "GRE inside UDP needs IPv4 between the servers: this tunnel stays plain GRE."
+      fi
+      if is_ipv4 "$rip" && [ "$carrier" != plain ]; then
+        [ "$carrier" = udp ] || echo -e "  ${C_D}Many paths (often inside Iran) drop $tr's own protocol but pass UDP.${C_N}"
+        if [ "$carrier" = udp ] || yes_no "Carry the tunnel inside UDP (the same kernel $tr, in UDP packets)? y/N" n; then
           local dfp=5555 fp; [ "$role" = server ] && dfp=$(bnpy alloc port udp "$name")
           fp=$(auto_or_ask "$role" "UDP port for the tunnel (same on both ends)" "$dfp")
           case "$fp" in ''|*[!0-9]*) fp=$dfp ;; esac
@@ -1229,6 +1254,9 @@ write_tunnel_cfg(){
 EOF
     core_check "$cfg" || return 1
     info "Saved $cfg"
+    if [ "$tr" = tcptun ]; then
+      echo -e "  ${C_D}The foreign server connects to this one on TCP $(jget "$cfg" carrier_port): allow it inbound in this server's firewall.${C_N}"
+    fi
   else
     local target tdef=127.0.0.1
     # sit delivers IPv6 straight to this host; the service must listen on [::].
@@ -1267,10 +1295,13 @@ create_tunnel(){
   if [ -f "$CFG_DIR/$name.json" ]; then local o; o=$(ask "'$name' exists. Overwrite? y/N" "N"); case "$o" in y|Y) :;; *) warn "Cancelled."; return;; esac; fi
   tr=$(pick_transport)
   [ -z "$tr" ] && { warn "Cancelled."; return; }
+  # gre's carrier was chosen with it: inside UDP is still the kernel's gre.
+  local carrier=""
+  case "$tr" in gre+udp) tr=gre; carrier=udp ;; gre) carrier=plain ;; esac
   enc=$(pick_encryption "$tr")
 
   if is_tunnel_transport "$tr"; then
-    write_tunnel_cfg "$role" "$name" "$tr" "$enc"
+    write_tunnel_cfg "$role" "$name" "$tr" "$enc" "$carrier"
   else
     local dsel dir proxy=0; dsel=$(pick_direction "$tr"); dir="${dsel#proxy-}"; [ "$dsel" != "$dir" ] && proxy=1
     read -r ka kmode kdata kparity <<< "$(pick_preset)"; build_extra "$role" "$tr" "$dir" "$enc"
@@ -1661,8 +1692,9 @@ speed_test(){
     warn "The tunnel is not running — start it first (option 1)."
     return
   fi
+  local p2p=0
   case "$tr" in
-    gre|gretap|ipip|sit|l2tp|udp|icmp) : ;;
+    gre|gretap|ipip|sit|l2tp|udp|icmp|tcptun) p2p=1 ;;
     *) if [ "$role" != server ]; then
          warn "For $tr the test runs on the Iran relay (the server that forwards the users' ports)."
          echo -e "  ${C_D}Its tunnel opens the test streams and this server answers them. Open this menu there.${C_N}"
@@ -1684,10 +1716,16 @@ speed_test(){
   local secs streams
   secs=$(ask "Seconds per direction (3-30)" "10"); case "$secs" in ''|*[!0-9]*) secs=10 ;; esac
   streams=$(ask "Parallel streams (1 = one user, 8 = many users)" "4"); case "$streams" in ''|*[!0-9]*) streams=4 ;; esac
+  # The UDP test (rate and loss, like iperf3 -u) runs between the two tunnel
+  # addresses, so only point-to-point tunnels have it, from 2.8.18 on.
+  local udpf=""
+  if [ "$p2p" = 1 ] && ! { [ -n "$cv" ] && version_lt "$cv" 2.8.18; }; then
+    yes_no "Also test UDP (games, calls: rate and loss, like iperf3 -u; about 30 s more)? Y/n" y && udpf=-udp
+  fi
   echo
   local out ttyf=""
   [ -t 2 ] && ttyf=-tty
-  out="$("$BIN" speedtest -c "$cfg" -t "$secs" -p "$streams" $ttyf 2>&1 | tee /dev/stderr)"
+  out="$("$BIN" speedtest -c "$cfg" -t "$secs" -p "$streams" $ttyf $udpf 2>&1 | tee /dev/stderr)"
   local res; res="$(printf '%s\n' "$out" | sed -n 's/.*RESULT //p' | tail -n 1)"
   if [ -z "$res" ]; then
     echo; warn "No result — see the message above."
@@ -1699,7 +1737,14 @@ speed_test(){
   down="$(printf '%s' "$res" | sed -n 's/.*down=\([0-9.]*\)Mbit.*/\1/p')"
   up="$(printf '%s' "$res" | sed -n 's/.*up=\([0-9.]*\)Mbit.*/\1/p')"
   echo
-  echo -e "  ${C_B}Result${C_N}  ↓ ${C_G}${down} Mbit/s${C_N}   ↑ ${C_G}${up} Mbit/s${C_N}   ping ${tping}ms   jitter ${tjit}ms"
+  echo -e "  ${C_B}Result${C_N}  ↓ ${C_G}${down} Mbit/s${C_N}   ↑ ${C_G}${up} Mbit/s${C_N}   ping ${tping}ms   jitter ${tjit}ms  ${C_D}(TCP, $streams streams)${C_N}"
+  local ures; ures="$(printf '%s\n' "$out" | sed -n 's/.*UDPRESULT //p' | tail -n 1)"
+  if [ -n "$ures" ]; then
+    local ud udl uu uul
+    ud="$(printf '%s' "$ures" | sed -n 's/.*down=\([0-9.]*\)Mbit.*/\1/p')"; udl="$(printf '%s' "$ures" | sed -n 's/.*downloss=\([0-9.]*\)%.*/\1/p')"
+    uu="$(printf '%s' "$ures" | sed -n 's/.* up=\([0-9.]*\)Mbit.*/\1/p')";  uul="$(printf '%s' "$ures" | sed -n 's/.*uploss=\([0-9.]*\)%.*/\1/p')"
+    echo -e "  ${C_B}UDP${C_N}     ↓ ${C_G}${ud} Mbit/s${C_N} (loss ${udl}%)   ↑ ${C_G}${uu} Mbit/s${C_N} (loss ${uul}%)"
+  fi
   # What the numbers say.
   if [ -n "$pavg" ]; then
     local extra; extra=$(awk -v a="$tping" -v b="$pavg" 'BEGIN{printf "%.0f", a-b}')
@@ -2071,6 +2116,9 @@ change_transport(){
   echo; echo -e "${C_B}  Change transport for '$n'${C_N}  ${C_D}(current: $cur, encryption: $curenc)${C_N}"
   local new; new=$(pick_transport)
   [ -z "$new" ] && { warn "cancelled"; return; }
+  # gre comes with its carrier: plain, or inside UDP (fou_port).
+  local wantfou="" curfou; curfou="$(jget "$cfg" fou_port)"; [ "$curfou" = 0 ] && curfou=""
+  case "$new" in gre+udp) new=gre; wantfou=1 ;; gre) wantfou=0 ;; esac
   # A transport from another family needs different fields entirely (a relay
   # address vs. two real IPs and a tunnel pair). Swapping the name in place
   # left a config the new transport could not start from.
@@ -2081,7 +2129,9 @@ change_transport(){
     read -t 30 -rp "  ▶ press ENTER to continue... " _; return
   fi
   local newenc; newenc=$(pick_encryption "$new")
-  if [ "$new" = "$cur" ] && [ "$newenc" = "$curenc" ]; then info "already $cur/$curenc — nothing to do"; return; fi
+  local foumove=0
+  { [ "$wantfou" = 1 ] && [ -z "$curfou" ]; } || { [ "$wantfou" = 0 ] && [ -n "$curfou" ]; } && foumove=1
+  if [ "$new" = "$cur" ] && [ "$newenc" = "$curenc" ] && [ "$foumove" = 0 ]; then info "already $cur/$curenc — nothing to do"; return; fi
   cfg_begin "$cfg"
   jset "$cfg" transport "$new"
   jset "$cfg" encryption "$newenc"
@@ -2099,6 +2149,14 @@ change_transport(){
   enc_switch "$cfg" "$curenc" "$newenc"
   # tcpnomux does not multiplex, so it cannot carry the proxy.
   [ "$new" = tcpnomux ] && for k in socks socks_user socks_pass socks_open; do jset "$cfg" "$k" "" del; done
+  # The kernel tunnels' own settings mean nothing to the others.
+  if [ "$wantfou" = 1 ] && [ -z "$curfou" ]; then
+    curfou="$(bnpy alloc port udp "$n")"; jset "$cfg" fou_port "$curfou" int
+  elif [ "$wantfou" = 0 ]; then
+    jset "$cfg" fou_port "" del; curfou=""
+  fi
+  case "$new" in gre|gretap|ipip|sit) : ;; *) jset "$cfg" fou_port "" del; curfou="" ;; esac
+  case "$new" in gre|gretap) : ;; *) jset "$cfg" gre_key "" del ;; esac
   cfg_commit "$cfg" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
   info "transport: $cur/$curenc -> $new/$newenc"
   if tunnel_listens "$cfg" && is_udp_transport "$new" && ! is_udp_transport "$cur"; then
@@ -2107,6 +2165,8 @@ change_transport(){
     warn "e.g.  ufw allow $port/udp   or   iptables -I INPUT -p udp --dport $port -j ACCEPT"
   fi
   warn "Do the SAME on the other server: '$new' with encryption '$newenc', or they will not connect."
+  [ -n "$curfou" ] && warn "This tunnel travels inside UDP port $curfou (fou_port): the other server needs the same, and UDP $curfou open."
+  [ "$new" = tcptun ] && warn "tcptun: the foreign server connects to the Iran server on TCP $(jget "$cfg" carrier_port || true) (6262 if empty): set the same carrier_port on both (Tune) and allow it inbound on the Iran server."
   service_check "$n"
   read -t 30 -rp "  ▶ press ENTER to continue... " _
 }
@@ -2168,7 +2228,7 @@ edit_security(){
   trap 'rm -f "$work"' RETURN
   echo; echo -e "${C_B}  Encryption & stealth of '$n'${C_N}  ${C_D}($tr, encryption: $enc) — blank keeps the current value${C_N}"
   echo -e "  ${C_D}──────────────────────────────────────────────${C_N}"
-  if [ "$fam" = stream ] || [ "$tr" = udp ] || [ "$tr" = icmp ]; then
+  if [ "$fam" = stream ] || [ "$tr" = udp ] || [ "$tr" = icmp ] || [ "$tr" = tcptun ]; then
     if yes_no "Change the encryption layer (now $enc)? y/N" n; then
       local newenc; newenc=$(pick_encryption "$tr")
       jset "$work" encryption "$newenc"
@@ -2353,7 +2413,7 @@ change_direction(){
 tunnel_summary(){
   python3 - "$1" <<'PYEOF'
 import json,sys
-P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp")
+P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp", "tcptun")
 try:
     c = json.load(open(sys.argv[1]))
 except Exception:
@@ -2617,9 +2677,10 @@ tune_tunnel(){
         v=$(ask "  l2tp_encap (udp/ip) [${cur:-udp}]" ""); [ -n "$v" ] && jset "$work" l2tp_encap "$v"
         cur="$(jget "$cfg" l2tp_port)"
         v=$(ask "  l2tp_port (udp encap, same on both ends) [${cur:-1701}]" ""); [ -n "$v" ] && jset "$work" l2tp_port "$v" int ;;
-      udp|icmp)
+      udp|icmp|tcptun)
         cur="$(jget "$cfg" carrier_port)"
-        v=$(ask "  carrier_port ($([ "$tr" = icmp ] && echo 'icmp tunnel id' || echo 'udp port'), same on both ends) [${cur:-6262}]" "")
+        local what='udp port'; [ "$tr" = icmp ] && what='icmp tunnel id'; [ "$tr" = tcptun ] && what='tcp port'
+        v=$(ask "  carrier_port ($what, same on both ends) [${cur:-6262}]" "")
         [ -n "$v" ] && jset "$work" carrier_port "$v" int ;;
     esac
     if [ "$mode" = client ]; then
@@ -2888,7 +2949,7 @@ bnshare(){
   python3 - "$@" <<'PYEOF'
 import glob, ipaddress, json, os, re, sys, zlib
 
-P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp")
+P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp", "tcptun")
 # What belongs to ONE server and never travels to the other: its user ports,
 # quotas and proxy, where it delivers, its device name, its extra local
 # addresses and its certificate files.
