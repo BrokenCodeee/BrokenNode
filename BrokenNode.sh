@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.18"
+VERSION="2.8.19"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -2157,6 +2157,12 @@ change_transport(){
   fi
   case "$new" in gre|gretap|ipip|sit) : ;; *) jset "$cfg" fou_port "" del; curfou="" ;; esac
   case "$new" in gre|gretap) : ;; *) jset "$cfg" gre_key "" del ;; esac
+  # tcptun's packets ride a TCP stream and default to an MTU of 8000; a
+  # kernel tunnel or udp needs one that fits the path. An MTU set for one
+  # is wrong for the other: back to automatic.
+  if [ "$new" != "$cur" ] && { [ "$new" = tcptun ] || [ "$cur" = tcptun ]; }; then
+    jset "$cfg" mtu 0 int
+  fi
   cfg_commit "$cfg" || { read -t 30 -rp "  ▶ press ENTER to continue... " _; return; }
   info "transport: $cur/$curenc -> $new/$newenc"
   if tunnel_listens "$cfg" && is_udp_transport "$new" && ! is_udp_transport "$cur"; then

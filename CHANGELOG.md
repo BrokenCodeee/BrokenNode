@@ -3,6 +3,58 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.19
+
+### Fixed
+- **udp and icmp tunnels reordered packets.** Four goroutines read the
+  tunnel device in turn and sent what each read at once, so about one packet
+  in nine of a connection crossed out of order (measured on a burst of 4000
+  datagrams); TCP inside the tunnel takes that for loss. One reader now keeps
+  the order, and it is also faster and lighter (veth, median of three: 82-89
+  instead of 73-80 MiB/s, 30-32 instead of 36-40 CPU-seconds per GiB).
+- **UDP bursts were dropped at the Iran server on udp, icmp and tcptun.**
+  Their UDP port forwarding kept the system's small default socket buffers,
+  unlike every other transport: a burst from a game or a call overflowed them
+  (1100 of 4000 datagrams in the test). They get the same buffers and priority
+  as the others now.
+- **A kernel tunnel killed outright left things behind.** When it was then
+  deleted or replaced instead of started again, its network device, its UDP
+  port inside UDP and GRO off on the network card stayed until a reboot. The
+  cleanup that runs after every stop and in the health check now removes them,
+  and only what this program made and nothing uses any more.
+- Clearer logs: a packet tunnel that cannot send (a firewall, no route, a
+  packet too large) now says so; tcptun says when it refuses a connection
+  from an address other than the other server's; a kernel without the socket
+  match no longer prints a bare iptables error at every start.
+- Changing a tunnel to or from tcptun resets a hand-set MTU to automatic.
+- golang.org/x/net updated to v0.62.0 (two advisories; not reachable from
+  BrokenNode's code).
+
+---
+
+## فارسی — 2.8.19
+
+### رفع اشکال
+- **تانل‌های udp و icmp ترتیب بسته‌ها را به هم می‌زدند.** چهار گوروتین به نوبت از دستگاه تانل می‌خواندند
+  و هر کدام همان لحظه می‌فرستاد، پس حدود یک بسته از هر نُه بستهٔ یک اتصال جابه‌جا می‌رسید (روی ۴۰۰۰ بسته
+  اندازه‌گیری شد) و TCP داخل تانل آن را گم‌شدن بسته حساب می‌کرد. حالا یک خواننده ترتیب را نگه می‌دارد و
+  سریع‌تر و سبک‌تر هم هست (روی veth، میانهٔ سه بار: ۸۲ تا ۸۹ به‌جای ۷۳ تا ۸۰ مگابایت بر ثانیه، و ۳۰ تا ۳۲ به‌جای
+  ۳۶ تا ۴۰ ثانیهٔ پردازنده برای هر گیگابایت).
+- **انفجار بسته‌های UDP روی سرور ایران در udp، icmp و tcptun دور ریخته می‌شد.** فورواردِ پورت UDP این‌ها
+  برخلاف بقیهٔ ترنسپورت‌ها بافر کوچک پیش‌فرض سیستم را داشت و انفجار بستهٔ یک بازی یا تماس آن را پر می‌کرد
+  (۱۱۰۰ از ۴۰۰۰ بسته در تست). حالا همان بافر و اولویت بقیه را دارد.
+- **تانل کرنل که یکباره کشته می‌شد چیزهایی جا می‌گذاشت.** اگر بعد به‌جای روشن شدن دوباره حذف یا عوض می‌شد،
+  دستگاه شبکه‌اش، پورت UDPاش (برای داخل UDP) و GRO خاموشِ کارت شبکه تا ری‌استارت سرور می‌ماند. پاک‌سازی‌ای
+  که بعد از هر توقف و در health check اجرا می‌شود حالا آن‌ها را برمی‌دارد، و فقط چیزی را که خود BrokenNode
+  ساخته و دیگر استفاده نمی‌شود.
+- لاگ‌های روشن‌تر: تانل بسته‌ای که نمی‌تواند بفرستد (فایروال، نبودِ مسیر، بستهٔ بزرگ) حالا می‌گوید؛ tcptun
+  می‌گوید وقتی اتصالی از آدرسی غیر از سرور مقابل را رد می‌کند؛ و روی کرنل بدون socket match دیگر در هر شروع
+  خطای خامِ iptables چاپ نمی‌شود.
+- عوض کردن تانل به tcptun یا از tcptun، MTU دستی را به خودکار برمی‌گرداند.
+- golang.org/x/net به v0.62.0 بروز شد (دو هشدار امنیتی؛ از کد BrokenNode قابل دسترس نبودند).
+
+---
+
 ## 2.8.18
 
 ### New
