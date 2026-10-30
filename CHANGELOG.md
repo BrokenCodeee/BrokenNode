@@ -3,6 +3,31 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.16
+
+### Fixed
+- **UDP through a kernel tunnel (gre, gretap, ipip, l2tp).** On the foreign
+  server every UDP service that ties its socket to the sender after the
+  first packet — iperf3, many game and QUIC servers — got that first packet
+  and nothing after it: each later one was answered with "port unreachable"
+  (measured on a real GRE-inside-UDP tunnel: 0 bytes, while ping worked). A
+  service listening on 0.0.0.0 now receives the tunnel's traffic directly;
+  only one bound to 127.0.0.1 alone still goes through the address
+  rewrite. Update the foreign server.
+
+---
+
+## فارسی — 2.8.16
+
+### رفع اشکال
+- **UDP داخل تانل‌های کرنل (gre، gretap، ipip، l2tp).** روی سرور خارج، هر سرویس UDP که بعد از اولین بسته
+  سوکتش را به فرستنده وصل می‌کند (iperf3، خیلی از سرورهای بازی و QUIC) فقط همان بستهٔ اول را می‌گرفت و
+  جواب بقیه "port unreachable" بود (روی یک تانل واقعی GRE داخل UDP اندازه‌گیری شد: ۰ بایت، در حالی که
+  پینگ کار می‌کرد). حالا سرویسی که روی 0.0.0.0 گوش می‌دهد ترافیک تانل را مستقیم می‌گیرد و فقط سرویسی که
+  تنها روی 127.0.0.1 است از مسیر تغییر آدرس می‌گذرد. سرور خارج را بروز کنید.
+
+---
+
 ## 2.8.15
 
 ### New
