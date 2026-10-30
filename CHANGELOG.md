@@ -3,6 +3,31 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.17
+
+### Fixed
+- **TCP through GRE inside UDP (`fou_port`).** UDP through the tunnel ran
+  fine, but every TCP connection crawled at about 0.5 Mbit/s both ways,
+  stuck at one packet in flight. The cause is GRO on the server's network
+  card, which mishandles tunnel-inside-UDP packets on these hosts: with it
+  off on both servers, TCP through the same tunnel measured 540 Mbit/s. While
+  a tunnel inside UDP runs, BrokenNode now turns GRO off on the card the
+  tunnel uses and turns it back on when the last such tunnel stops. A card
+  whose GRO you turned off yourself is left alone. Update both servers.
+
+---
+
+## فارسی — 2.8.17
+
+### رفع اشکال
+- **TCP داخل GRE داخل UDP (`fou_port`).** UDP داخل تانل درست کار می‌کرد، ولی هر اتصال TCP در هر دو جهت با
+  حدود ۰٫۵ مگابیت می‌خزید. علت GRO کارت شبکهٔ سرور است که بسته‌های تانلِ داخل UDP را روی این سرورها خراب
+  می‌کند: با خاموش شدنش روی هر دو سرور، TCP داخل همان تانل ۵۴۰ مگابیت اندازه‌گیری شد. حالا تا وقتی تانلِ
+  داخل UDP روشن است BrokenNode خودش GRO را روی همان کارت شبکه خاموش می‌کند و وقتی آخرین چنین تانلی
+  متوقف شد دوباره روشنش می‌کند. اگر خودتان GRO را خاموش کرده باشید دست نمی‌خورد. هر دو سرور را بروز کنید.
+
+---
+
 ## 2.8.16
 
 ### Fixed
