@@ -3,6 +3,75 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.21
+
+### Fixed
+- **A cleanup in another network namespace could undo a live tunnel's GRO
+  setting.** The marks BrokenNode keeps in /run are shared by every network
+  namespace on a server (containers, tests); a cleanup run in one of them saw
+  none of the host's tunnels and removed their marks, turning GRO back on
+  under a running tunnel inside UDP. Marks now name their namespace.
+- "The other server hung up at the handshake" now says to check the token
+  too: with aead a different token looks exactly like that.
+- **Upgrading from 2.8.20 or older, the old marks are now safe too.** A
+  cleanup in another namespace still treated the old, unnamed marks as its
+  own, so a tunnel started before the upgrade could be left with GRO off
+  after it stopped. Unnamed marks now belong to the server's own namespace only.
+- **Memory after a burst of users now goes back down on Debian.** Debian turns
+  transparent huge pages on for every program. The kernel then put the memory
+  the core had freed after a burst back into huge pages: after 5000 users the
+  foreign end kept 200 MB while idle, and still grew. The core now turns huge
+  pages off for itself: after 3000 users both ends now settle at about 23 MB
+  (the same test without the change kept 100-130 MB, all in huge pages).
+- **mtcp: a few users failed right after a short outage.** After the path
+  dropped for a few seconds, some links still waited out TCP's retransmit
+  timer. A user put on one of them was cut off a second later, when the
+  other server gave that link up. The relay now checks the link's socket and
+  uses another link while one is still retrying. In the 5-second outage test
+  this dropped 1-6 of 20 users before; now none.
+
+### Improved
+- **doctor finds a path that drops full-size packets.** If the path between
+  the servers carries less than the tunnel's MTU and filters the ICMP that
+  would say so, small packets get through but transfers stall, and the
+  tunnel looks connected. doctor now also sends full-size pings through
+  udp, icmp, tcptun and kernel tunnels. When those fail it says so and
+  suggests a lower `mtu` (menu → this tunnel → tune). For kcp, set
+  `kcp_mtu` to 1200 on such paths.
+
+---
+
+## فارسی — 2.8.21
+
+### رفع اشکال
+- **پاک‌سازی در یک network namespace دیگر می‌توانست تنظیم GRO یک تانل روشن را برگرداند.** نشانه‌هایی که
+  BrokenNode در /run نگه می‌دارد بین همهٔ namespaceهای یک سرور (کانتینرها، تست‌ها) مشترک است؛ پاک‌سازی در یکی
+  از آن‌ها هیچ‌کدام از تانل‌های سرور را نمی‌دید و نشانه‌هایشان را پاک می‌کرد و GRO را زیر یک تانل روشنِ داخل UDP
+  دوباره روشن می‌کرد. حالا هر نشانه namespace خودش را دارد.
+- پیام «the other server hung up at the handshake» حالا می‌گوید توکن را هم بررسی کنید: با aead توکن متفاوت دقیقاً
+  همین‌طور دیده می‌شود.
+- **هنگام ارتقا از ۲.۸.۲۰ یا قدیمی‌تر، نشانه‌های قدیمی هم امن‌اند.** پاک‌سازی در یک namespace دیگر هنوز نشانه‌های
+  قدیمیِ بی‌نام را مال خودش می‌دانست، پس تانلی که پیش از ارتقا روشن شده بود ممکن بود بعد از خاموش شدن GRO را خاموش
+  باقی بگذارد. حالا نشانه‌های بی‌نام فقط مال namespace خود سرور هستند.
+- **حافظه بعد از هجوم کاربران حالا روی دبیان پایین می‌آید.** دبیان transparent huge pages را برای همهٔ برنامه‌ها
+  روشن می‌کند و کرنل حافظه‌ای را که هسته بعد از هجوم آزاد کرده بود دوباره به صفحه‌های بزرگ تبدیل می‌کرد: بعد از ۵۰۰۰
+  کاربر سمت خارج در حالت بیکار ۲۰۰ مگابایت نگه می‌داشت و باز هم بالا می‌رفت. حالا هسته صفحه‌های بزرگ را برای خودش
+  خاموش می‌کند: بعد از ۳۰۰۰ کاربر هر دو سر حدود ۲۳ مگابایت می‌مانند (همان تست بدون این تغییر ۱۰۰ تا ۱۳۰ مگابایت
+  نگه می‌داشت، همه در صفحه‌های بزرگ).
+- **mtcp: چند کاربر درست بعد از یک قطعی کوتاه قطع می‌شدند.** بعد از چند ثانیه قطعی مسیر، بعضی لینک‌ها هنوز منتظر
+  تایمر ارسال دوبارهٔ TCP بودند و کاربری که روی یکی از آن‌ها می‌افتاد یک ثانیه بعد، وقتی سرور دیگر آن لینک را رها می‌کرد،
+  قطع می‌شد. حالا سرور ایران وضعیت سوکت لینک را نگاه می‌کند و تا وقتی لینکی در حال تلاش دوباره است از لینک دیگری
+  استفاده می‌کند. در تست قطعی ۵ ثانیه‌ای قبلاً ۱ تا ۶ کاربر از ۲۰ کاربر قطع می‌شدند؛ حالا هیچ‌کدام.
+
+### بهبود
+- **doctor مسیری را که بسته‌های کامل را دور می‌اندازد پیدا می‌کند.** اگر مسیر بین دو سرور کمتر از MTU تانل را
+  عبور دهد و ICMPی را که این را خبر می‌دهد فیلتر کند، بسته‌های کوچک رد می‌شوند ولی انتقال‌ها گیر می‌کنند و تانل وصل
+  به نظر می‌رسد. حالا doctor برای تانل‌های udp و icmp و tcptun و تانل‌های کرنلی پینگ با اندازهٔ کامل هم می‌فرستد و
+  اگر رد نشود همین را می‌گوید و `mtu` کمتر را پیشنهاد می‌کند (منو ← این تانل ← tune). برای kcp روی چنین مسیرهایی
+  `kcp_mtu` را ۱۲۰۰ بگذارید.
+
+---
+
 ## 2.8.20
 
 ### Fixed
