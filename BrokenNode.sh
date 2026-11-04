@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.19"
+VERSION="2.8.20"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -4068,7 +4068,15 @@ update_self(){
   info "Updating $SRC_DIR ..."
   forget_old_core
   cd "$(dirname "$SRC_DIR")" || return
-  BROKENNODE_DIR="$(basename "$SRC_DIR")" exec bash "$tmp"
+  # The new core is applied by the menu the installer opens. With no terminal
+  # (`ssh host BrokenNode update`, a script, cron) the installer opened none:
+  # it downloaded the release, said "Installed", and the old core went on
+  # running. Hand it "apply" then, which installs the core without the menu.
+  if [ -t 0 ]; then
+    BROKENNODE_DIR="$(basename "$SRC_DIR")" exec bash "$tmp"
+  else
+    BROKENNODE_DIR="$(basename "$SRC_DIR")" exec bash "$tmp" apply
+  fi
 }
 
 # uninstall_all: remove EVERYTHING — tunnels, core, configs, units.
@@ -4462,6 +4470,7 @@ case "${1:-}" in
   uninstall|purge) uninstall_all ;;
   version) echo "BrokenNode manager v$VERSION" ;;
   update) update_self ;;
+  apply) need_root; auto_apply_bundled </dev/null; info "Core: $("$BIN" version 2>/dev/null | head -n 1)" ;;
   ""|menu) main_menu ;;
-  *) echo "usage: sudo bash $SELF [server|client|manage|import <code>|share <tunnel>|backup|transports|tune|restart-all|start-all|stop-all|doctor|update|uninstall|version]"; exit 1 ;;
+  *) echo "usage: sudo bash $SELF [server|client|manage|import <code>|share <tunnel>|backup|transports|tune|restart-all|start-all|stop-all|doctor|update|apply|uninstall|version]"; exit 1 ;;
 esac

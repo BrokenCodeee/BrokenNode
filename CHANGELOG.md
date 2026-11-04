@@ -3,6 +3,48 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.20
+
+### Fixed
+- **mtcp: one user was held to about 80-90 Mbit/s** on an 80 ms path, and UDP
+  through mtcp lost over half its packets at 100 Mbit/s. The per-user window
+  set in 2.8.11 (1 MB on a 2 GB server) was too small for the path's delay.
+  It is now RAM/512 between 2 and 8 MB: measured on a real Iran-Germany pair,
+  one user 212-241 Mbit/s (was 77-94), the speed test 535-580/833-851 (was
+  335/334), UDP loss about 1% (was 59%), for a little more memory with many
+  slow users (60 of them: 115 MB instead of 48 on a 2 GB box at most).
+- **GRE inside UDP after a crash took two tries to come back** on newer
+  kernels (7.0): the UDP port the killed run left open was taken for another
+  program's. It is reused at once now.
+- **`BrokenNode update` with no terminal left the old core running** (over
+  `ssh server BrokenNode update`, or from a script): it downloaded and checked
+  the release and said "Installed", but the new core is applied by the menu,
+  which does not open without a terminal. It is applied now (`BrokenNode
+  apply` does the same by hand).
+- **The UDP speed test could report 0 Mbit/s** when the first 2 seconds lost
+  a few packets (a new flow being set up): it tries the lowest rate again, and
+  a path that loses at every rate is shown with its real loss.
+
+---
+
+## فارسی — 2.8.20
+
+### رفع اشکال
+- **mtcp: هر کاربر روی مسیر ۸۰ میلی‌ثانیه‌ای به حدود ۸۰ تا ۹۰ مگابیت محدود بود** و UDP داخل mtcp با ۱۰۰ مگابیت
+  بیش از نصف بسته‌ها را گم می‌کرد. پنجرهٔ هر کاربر که از 2.8.11 گذاشته شد (۱ مگابایت روی سرور ۲ گیگ) برای
+  تأخیر مسیر کوچک بود. حالا RAM/512 بین ۲ و ۸ مگابایت است: روی یک جفت واقعی ایران-آلمان اندازه‌گیری شد، هر
+  کاربر ۲۱۲ تا ۲۴۱ مگابیت (قبلاً ۷۷ تا ۹۴)، تست سرعت ۵۳۵ تا ۵۸۰ / ۸۳۳ تا ۸۵۱ (قبلاً ۳۳۵/۳۳۴)، گم‌شدن UDP حدود
+  ۱٪ (قبلاً ۵۹٪)، با کمی حافظهٔ بیشتر وقتی کاربرهای کند زیادند (۶۰ کاربر: حداکثر ۱۱۵ به‌جای ۴۸ مگابایت روی ۲ گیگ).
+- **GRE داخل UDP بعد از کرش با تلاش دوم برمی‌گشت** روی کرنل‌های جدید (7.0): پورت UDP که اجرای کشته‌شده باز
+  گذاشته بود مال برنامهٔ دیگری حساب می‌شد. حالا فوراً دوباره استفاده می‌شود.
+- **`BrokenNode update` بدون ترمینال هستهٔ قدیمی را روشن نگه می‌داشت** (با `ssh server BrokenNode update` یا از یک
+  اسکریپت): نسخه را دانلود و بررسی می‌کرد و می‌گفت «Installed»، ولی هستهٔ جدید را منو نصب می‌کند که بدون ترمینال باز
+  نمی‌شود. حالا نصب می‌شود (`BrokenNode apply` همین کار را دستی انجام می‌دهد).
+- **تست سرعت UDP ممکن بود ۰ مگابیت نشان دهد** وقتی ۲ ثانیهٔ اول چند بسته گم می‌شد (راه افتادن یک جریان تازه):
+  کمترین سرعت را دوباره امتحان می‌کند، و مسیری که در همهٔ سرعت‌ها بسته گم می‌کند با درصد واقعی‌اش نشان داده می‌شود.
+
+---
+
 ## 2.8.19
 
 ### Fixed
