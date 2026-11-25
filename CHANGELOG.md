@@ -3,6 +3,32 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.23
+
+### Fixed
+- **gre and the other kernel tunnels: the foreign end showed DOWN** although
+  the tunnel worked, and the main menu warned about it. Kernel tunnels have
+  no link count; one was set at 0 by mistake.
+- **Connections counted wrong on kernel tunnels.** The kernel keeps a
+  connection in its table for hours after it died without closing (after an
+  outage, hundreds); they were counted as users' connections. Now a
+  connection counts when it carried something in the last 3 minutes, and the
+  page says how many idle or dead ones the kernel still holds.
+- **Kernel tunnels showed 0 users and connections on Ubuntu** (and on a
+  busy server). The kernel's connection table was read from a file Ubuntu's
+  kernels do not have; it is now read the way the conntrack tool reads it
+  (netlink), on every distribution, in the background and less often the
+  larger it is. The page says why when it cannot count.
+- **Packet tunnels (udp, icmp, tcptun): the relay showed 0 users.** Their
+  relay counts its users itself again.
+- **Security updates:** three libraries the core uses had published
+  vulnerabilities (websocket, compression); updated, and the release is built
+  with Go 1.27.4 (a fix in its HTTP code).
+- The all-time traffic of kernel and packet tunnels showed 0 B; it is no
+  longer shown for them. The foreign end of a kernel tunnel no longer says
+  the other end's release is "not known yet" (kernel tunnels do not exchange
+  it), and its ports read "set on the relay".
+
 ## 2.8.22
 
 ### New

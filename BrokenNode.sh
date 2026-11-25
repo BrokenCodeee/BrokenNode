@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.22"
+VERSION="2.8.23"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -1599,6 +1599,24 @@ tunnel_state(){
   else TS=down; TS_TXT="${C_R}● DOWN ${age}${C_N}"; fi
 }
 
+# ct_note — how a kernel or packet tunnel's connections were counted, from LV:
+# conntrack, the kernel's table of the connections it NATs. Entries it still
+# holds for connections that died without closing are named, not counted.
+ct_note(){
+  case "${LV[ct]:-}" in
+    ok) local o; o=$(lvn ct_tcp_open)
+        local stale=$(( o - $(lvn ct_tcp) ))
+        if [ "$stale" -gt 0 ]; then
+          printf '%b' "${C_D}from conntrack · active in the last 3 min; $(num "$stale") more in the kernel's table are idle or dead${C_N}"
+        else
+          printf '%b' "${C_D}from conntrack (the kernel carries this tunnel)${C_N}"
+        fi ;;
+    counting) printf '%b' "${C_D}counting from conntrack…${C_N}" ;;
+    unavailable) printf '%b' "${C_Y}the kernel's connection table cannot be read here (netlink, /proc/net/nf_conntrack): connections unknown${C_N}" ;;
+    too_big) printf '%b' "${C_Y}conntrack holds $(num "$(lvn ct_entries)") entries — too many to count${C_N}" ;;
+  esac
+}
+
 # users_of — from LV: "USERS CONNS TCP UDP" now. Users are distinct addresses
 # (the relay sees them; the foreign end sees only the relay: 0 there). Kernel
 # and packet tunnels read conntrack for both.
@@ -1770,7 +1788,8 @@ tunnel_card(){
   local pv="" vtxt=""
   if [ "${#LV[@]}" -gt 0 ]; then
     pv="${LV[peer_version]:-}"
-    if [ -z "$pv" ]; then vtxt="${C_D}release of the other end: not known yet${C_N}"
+    if [ "${LV[links]:--1}" = -1 ]; then vtxt="${C_D}kernel tunnel: the ends do not exchange releases${C_N}"
+    elif [ -z "$pv" ]; then vtxt="${C_D}release of the other end: not known yet${C_N}"
     elif [ "$pv" = "${LV[version]:-}" ]; then vtxt="${C_G}✔ same release ${pv}${C_N}"
     elif [ "$pv" = older ]; then vtxt="${C_Y}▲ other end older than 2.8.6${C_N}"
     else vtxt="${C_Y}▲ other end runs ${pv}, this one ${LV[version]:-?}${C_N}"; fi
@@ -1798,15 +1817,14 @@ tunnel_card(){
   local u c t d; read -r u c t d < <(users_of)
   local ul=""
   [ "$mode" = server ] && ul="users ${C_W}$(num "$u")${C_N}   "
-  local ct=""; [ "${LV[ct]:-}" = ok ] && ct="  ${C_D}(from conntrack)${C_N}"
-  [ "${LV[ct]:-}" = unavailable ] && ct="  ${C_D}(conntrack not readable: counts unknown)${C_N}"
-  [ "${LV[ct]:-}" = too_big ] && ct="  ${C_D}(conntrack table too large to count)${C_N}"
-  echo -e "  $bar $(ui_pad now 10)${ul}connections ${C_W}$(num "$c")${C_N} ${C_D}(tcp $(num "$t") · udp $(num "$d"))${C_N}$ct"
+  echo -e "  $bar $(ui_pad now 10)${ul}connections ${C_W}$(num "$c")${C_N} ${C_D}(tcp $(num "$t") · udp $(num "$d"))${C_N}"
+  local ctn; ctn="$(ct_note)"; [ -n "$ctn" ] && echo -e "  $bar $(ui_pad '' 10)$ctn"
   if [ "${LV[ct]:-}" != ok ]; then
     echo -e "  $bar $(ui_pad '' 10)${C_D}peak $(num "$(lvn peak)") · $(num "$(lvn conns)") opened since start${C_N}"
   fi
   local pf; pf=$(lvn ports_failed)
   local ps="${C_W}$ports${C_N}"
+  [ "$mode" = client ] && [ "$np" = 0 ] && ps="${C_D}set on the relay${C_N}"
   if [ "$mode" = server ] && [ "$np" -gt 0 ]; then
     if [ "$pf" -gt 0 ]; then ps+="   ${C_R}$pf NOT served${C_N}"; else ps+="   ${C_G}all $np served${C_N}"; fi
   fi
@@ -1814,7 +1832,7 @@ tunnel_card(){
   local sp; sp="$(speed_now "$n")"
   [ -n "$sp" ] && echo -e "  $bar $(ui_pad speed 10)${C_W}$sp${C_N}"
   echo -e "  $bar $(ui_pad traffic 10)↑ ${C_W}$(hbs "$(lvn up)")${C_N}  ↓ ${C_W}$(hbs "$(lvn down)")${C_N} ${C_D}this run${C_N}"
-  if [ -n "${LV[life_up]:-}" ]; then
+  if [ -n "${LV[life_up]:-}" ] && [ "${LV[src]:-}" != dev ]; then
     echo -e "  $bar $(ui_pad '' 10)↑ $(hbs "$(lvn life_up)")  ↓ $(hbs "$(lvn life_down)") ${C_D}all time${C_N}"
   fi
   echo -e "  $bar $(ui_pad running 10)$(hdur $(( now - $(lvn started) )))   ${C_D}core ${LV[version]:-?} · pid ${LV[pid]:-?}${C_N}"
@@ -1971,7 +1989,9 @@ stats_page(){
       out+="    ${C_D}Peak here${C_N}    ↓ $(hr_rate "$mdown")   ↑ $(hr_rate "$mup")\n"
       out+="    ${C_D}↓ history${C_N}    $(printf '%s' "${hist[@]}")\n"
       out+="    ${C_B}This run${C_N}     ↓ $(hb "$down")   ↑ $(hb "$up")   total $(hb $(( up + down )))\n"
-      if [ -n "${L[life_up]:-}" ]; then
+      # The all-time totals count user sockets; a kernel or packet tunnel's
+      # users never touch one (they showed 0 B for ever).
+      if [ -n "${L[life_up]:-}" ] && [ "${L[src]:-}" != dev ]; then
         out+="    ${C_B}Lifetime${C_N}     ↓ $(hb "${L[life_down]:-}")   ↑ $(hb "${L[life_up]:-}")   ${C_D}(survives restarts)${C_N}\n"
       fi
       # Users and connections: the core's own counts, or for a kernel or
@@ -1982,8 +2002,8 @@ stats_page(){
       out+="$(ui_rule)\n"
       local who=""; [ "${L[role]:-}" = server ] && who="users ${C_W}$(num "$u")${C_N}   "
       out+="    ${C_B}Now${C_N}          ${who}connections ${C_W}$(num "$c")${C_N}  ${C_D}tcp $(num "$t") · udp $(num "$d")${C_N}\n"
-      if [ "${LV[ct]:-}" = ok ]; then
-        out+="    ${C_D}             counted from conntrack (the kernel carries this tunnel)${C_N}\n"
+      if [ -n "${LV[ct]:-}" ]; then
+        out+="                 $(ct_note)\n"
       else
         out+="    ${C_D}Since start${C_N}  peak $(num "${L[peak]:-0}") at once · $(num "${L[conns]:-0}") opened\n"
       fi
