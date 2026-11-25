@@ -3,6 +3,52 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.22
+
+### New
+- **A new menu.** The main menu opens on a summary of every tunnel on the
+  server: how many run, are down or stopped, users and connections online,
+  traffic, and whether the other servers run the same release. A tunnel that
+  is down is named at the bottom, with where to look. Options are grouped
+  (tunnels, tools, system); the numbers are the same as before.
+- **Manage tunnels is a table:** state and for how long (up 6d, DOWN 4m),
+  transport, users, connections (tcp/udp), traffic and ping, with the reason
+  under a tunnel that is not well.
+- **Each tunnel has its own page:** peer, release check, links and their ping
+  (lowest, average, highest), users, connections by protocol and by port,
+  ports served, speed now, traffic this run and all time, how long it has
+  run. Its options are grouped (run, watch & test, change, config & share)
+  and show their current value; the numbers are the same as before.
+- **Users and connections for every transport.** The core now reports the
+  number of users (distinct addresses), open connections per port and
+  protocol, and the links' round-trip time (from TCP and kcp themselves,
+  nothing extra is sent). Kernel tunnels (gre, ipip, ...) and packet tunnels
+  (udp, icmp, tcptun) count their users from the kernel's connection table.
+- **Live stats and the Health check show all of it**; the Health check ends
+  with a count of OK, warnings and problems, and lists every core running on
+  the server with its real version.
+
+### Fixed
+- **tcpnomux used a lot of memory and sockets with many users.** Every UDP
+  flow — each DNS lookup, from a new port each time — held a carrier and a
+  socket on the foreign server for a full minute. A flow that got at most one
+  answer now goes after 5 seconds; a real conversation (a game, a call, QUIC)
+  keeps the minute. UDP sessions also start with small buffers. Measured at
+  200 lookups a second: 1266 sessions instead of about 12000, and 165 MB on
+  the foreign server instead of 455 MB. This helps UDP on every transport.
+- **"The other server runs 2.8.9" while both run the new release.** An old
+  copy of the core was still running (a tunnel not restarted after an
+  interrupted update, or started by hand). The log now names the address the
+  old release came from; opening the menu restarts a tunnel still on an older
+  core, and names a core that no tunnel started.
+- **An update started tunnels that had been stopped on purpose.** Now only
+  the tunnels meant to run are restarted onto the new core.
+- An update left a file in /tmp each time; a failed update now returns to
+  the menu.
+- The Health check said a port was not listening on a busy server although
+  it was; a tunnel stopped on purpose is no longer counted as a problem.
+- Columns lined up wrong on servers whose language setting is "C".
+
 ## 2.8.21
 
 ### Fixed

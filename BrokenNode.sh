@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.21"
+VERSION="2.8.22"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -70,19 +70,6 @@ detect_ip6(){ ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{for(i=1;i
 default_iface(){ ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1; }
 
 core_ver(){ if [ -x "$BIN" ]; then "$BIN" version 2>/dev/null | awk '{print $NF}'; else echo "v$VERSION"; fi; }
-banner(){
-  clear 2>/dev/null || true
-  local v; v="$(core_ver)"
-  echo -e "${C_M}"
-  echo "  ╔══════════════════════════════════════════════╗"
-  echo "  ║           B R O K E N   N O D E              ║"
-  printf "  ║      Multi-Protocol Tunnel  ·  %-14s║\n" "$v"
-  echo "  ╠══════════════════════════════════════════════╣"
-  printf "  ║%-46s║\n" "      Telegram:  @BrokenNode"
-  echo "  ╚══════════════════════════════════════════════╝"
-  echo -e "${C_N}${C_D}  arch: $(uname -m)   manager: v$VERSION   core: $([ -x "$BIN" ] && core_ver || echo 'not installed')${C_N}"
-  echo -e "${C_G}  Free & open-source · t.me/BrokenNode${C_N}"
-}
 
 # arch_sfx maps this machine to the binary suffix built by scripts/build.sh.
 # The names come from `uname -m`, which is what every Linux distribution
@@ -978,7 +965,10 @@ check_bind(){
   esac
   host="${host#[}"; host="${host%]}"
   command -v ip >/dev/null 2>&1 || { echo "$addr"; return; }
-  if ip -o addr show 2>/dev/null | grep -qw "$host"; then
+  # Read first, then search: with pipefail, grep -q leaving at the first
+  # match makes the writer die of SIGPIPE and the pipeline count as failed.
+  local addrs; addrs="$(ip -o addr show 2>/dev/null)"
+  if grep -qw "$host" <<<"$addrs"; then
     echo "$addr"; return
   fi
   {
@@ -1482,45 +1472,384 @@ link_state(){
   esac
 }
 
-list_tunnels(){
-  TUNNELS=()
-  local f n st any=0 i=0
-  echo; echo -e "${C_B}  Tunnels:${C_N}"
-  echo -e "  ${C_D}──────────────────────────────────────────────${C_N}"
+
+# ============================================================================
+#  UI kit — the menu's look: one header, breadcrumbs, sections, numbered
+#  items, and the live numbers each tunnel's core writes every second to
+#  /run/brokennode/<name>.live (users, connections per port, link RTT ...).
+#  Menu numbers never change with the layout: they are what people remember
+#  and what every guide says.
+# ============================================================================
+C_W='\033[1;37m'; C_BOLD='\033[1m'
+UI_W=72
+ui_rule(){ local s; printf -v s '%*s' "$UI_W" ''; echo -e "  ${C_D}${s// /─}${C_N}"; }
+ui_crumb(){ # ui_crumb A B ... — "Home › A › B", the last one bright
+  local out="${C_D}Home" i n=$#
+  for ((i=1; i<=n; i++)); do
+    if [ "$i" -eq "$n" ]; then out+=" ›${C_N} ${C_W}${!i}${C_N}"; else out+=" › ${!i}"; fi
+  done
+  echo -e "  $out"
+}
+# ui_pause — hold what an action printed until Enter (the page redraws after).
+ui_pause(){ read -t 120 -rp "  ▶ press ENTER to go back to the tunnel... " _ 2>/dev/null || true; }
+ui_section(){ echo -e "  ${C_B}${C_BOLD}$1${C_N}"; }
+# ui_item NUM LABEL [HINT] — one menu line; the label column is fixed.
+ui_item(){ printf "    ${C_Y}${C_BOLD}%-3s${C_N} %-24s ${C_D}%b${C_N}\n" "$1" "$2" "${3:-}"; }
+# ui_pad TEXT WIDTH — TEXT (with colour codes) padded to WIDTH visible columns.
+# Width is counted in characters whatever the locale: the bytes of a UTF-8
+# character after its first (0x80-0xBF) are not counted — "●" is one column,
+# and in the C locale servers often run in bash would count it as three.
+ui_pad(){
+  local plain; plain="$(printf '%b' "$1" | sed 's/\x1b\[[0-9;]*m//g')"
+  local LC_ALL=C
+  plain="${plain//[$'\x80'-$'\xbf']/}"
+  local n=$(( $2 - ${#plain} )); [ "$n" -lt 0 ] && n=0
+  printf '%b%*s' "$1" "$n" ''
+}
+# ui_two LEFT RIGHT — two columns, the right one starting at column 38.
+ui_two(){ printf '%s%b\n' "$(ui_pad "$1" 36)" "$2"; }
+# ui_item2 NUM LABEL [HINT] — ui_item as one column of a pair (no newline).
+ui_item2(){ printf "  ${C_Y}${C_BOLD}%-3s${C_N} %b${C_D}%s${C_N}" "$1" "$2" "${3:+  $3}"; }
+# num 1284 -> 1,284
+num(){ local n="${1:-0}"; case "$n" in ''|*[!0-9-]*) printf '%s' "$n"; return ;; esac
+  while [[ "$n" =~ ^(-?[0-9]+)([0-9]{3})$|^(-?[0-9]+)([0-9]{3}),(.*)$ ]]; do
+    if [ -n "${BASH_REMATCH[1]}" ]; then n="${BASH_REMATCH[1]},${BASH_REMATCH[2]}"; else n="${BASH_REMATCH[3]},${BASH_REMATCH[4]},${BASH_REMATCH[5]}"; fi
+  done; printf '%s' "$n"; }
+# hdur SECONDS -> "6d 4h", "11h 3m", "4m", "35s"
+hdur(){ local s="${1:-0}"; case "$s" in ''|*[!0-9]*) s=0 ;; esac
+  if [ "$s" -ge 86400 ]; then printf '%dd %dh' $((s/86400)) $((s%86400/3600))
+  elif [ "$s" -ge 3600 ]; then printf '%dh %dm' $((s/3600)) $((s%3600/60))
+  elif [ "$s" -ge 60 ]; then printf '%dm' $((s/60))
+  else printf '%ds' "$s"; fi; }
+# hbs BYTES -> "301.4 GB" (one decimal, a space: the tables' format)
+hbs(){ awk -v b="${1:-0}" 'BEGIN{ u="B"; x=b+0;
+  if(x>=1024){x/=1024;u="KB"} if(x>=1024){x/=1024;u="MB"} if(x>=1024){x/=1024;u="GB"} if(x>=1024){x/=1024;u="TB"}
+  if(u=="B")printf "%d B",x; else printf "%.1f %s",x,u }'; }
+# rtt_col MS — a ping coloured by how it feels: green, yellow, red.
+rtt_col(){ local m="$1"; case "$m" in ''|*[!0-9]*) printf '%b' "${C_D}—${C_N}"; return ;; esac
+  if [ "$m" -lt 120 ]; then printf '%b' "${C_G}${m}ms${C_N}"
+  elif [ "$m" -lt 250 ]; then printf '%b' "${C_Y}${m}ms${C_N}"
+  else printf '%b' "${C_R}${m}ms${C_N}"; fi; }
+
+# live_load NAME — the tunnel's live numbers into LV; fails when the core
+# wrote none in the last 5 s (stopped, or a core older than 2.3.9).
+declare -A LV=()
+live_load(){
+  LV=()
+  local f="/run/brokennode/$1.live" k v
+  [ -f "$f" ] || return 1
+  while IFS='=' read -r k v; do
+    [[ "$k" =~ ^[a-z_0-9]+$ ]] && LV[$k]="$v"
+  done < "$f"
+  local ts="${LV[ts]:-0}" now; now=$(date +%s)
+  case "$ts" in ''|*[!0-9]*) ts=0 ;; esac
+  [ $(( now - ts )) -le 5 ] || { LV=(); return 1; }
+}
+# lvn KEY — a numeric live value (0 when absent or not a number).
+lvn(){ local v="${LV[$1]:-0}"; v="${v%% *}"; case "$v" in ''|*[!0-9]*) echo 0 ;; *) echo "$v" ;; esac; }
+
+# cfg_info FILE — the config fields the pages show, in one read:
+# mode transport encryption direction peer ports nports socks fou carrier
+cfg_info(){
+  python3 - "$1" <<'PYEOF'
+import json,sys
+P2P = ("gre", "gretap", "ipip", "sit", "l2tp", "udp", "icmp", "tcptun")
+try:
+    c = json.load(open(sys.argv[1]))
+except Exception:
+    c = {}
+t = c.get("transport") or "?"
+stream = t not in P2P
+d = str(c.get("direction") or "").strip().lower()
+direct = stream and d == "direct"
+listens = (c.get("mode") == "server") != direct
+if stream:
+    peer = c.get("bind_addr" if listens else "remote_addr") or "?"
+else:
+    peer = c.get("remote_ip") or "?"
+ports = [str(p) for p in (c.get("ports") or [])]
+carrier = "in UDP" if t in ("gre", "gretap", "ipip", "sit") and c.get("fou_port") else ""
+enc = c.get("encryption") or ("-" if not stream else "aead")
+print("\t".join([c.get("mode") or "?", t, enc, "direct" if direct else "reverse",
+                 "listen" if listens else "dial", peer, " · ".join(ports) or "-", str(len(ports)),
+                 c.get("socks") or "", carrier]))
+PYEOF
+}
+
+# tunnel_state NAME — sets TS (up|down|stopped|failed|running|starting), TS_TXT
+# (coloured, with how long) and loads LV. "running" is a live service whose
+# core reports no link count (kernel tunnels): the kernel is the data plane.
+tunnel_state(){
+  local n="$1" unit="brokennode@$1" act en now; now=$(date +%s)
+  act="$(systemctl is-active "$unit" 2>/dev/null)"
+  en=0; systemctl is-enabled "$unit" >/dev/null 2>&1 && en=1
+  live_load "$n"
+  case "$act" in
+    active) : ;;
+    activating|reloading) TS=starting; TS_TXT="${C_Y}◐ starting${C_N}"; return ;;
+    *) if [ "$en" = 1 ]; then TS=failed; TS_TXT="${C_R}● FAILED${C_N}"
+       else TS=stopped; TS_TXT="${C_D}○ stopped${C_N}"; fi; return ;;
+  esac
+  if [ "${#LV[@]}" -eq 0 ]; then TS=running; TS_TXT="${C_G}● running${C_N}"; return; fi
+  local links; links="${LV[links]:--1}"
+  local since="${LV[link_since]:-${LV[started]:-$now}}"; case "$since" in ''|*[!0-9]*) since=$now ;; esac
+  local age; age="$(hdur $(( now - since )))"
+  if [ "$links" = -1 ]; then TS=running; TS_TXT="${C_G}● up $(hdur $(( now - ${LV[started]:-$now} )))${C_N}"
+  elif [ "$links" -gt 0 ] 2>/dev/null; then TS=up; TS_TXT="${C_G}● up ${age}${C_N}"
+  else TS=down; TS_TXT="${C_R}● DOWN ${age}${C_N}"; fi
+}
+
+# users_of — from LV: "USERS CONNS TCP UDP" now. Users are distinct addresses
+# (the relay sees them; the foreign end sees only the relay: 0 there). Kernel
+# and packet tunnels read conntrack for both.
+users_of(){
+  local u c t d
+  if [ "${LV[ct]:-}" = ok ]; then
+    t=$(lvn ct_tcp); d=$(lvn ct_udp); u=$(lvn ct_clients)
+  else
+    t=$(lvn active_tcp); d=$(lvn active_udp); u=$(lvn clients)
+  fi
+  c=$(( t + d ))
+  echo "$u $c $t $d"
+}
+
+# header — the line every page starts with.
+banner(){
+  clear 2>/dev/null || true
+  local role="" f m srv=0 cli=0 cv="not installed"
   for f in "$CFG_DIR"/*.json; do
     [ -e "$f" ] || continue
-    any=1; n="$(basename "$f" .json)"; i=$((i+1)); TUNNELS+=("$n")
-    st="$(systemctl is-active "brokennode@$n" 2>/dev/null)"
-    local m tr; m=$(grep -o '"mode"[^,]*' "$f" | sed 's/.*: *"//;s/".*//'); tr=$(grep -o '"transport"[^,]*' "$f" | sed 's/.*: *"//;s/".*//')
-    local col="$C_R"; [ "$st" = active ] && col="$C_G"
-    # "active" only means the SERVICE is running. It says nothing about whether
-    # the tunnel actually has a peer — we lost hours to a tunnel that was
-    # "active" while carrying no traffic at all. link_state reads the log to
-    # report what really happened last.
-    local link; link="$(link_state "$n")"
-    # One read of the config for everything the two lines show.
-    local dir listens addr ports
-    IFS=$'\t' read -r dir listens addr ports < <(tunnel_summary "$f")
-    [ "$dir" = direct ] && tr="$tr (direct)"
-    printf "  %2d) %-14s ${col}%-8s${C_N} %-22s ${C_D}%s/%s${C_N}\n" "$i" "$n" "$st" "$link" "$m" "$tr"
-    local pf; pf=$(ports_failed "$n")
-    [ "$pf" -gt 0 ] && echo -e "      ${C_R}⚠ ${pf} port(s) NOT served — users of them get nothing. Open the tunnel → 18) Diagnose${C_N}"
-    local vn; vn=$(version_note "$n"); [ -n "$vn" ] && echo -e "      $vn"
-    # second line: address/port + psk (token), so both sides can be re-checked
-    # against each other at a glance without opening the config file.
-    local psk
-    psk="$(sed -n 's/.*"token"[ ]*:[ ]*"\([^"]*\)".*/\1/p' "$f")"
-    # Where this end listens or what it dials depends on the direction.
-    local how="listen:"
-    [ "$listens" = 0 ] && how="dials: "
-    if [ "$m" = server ]; then
-      printf "      ${C_D}%s %-22s ports: %-18s psk: %s${C_N}\n" "$how" "${addr:-?}" "${ports:-?}" "${psk:-?}"
-    else
-      printf "      ${C_D}%s %-22s psk: %s${C_N}\n" "$how" "${addr:-?}" "${psk:-?}"
+    m="$(sed -n 's/.*"mode"[ ]*:[ ]*"\([^"]*\)".*/\1/p' "$f")"
+    [ "$m" = server ] && srv=1; [ "$m" = client ] && cli=1
+  done
+  [ "$srv" = 1 ] && role="relay (Iran)"
+  [ "$cli" = 1 ] && role="${role:+$role + }foreign end"
+  [ -x "$BIN" ] && cv="$(core_ver)"; cv="${cv#v}"
+  echo
+  echo -e "  ${C_M}▌${C_N} ${C_M}${C_BOLD}B R O K E N   N O D E${C_N}   ${C_D}v$VERSION · core $cv · $(arch_sfx)${role:+ · $role}${C_N}"
+  ui_rule
+}
+
+# tr_label TRANSPORT ENCRYPTION CARRIER DIRECTION SOCKS — "mtcp · reality",
+# "gre · in UDP", "kcp · aead · direct", "ws · tls · proxy".
+tr_label(){
+  local l="$1"
+  if [ -n "$3" ]; then l+=" · $3"
+  elif [ -n "$2" ] && [ "$2" != - ] && [ "$2" != none ]; then l+=" · $2"; fi
+  [ "$4" = direct ] && l+=" · direct"
+  [ -n "$5" ] && l+=" · proxy"
+  printf '%s' "$l"
+}
+
+# list_tunnels — the table of tunnels; fills TUNNELS (numbers to names).
+list_tunnels(){
+  TUNNELS=()
+  local f n i=0 now; now=$(date +%s)
+  echo
+  echo -e "  ${C_D} #  $(ui_pad NAME 14)$(ui_pad STATE 13)$(ui_pad TRANSPORT 22)$(ui_pad USERS 7)$(ui_pad CONNS 13)$(ui_pad TRAFFIC 11)PING${C_N}"
+  echo -e "  ${C_D} ── ───────────── ──────────── ───────────────────── ────── ──────────── ────────── ─────${C_N}"
+  for f in "$CFG_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    n="$(basename "$f" .json)"; i=$((i+1)); TUNNELS+=("$n")
+    local mode tr enc dir how peer ports np socks car
+    IFS=$'\t' read -r mode tr enc dir how peer ports np socks car < <(cfg_info "$f")
+    tunnel_state "$n"
+    local users="—" conns="—" traffic="—" ping="—"
+    if [ "${#LV[@]}" -gt 0 ]; then
+      local u c t d; read -r u c t d < <(users_of)
+      [ "$mode" = server ] && users="$(num "$u")"
+      conns="$(num "$c") ${C_D}$t/$d${C_N}"
+      traffic="$(hbs $(( $(lvn up) + $(lvn down) )))"
+      [ -n "${LV[rtt_avg]:-}" ] && ping="$(rtt_col "${LV[rtt_avg]}")"
+    fi
+    printf "   ${C_Y}${C_BOLD}%-2s${C_N} %s%s%s%s%s%s%b\n" "$i" "$(ui_pad "$n" 14)" "$(ui_pad "$TS_TXT" 13)" \
+      "$(ui_pad "$(tr_label "$tr" "$enc" "$car" "$dir" "$socks")" 22)" "$(ui_pad "$users" 7)" "$(ui_pad "$conns" 13)" "$(ui_pad "$traffic" 11)" "$ping"
+    # Why a tunnel is not well, under its row.
+    case "$TS" in
+      down)   echo -e "         ${C_R}└ no link to the other server ($peer) — open it, then 18) Diagnose${C_N}" ;;
+      failed) echo -e "         ${C_R}└ the service keeps failing — open it, then 4) Live logs${C_N}" ;;
+    esac
+    if [ "${#LV[@]}" -gt 0 ]; then
+      local pf; pf=$(lvn ports_failed)
+      [ "$pf" -gt 0 ] && echo -e "         ${C_R}└ ${pf} port(s) NOT served — users of them get nothing → 18) Diagnose${C_N}"
+      local vn; vn=$(version_note "$n"); [ -n "$vn" ] && echo -e "         └ $vn"
     fi
   done
-  [ "$any" = 0 ] && echo -e "   ${C_D}(no tunnels yet)${C_N}"
-  echo -e "  ${C_D}──────────────────────────────────────────────${C_N}"
+  [ "$i" = 0 ] && echo -e "   ${C_D}(no tunnels yet — 1 or 2 on the main menu creates one)${C_N}"
+  echo
+}
+
+# dashboard — the main menu's summary of every tunnel on this server.
+dashboard(){
+  local f n up=0 down=0 stopped=0 users=0 conns=0 tu=0 td=0 vbad=0 total=0
+  for f in "$CFG_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    n="$(basename "$f" .json)"; total=$((total+1))
+    tunnel_state "$n"
+    case "$TS" in up|running) up=$((up+1)) ;; down|failed) down=$((down+1)) ;; *) stopped=$((stopped+1)) ;; esac
+    if [ "${#LV[@]}" -gt 0 ]; then
+      local u c t d; read -r u c t d < <(users_of)
+      users=$((users+u)); conns=$((conns+c))
+      tu=$((tu + $(lvn up))); td=$((td + $(lvn down)))
+      local pv="${LV[peer_version]:-}"
+      [ -n "$pv" ] && [ "$pv" != "${LV[version]:-}" ] && vbad=$((vbad+1))
+    fi
+  done
+  echo
+  if [ "$total" = 0 ]; then
+    echo -e "  ${C_D}No tunnels yet. Start with 1 on the Iran server and 2 on the foreign one,${C_N}"
+    echo -e "  ${C_D}or 6 to paste a share code from the other server.${C_N}"
+    return
+  fi
+  local line="  ${C_G}●${C_N} $up running"
+  [ "$down" -gt 0 ] && line+="   ${C_R}●${C_N} $down down" || line+="   ${C_D}●${C_N} 0 down"
+  [ "$stopped" -gt 0 ] && line+="   ${C_D}○ $stopped stopped${C_N}"
+  printf '%s' "$(ui_pad "$line" 44)"; echo -e "${C_W}$(num "$users")${C_N} users · ${C_W}$(num "$conns")${C_N} connections"
+  printf '%s' "$(ui_pad "  ${C_D}this run${C_N}  ↑ ${C_W}$(hbs "$tu")${C_N}  ↓ ${C_W}$(hbs "$td")${C_N}" 44)"
+  if [ "$vbad" -gt 0 ]; then echo -e "${C_Y}▲ $vbad tunnel(s): other server on another release${C_N}"
+  else echo -e "${C_G}✔${C_N} other servers: same release"; fi
+}
+
+# down_alerts — one line for each tunnel that should run and does not.
+down_alerts(){
+  local f n any=0
+  for f in "$CFG_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    n="$(basename "$f" .json)"
+    tunnel_state "$n"
+    case "$TS" in
+      down)   [ "$any" = 0 ] && ui_rule; any=1
+              echo -e "  ${C_R}⚠ tunnel${C_N} ${C_W}$n${C_N} ${C_R}is DOWN ($(hdur $(( $(date +%s) - $(lvn link_since) )))) — no link to the other server${C_N}" ;;
+      failed) [ "$any" = 0 ] && ui_rule; any=1
+              echo -e "  ${C_R}⚠ tunnel${C_N} ${C_W}$n${C_N} ${C_R}keeps failing to start${C_N}" ;;
+    esac
+  done
+  [ "$any" = 1 ] && echo -e "    ${C_D}open it: 3 → its number → 18 Diagnose (or 4 Live logs)${C_N}"
+  return 0
+}
+
+# speed_now NAME — "↑ X ↓ Y" from this snapshot and the one the menu saw last
+# time (kept in /run), when that was within 30 s; empty otherwise.
+speed_now(){
+  local n="$1" f="/run/brokennode/.ui-$1" pts pup pdown ts up down
+  ts=$(lvn ts); up=$(lvn up); down=$(lvn down)
+  if [ -f "$f" ] && read -r pts pup pdown < "$f" 2>/dev/null; then
+    case "$pts$pup$pdown" in *[!0-9]*|'') pts=0 ;; esac
+    local dt=$(( ts - pts ))
+    if [ "$dt" -gt 0 ] && [ "$dt" -le 30 ]; then
+      local ru=$(( (up - pup) / dt )) rd=$(( (down - pdown) / dt ))
+      [ "$ru" -lt 0 ] && ru=0; [ "$rd" -lt 0 ] && rd=0
+      printf '↑ %s  ↓ %s' "$(hr_rate "$ru")" "$(hr_rate "$rd")"
+    fi
+  fi
+  [ "$ts" -gt 0 ] && echo "$ts $up $down" > "$f" 2>/dev/null
+  return 0
+}
+
+# port_lines — "443/tcp 12 now · 340 since start" for each port in LV.
+port_lines(){
+  local k v proto port now tot
+  for k in $(printf '%s\n' "${!LV[@]}" | grep -E '^(port|ctport)_(tcp|udp)_[0-9]+$' | sort -t_ -k3,3n); do
+    v="${LV[$k]}"; proto="${k#*_}"; port="${proto#*_}"; proto="${proto%%_*}"
+    now="${v%% *}"; tot=""; [ "$v" != "$now" ] && tot="${v#* }"
+    printf "      %s %s%b\n" "$(ui_pad "${port}/${proto}" 12)" "$(ui_pad "${C_W}$(num "$now")${C_N} open" 12)" "${tot:+${C_D} · $(num "$tot") since start${C_N}}"
+  done
+  return 0
+}
+
+# tunnel_card NAME — everything about one tunnel at a glance.
+tunnel_card(){
+  local n="$1" f="$CFG_DIR/$1.json" now; now=$(date +%s)
+  local mode tr enc dir how peer ports np socks car
+  IFS=$'\t' read -r mode tr enc dir how peer ports np socks car < <(cfg_info "$f")
+  tunnel_state "$n"
+  local role="Iran relay"; [ "$mode" = client ] && role="foreign end"
+  local bar="${C_D}│${C_N}"
+  echo -e "  ${C_D}┌$(printf '%*s' 70 '' | sed 's/ /─/g')${C_N}"
+  echo -e "  $bar ${C_W}${C_BOLD}$n${C_N}   $TS_TXT   ${C_D}$role · $dir · $(tr_label "$tr" "$enc" "$car" "" "$socks")${C_N}"
+  local pv="" vtxt=""
+  if [ "${#LV[@]}" -gt 0 ]; then
+    pv="${LV[peer_version]:-}"
+    if [ -z "$pv" ]; then vtxt="${C_D}release of the other end: not known yet${C_N}"
+    elif [ "$pv" = "${LV[version]:-}" ]; then vtxt="${C_G}✔ same release ${pv}${C_N}"
+    elif [ "$pv" = older ]; then vtxt="${C_Y}▲ other end older than 2.8.6${C_N}"
+    else vtxt="${C_Y}▲ other end runs ${pv}, this one ${LV[version]:-?}${C_N}"; fi
+  fi
+  local pl="peer"; [ "$how" = listen ] && pl="listens"
+  echo -e "  $bar $(ui_pad "$pl" 10)${C_W}$peer${C_N}   $vtxt"
+  if [ "${#LV[@]}" -eq 0 ]; then
+    echo -e "  $bar ${C_D}no live numbers: the tunnel is not running (or its core predates them)${C_N}"
+    echo -e "  $bar $(ui_pad ports 10)${C_W}$ports${C_N}"
+    echo -e "  ${C_D}└$(printf '%*s' 70 '' | sed 's/ /─/g')${C_N}"
+    return
+  fi
+  local links; links="${LV[links]:--1}"
+  if [ "$links" != -1 ]; then
+    local lk="${C_W}$links${C_N} up"
+    local bo; bo=$(lvn links_backoff); [ "$bo" -gt 0 ] && lk+="  ${C_Y}($bo retransmitting)${C_N}"
+    local rt=""; [ -n "${LV[rtt_avg]:-}" ] && rt="   ping $(rtt_col "${LV[rtt_avg]}") ${C_D}(min ${LV[rtt_min]:-?} · max ${LV[rtt_max]:-?} ms)${C_N}"
+    echo -e "  $bar $(ui_pad links 10)$lk$rt"
+  else
+    local dv="${LV[dev]:-}" dst="—"
+    [ -n "$dv" ] && dst="$(cat "/sys/class/net/$dv/operstate" 2>/dev/null || echo gone)"
+    [ "$dst" = unknown ] && dst=up
+    echo -e "  $bar $(ui_pad device 10)${C_W}${dv:-—}${C_N} ($dst)   ${C_D}the kernel carries the traffic${C_N}"
+  fi
+  local u c t d; read -r u c t d < <(users_of)
+  local ul=""
+  [ "$mode" = server ] && ul="users ${C_W}$(num "$u")${C_N}   "
+  local ct=""; [ "${LV[ct]:-}" = ok ] && ct="  ${C_D}(from conntrack)${C_N}"
+  [ "${LV[ct]:-}" = unavailable ] && ct="  ${C_D}(conntrack not readable: counts unknown)${C_N}"
+  [ "${LV[ct]:-}" = too_big ] && ct="  ${C_D}(conntrack table too large to count)${C_N}"
+  echo -e "  $bar $(ui_pad now 10)${ul}connections ${C_W}$(num "$c")${C_N} ${C_D}(tcp $(num "$t") · udp $(num "$d"))${C_N}$ct"
+  if [ "${LV[ct]:-}" != ok ]; then
+    echo -e "  $bar $(ui_pad '' 10)${C_D}peak $(num "$(lvn peak)") · $(num "$(lvn conns)") opened since start${C_N}"
+  fi
+  local pf; pf=$(lvn ports_failed)
+  local ps="${C_W}$ports${C_N}"
+  if [ "$mode" = server ] && [ "$np" -gt 0 ]; then
+    if [ "$pf" -gt 0 ]; then ps+="   ${C_R}$pf NOT served${C_N}"; else ps+="   ${C_G}all $np served${C_N}"; fi
+  fi
+  echo -e "  $bar $(ui_pad ports 10)$ps"
+  local sp; sp="$(speed_now "$n")"
+  [ -n "$sp" ] && echo -e "  $bar $(ui_pad speed 10)${C_W}$sp${C_N}"
+  echo -e "  $bar $(ui_pad traffic 10)↑ ${C_W}$(hbs "$(lvn up)")${C_N}  ↓ ${C_W}$(hbs "$(lvn down)")${C_N} ${C_D}this run${C_N}"
+  if [ -n "${LV[life_up]:-}" ]; then
+    echo -e "  $bar $(ui_pad '' 10)↑ $(hbs "$(lvn life_up)")  ↓ $(hbs "$(lvn life_down)") ${C_D}all time${C_N}"
+  fi
+  echo -e "  $bar $(ui_pad running 10)$(hdur $(( now - $(lvn started) )))   ${C_D}core ${LV[version]:-?} · pid ${LV[pid]:-?}${C_N}"
+  echo -e "  ${C_D}└$(printf '%*s' 70 '' | sed 's/ /─/g')${C_N}"
+  local pls; pls="$(port_lines)"
+  if [ -n "$pls" ]; then
+    local side="the users' ports"; [ "$mode" = client ] && side="the services' ports"
+    echo -e "  ${C_D}open connections by port ($side)${C_N}"
+    printf '%s\n' "$pls"
+  fi
+}
+
+# tunnel_menu NAME — the tunnel's options, grouped; the numbers are the ones
+# they always had.
+tunnel_menu(){
+  local n="$1" f="$CFG_DIR/$1.json"
+  local mode tr enc dir how peer ports np socks car
+  IFS=$'\t' read -r mode tr enc dir how peer ports np socks car < <(cfg_info "$f")
+  echo
+  ui_two "$(ui_section RUN)" "$(ui_section 'WATCH & TEST')"
+  ui_two "  $(ui_item2 1 Start)"   "$(ui_item2 4 'Live logs')"
+  ui_two "  $(ui_item2 2 Stop)"    "$(ui_item2 8 'Live stats' 'speed, users, ports')"
+  ui_two "  $(ui_item2 3 Restart)" "$(ui_item2 15 'Speed test')"
+  ui_two "  $(ui_item2 7 "${C_R}Delete${C_N}")" "$(ui_item2 18 Diagnose 'users get nothing?')"
+  echo
+  ui_two "$(ui_section CHANGE)" "$(ui_section 'CONFIG & SHARE')"
+  ui_two "  $(ui_item2 9 Transport "$tr")"     "$(ui_item2 5 'Show config')"
+  ui_two "  $(ui_item2 10 'Peer IP')"          "$(ui_item2 6 'Edit config' '(nano)')"
+  ui_two "  $(ui_item2 11 Tune 'MTU · FEC · window')" "$(ui_item2 19 'Share code' 'for the other end')"
+  echo "  $(ui_item2 13 Direction "$(direction_label "$f")")"
+  echo "  $(ui_item2 14 Encryption "$enc")"
+  echo "  $(ui_item2 16 Preset 'Optimized · High-Speed · Stable · Low-Latency · Eco')"
+  echo "  $(ui_item2 17 Port-forwards "$np port(s)")"
+  echo
+  echo -e "  ${C_Y}${C_BOLD}0${C_N} back"
 }
 
 hb(){ # humanize bytes -> KB/MB/GB/TB
@@ -1572,7 +1901,7 @@ stats_page(){
   # below it. (Saving and restoring the cursor broke on a short terminal:
   # the first frame scrolled the screen and every later one landed higher.)
   local hdr
-  hdr="$(banner; echo -e "${C_B}  Live stats: $n${C_N}   ${C_D}(any key or Ctrl+C = back)${C_N}"; echo -e "  ${C_D}──────────────────────────────────────────────${C_N}")"
+  hdr="$(banner; ui_crumb "Manage tunnels" "$n" "Live stats"; echo -e "  ${C_D}redrawn every second · any key or Ctrl+C = back${C_N}")"
   clear 2>/dev/null || true
   printf '%s\n' "$hdr"
   local top; top=$(printf '%s\n' "$hdr" | wc -l)
@@ -1585,8 +1914,12 @@ stats_page(){
       # Every key but these few is a counter used in $(( )), where bash would
       # evaluate anything else as an expression: keep only plain numbers.
       while IFS='=' read -r k v; do
-        [[ "$k" =~ ^[a-z_]+$ ]] || continue
-        case "$k" in dev|role|src|transport) : ;; *) [[ "$v" =~ ^[0-9]+$ ]] || v=0 ;; esac
+        [[ "$k" =~ ^[a-z_0-9]+$ ]] || continue
+        case "$k" in
+          dev|role|src|transport|ct|version|peer_version) : ;;
+          port_*|ctport_*) [[ "$v" =~ ^[0-9]+( [0-9]+)?$ ]] || v=0 ;;
+          *) [[ "$v" =~ ^[0-9]+$ ]] || v=0 ;;
+        esac
         L[$k]="$v"
       done < "$lf"
     fi
@@ -1633,7 +1966,7 @@ stats_page(){
         if [ "$lk" -gt 0 ]; then out+="    Links  : ${C_G}${lk} up${C_N}\n"
         elif [ "$lk" -eq 0 ]; then out+="    Links  : ${C_R}0 up — not connected to the other server${C_N}\n"; fi
       fi
-      out+="  ${C_D}──────────────────────────────────────────────${C_N}\n"
+      out+="$(ui_rule)\n"
       out+="    ${C_B}Speed now${C_N}    ↓ download $(hr_rate "$rdown")   ↑ upload $(hr_rate "$rup")\n"
       out+="    ${C_D}Peak here${C_N}    ↓ $(hr_rate "$mdown")   ↑ $(hr_rate "$mup")\n"
       out+="    ${C_D}↓ history${C_N}    $(printf '%s' "${hist[@]}")\n"
@@ -1641,10 +1974,27 @@ stats_page(){
       if [ -n "${L[life_up]:-}" ]; then
         out+="    ${C_B}Lifetime${C_N}     ↓ $(hb "${L[life_down]:-}")   ↑ $(hb "${L[life_up]:-}")   ${C_D}(survives restarts)${C_N}\n"
       fi
-      if [ "${L[src]:-}" != dev ]; then
-        out+="    Users now    $(( ${L[active_tcp]:-0} + ${L[active_udp]:-0} ))  (tcp ${L[active_tcp]:-0}, udp ${L[active_udp]:-0})   peak ${L[peak]:-0} · total ${L[conns]:-0}\n"
+      # Users and connections: the core's own counts, or for a kernel or
+      # packet tunnel conntrack's (see users_of); then link health and the
+      # connections open on each port.
+      LV=(); local k2; for k2 in "${!L[@]}"; do LV[$k2]="${L[$k2]}"; done
+      local u c t d; read -r u c t d < <(users_of)
+      out+="$(ui_rule)\n"
+      local who=""; [ "${L[role]:-}" = server ] && who="users ${C_W}$(num "$u")${C_N}   "
+      out+="    ${C_B}Now${C_N}          ${who}connections ${C_W}$(num "$c")${C_N}  ${C_D}tcp $(num "$t") · udp $(num "$d")${C_N}\n"
+      if [ "${LV[ct]:-}" = ok ]; then
+        out+="    ${C_D}             counted from conntrack (the kernel carries this tunnel)${C_N}\n"
       else
-        out+="    ${C_D}Kernel/packet tunnel: speeds are the tunnel device's own counters.${C_N}\n"
+        out+="    ${C_D}Since start${C_N}  peak $(num "${L[peak]:-0}") at once · $(num "${L[conns]:-0}") opened\n"
+      fi
+      if [ -n "${L[rtt_avg]:-}" ]; then
+        out+="    ${C_B}Ping${C_N}         $(rtt_col "${L[rtt_avg]}") avg  ${C_D}min ${L[rtt_min]} · max ${L[rtt_max]} ms over the links${C_N}"
+        [ "${L[links_backoff]:-0}" -gt 0 ] && out+="  ${C_Y}${L[links_backoff]} retransmitting${C_N}"
+        out+="\n"
+      fi
+      local pls; pls="$(port_lines)"
+      if [ -n "$pls" ]; then
+        out+="    ${C_B}By port${C_N}\n$(printf '%s' "$pls" | sed 's/^  //')\n"
       fi
     fi
     # Redraw over the previous frame instead of clearing: no flashing. Only
@@ -1768,9 +2118,11 @@ speed_test(){
   done
 }
 
-okln(){   echo -e "  ${C_G}✔${C_N} $*"; }
-warnln(){ echo -e "  ${C_Y}▲${C_N} $*"; }
-badln(){  echo -e "  ${C_R}✗${C_N} $*"; }
+# The Health check's lines, counted for its summary.
+DOC_OK=0; DOC_WARN=0; DOC_BAD=0
+okln(){   DOC_OK=$((DOC_OK+1));     echo -e "    ${C_G}✔${C_N} $*"; }
+warnln(){ DOC_WARN=$((DOC_WARN+1)); echo -e "    ${C_Y}▲${C_N} $*"; }
+badln(){  DOC_BAD=$((DOC_BAD+1));   echo -e "    ${C_R}✗${C_N} $*"; }
 
 # doctor_dial REMOTE TRANSPORT — for the end that dials: can the other end be
 # reached, and how good is the path (loss, RTT, jitter)? Adds to the caller's
@@ -1830,8 +2182,10 @@ doctor_dial(){
 # (BBR, ports, UDP reachability, public IP, packet loss, MTU, services).
 doctor(){
   banner
-  echo -e "${C_B}  BrokenNode Doctor${C_N}   ${C_D}(read-only checks)${C_N}"
-  echo -e "  ${C_D}──────────────────────────────────────────────${C_N}"
+  ui_crumb "Health check"
+  echo
+  DOC_OK=0; DOC_WARN=0; DOC_BAD=0
+  ui_section "THIS SERVER"
   local warns=0
 
   # Congestion control (BBR)
@@ -1855,6 +2209,21 @@ doctor(){
   local fd; fd="$(ulimit -n)"
   okln "Open-file limit (ulimit -n): $fd"
 
+  # The core each running tunnel actually runs. The version on disk is not
+  # it: a tunnel not restarted since an update runs the old core, and the
+  # other server then reports that old release.
+  local have rpid rv runit nrun=0; have="$(core_version "$BIN" 2>/dev/null)"
+  while read -r rpid rv runit; do
+    [ -n "$rpid" ] || continue
+    nrun=$((nrun+1))
+    if [ "$runit" = - ]; then
+      warnln "Core v$rv running outside any tunnel unit (pid $rpid) — an old copy started by hand? stop it: kill $rpid"; warns=$((warns+1))
+    elif [ -n "$have" ] && [ "$rv" != "$have" ]; then
+      warnln "${runit%.service} runs core v$rv, installed is v$have — restart it (menu → Manage → Restart)"; warns=$((warns+1))
+    fi
+  done < <(running_cores)
+  [ "$nrun" -gt 0 ] && okln "Running cores: $nrun (installed core v${have:-?})"
+
   # Leftover ICMP-echo suppression. An icmp tunnel turns the kernel's ping
   # responder off while it runs; a release before 2.3.13 (or a hard kill) could
   # leave it off for good, so the server answers no pings even after the tunnel
@@ -1876,7 +2245,8 @@ doctor(){
     fi
   fi
 
-  echo -e "  ${C_D}── per-tunnel ─────────────────────────────────${C_N}"
+  echo
+  ui_section "TUNNELS"
   shopt -s nullglob
   local found=0
   for cf in "$CFG_DIR"/*.json; do
@@ -1887,10 +2257,29 @@ doctor(){
     trans="$(sed -n 's/.*"transport"[ ]*:[ ]*"\([^"]*\)".*/\1/p' "$cf")"
     bind="$(sed -n 's/.*"bind_addr"[ ]*:[ ]*"\([^"]*\)".*/\1/p' "$cf")"
     remote="$(sed -n 's/.*"remote_addr"[ ]*:[ ]*"\([^"]*\)".*/\1/p' "$cf")"
-    echo -e "  ${C_B}• $n${C_N} ${C_D}($mode/$trans)${C_N}"
-    # service state
+    echo -e "    ${C_W}${C_BOLD}$n${C_N}  ${C_D}$mode · $trans$( [ "$mode" = server ] && echo " · Iran relay" || echo " · foreign end")${C_N}"
+    # service state, then what the running core says about it
     local st; st="$(systemctl is-active "brokennode@$n" 2>/dev/null)"
-    [ "$st" = active ] && okln "  service: active" || { badln "  service: $st"; warns=$((warns+1)); }
+    if [ "$st" != active ] && ! systemctl is-enabled "brokennode@$n" >/dev/null 2>&1; then
+      # Stopped from the menu (Stop disables): wanted down, nothing to check.
+      echo -e "    ${C_D}○   stopped on purpose — 3 → $n → 1 Start to run it${C_N}"
+      continue
+    fi
+    if [ "$st" = active ]; then okln "  service: active"; else badln "  service: $st (it should run: 4 Live logs says why)"; warns=$((warns+1)); fi
+    if [ "$st" = active ] && live_load "$n"; then
+      local lu lc lt ld; read -r lu lc lt ld < <(users_of)
+      local ll="${LV[links]:--1}" lline=""
+      if [ "$ll" = 0 ]; then badln "  no link to the other server for $(hdur $(( $(date +%s) - $(lvn link_since) )))"; warns=$((warns+1))
+      elif [ "$ll" != -1 ]; then lline="$ll link(s) up"; fi
+      [ -n "${LV[rtt_avg]:-}" ] && lline+="${lline:+ · }ping ${LV[rtt_avg]} ms"
+      [ "$mode" = server ] && lline+="${lline:+ · }$(num "$lu") users"
+      lline+="${lline:+ · }$(num "$lc") connections (tcp $(num "$lt"), udp $(num "$ld"))"
+      [ "$ll" = 0 ] || okln "  now: $lline"
+      local lbo; lbo=$(lvn links_backoff)
+      [ "$lbo" -gt 0 ] && { warnln "  $lbo link(s) retransmitting — the path is losing packets now"; warns=$((warns+1)); }
+      local lpf; lpf=$(lvn ports_failed)
+      [ "$lpf" -gt 0 ] && { badln "  $lpf port(s) NOT served — another program holds them? → 18) Diagnose"; warns=$((warns+1)); }
+    fi
 
     # Point-to-point tunnels (gre, ipip, udp, icmp ...) have no bind/remote
     # address to check. What decides whether they work is whether the two real
@@ -1968,7 +2357,12 @@ doctor(){
     elif tunnel_listens "$cf"; then
       local port; port="${bind##*:}"
       if [ -n "$port" ]; then
-        ss -ltnup 2>/dev/null | grep -q ":$port " && okln "  listening on port $port" || { warnln "  port $port not listening"; warns=$((warns+1)); }
+        # Read first, then search: with pipefail, "ss | grep -q" failed on a
+        # busy server (grep leaves at the match, ss dies of SIGPIPE) and a
+        # listening port was reported as not listening.
+        local lst; lst="$(ss -ltnup 2>/dev/null)"
+        if grep -q ":$port " <<<"$lst"; then okln "  listening on port $port"
+        else warnln "  port $port not listening"; warns=$((warns+1)); fi
       fi
     else
       doctor_dial "$remote" "$trans"
@@ -2007,12 +2401,14 @@ doctor(){
       fi
     fi
   done
-  [ "$found" = 0 ] && echo "  (no tunnels configured yet)"
-  echo -e "  ${C_D}──────────────────────────────────────────────${C_N}"
-  if [ "$warns" -eq 0 ]; then echo -e "  ${C_G}All checks passed.${C_N}"
-  else echo -e "  ${C_Y}$warns warning(s) above.${C_N}"; fi
-  echo -e "  ${C_D}Note: kcp (a UDP transport) also needs UDP open end-to-end;${C_N}"
-  echo -e "  ${C_D}test with:  nc -u <relay-ip> <port>  (both sides).${C_N}"
+  [ "$found" = 0 ] && echo -e "    ${C_D}(no tunnels configured yet)${C_N}"
+  echo
+  ui_rule
+  local badge="  \033[30;42m ${DOC_OK} OK ${C_N}"
+  [ "$DOC_WARN" -gt 0 ] && badge+=" \033[30;43m ${DOC_WARN} WARNING$([ "$DOC_WARN" -gt 1 ] && echo S) ${C_N}"
+  [ "$DOC_BAD" -gt 0 ] && badge+=" \033[30;41m ${DOC_BAD} PROBLEM$([ "$DOC_BAD" -gt 1 ] && echo S) ${C_N}"
+  echo -e "$badge    ${C_D}$([ "$warns" -eq 0 ] && echo "all checks passed" || echo "details: 3 → the tunnel → 18 Diagnose")${C_N}"
+  echo -e "  ${C_D}kcp and the other UDP transports also need UDP open end to end: nc -u <relay-ip> <port>${C_N}"
 }
 
 # ---------------------------------------------------------------------------
@@ -2857,10 +3253,11 @@ edit_config(){
 
 manage_tunnels(){
   while true; do
-    banner; list_tunnels
+    banner; ui_crumb "Manage tunnels"; list_tunnels
     if [ "${#TUNNELS[@]}" -eq 0 ]; then read -t 30 -rp "  ▶ press ENTER to continue... " _; return; fi
-    echo -e "  ${C_D}Enter a number to manage one tunnel, 'D' to delete ALL, or blank to go back.${C_N}"
-    local sel; sel=$(ask "Select tunnel number (empty=back, D=delete all)" ""); [ -z "$sel" ] && return
+    echo -e "  ${C_Y}${C_BOLD}1-${#TUNNELS[@]}${C_N} open a tunnel    ${C_Y}${C_BOLD}D${C_N} delete all    ${C_Y}${C_BOLD}Enter${C_N} back"
+    echo
+    local sel; sel=$(ask "Tunnel" ""); [ -z "$sel" ] && return
     case "$sel" in
       d|D) delete_all_tunnels; continue;;
       *[!0-9]*) err "Enter a number, or D to delete all."; sleep 1; continue;;
@@ -2869,27 +3266,22 @@ manage_tunnels(){
     local n="${TUNNELS[$((sel-1))]}"
     local ED; ED="$(command -v nano || command -v vi)"
     while true; do
-      echo; echo -e "${C_B}  Manage '$n'${C_N}  ${C_D}[$(systemctl is-active "brokennode@$n" 2>/dev/null)]${C_N}"
+      [ -f "$CFG_DIR/$n.json" ] || break
+      banner; ui_crumb "Manage tunnels" "$n"; echo
+      tunnel_card "$n"
       local pfn; pfn=$(ports_failed "$n")
       [ "$pfn" -gt 0 ] && echo -e "  ${C_R}⚠ ${pfn} port(s) of this tunnel are NOT served (another program may hold them). Run 18) Diagnose.${C_N}"
       local vnn; vnn=$(version_note "$n"); [ -n "$vnn" ] && echo -e "  $vnn"
-      echo "   1) Start    2) Stop    3) Restart"
-      echo "   4) Live logs   5) Show config   6) Edit config (nano)"
-      echo "   7) Delete   8) Live stats"
-      echo -e "   ${C_G}9) Change transport${C_N}   ${C_G}10) Change peer IP${C_N}   ${C_G}11) Tune settings (MTU/FEC/window...)${C_N}"
-      echo -e "   ${C_G}13) Change direction${C_N}  ${C_D}(reverse / direct / proxy) [$(direction_label "$CFG_DIR/$n.json")]${C_N}   ${C_G}14) Encryption & stealth${C_N}  ${C_D}(token, tls, reality, fingerprint, fragment, pad)${C_N}"
-      echo -e "   ${C_G}15) Speed test${C_N}  ${C_D}(download/upload/ping through this tunnel)${C_N}"
-      echo -e "   ${C_G}16) Apply preset${C_N}  ${C_D}(Optimized/High-Speed/Stable/Low-Latency/Eco)${C_N}   ${C_G}17) Port-forwards${C_N}  ${C_D}(add / remove / replace)${C_N}"
-      echo -e "   ${C_G}18) Diagnose${C_N}  ${C_D}(connected but users get nothing? checks every port end to end, firewall, NAT rules)${C_N}"
-      echo -e "   ${C_G}19) Share code${C_N}  ${C_D}(one line to paste on the other server: it sets up its end of this tunnel)${C_N}"
-      echo "   0) Back"
+      tunnel_menu "$n"
+      # What the last choice did: the page is redrawn after it.
+      [ -n "${UI_NOTE:-}" ] && echo -e "  ${C_G}✔${C_N} $UI_NOTE"; UI_NOTE=""
       case "$(menu_ask 'Choice')" in
-        1) systemctl enable --now "brokennode@$n" >/dev/null 2>&1; systemctl start "brokennode@$n"; info "started";;
-        2) systemctl disable --now "brokennode@$n" >/dev/null 2>&1; info "stopped — stays down until you start it (the health check leaves it alone)";;
-        3) systemctl enable "brokennode@$n" >/dev/null 2>&1; systemctl restart "brokennode@$n"; info "restarted";;
+        1) systemctl enable --now "brokennode@$n" >/dev/null 2>&1; systemctl start "brokennode@$n"; UI_NOTE="started"; sleep 1;;
+        2) systemctl disable --now "brokennode@$n" >/dev/null 2>&1; UI_NOTE="stopped — stays down until you start it (the health check leaves it alone)";;
+        3) systemctl enable "brokennode@$n" >/dev/null 2>&1; systemctl restart "brokennode@$n"; UI_NOTE="restarted"; sleep 1;;
         4) live_logs "$n";;
         5) echo; cat "$CFG_DIR/$n.json"; echo; read -t 30 -rp "  ▶ press ENTER to continue... " _;;
-        6) edit_config "$n" "${EDITOR:-$ED}";;
+        6) edit_config "$n" "${EDITOR:-$ED}"; ui_pause;;
         7) local c; c=$(ask "Delete '$n' permanently? yes/no" "no")
            if [ "$c" = yes ]; then
              systemctl disable --now "brokennode@$n" >/dev/null 2>&1
@@ -2900,20 +3292,20 @@ manage_tunnels(){
              info "deleted '$n'"; break
            fi;;
         8) stats_page "$n";;
-        9) change_transport "$n";;
-        10) change_relay_ip "$n";;
-        11) tune_tunnel "$n";;
-        12) warn "Duplicate UDP packets was removed with quic in 2.3.22 (only quic could carry it).";;
-        13) change_direction "$n";;
-        14) edit_security "$n";;
+        9) change_transport "$n"; ui_pause;;
+        10) change_relay_ip "$n"; ui_pause;;
+        11) tune_tunnel "$n"; ui_pause;;
+        12) warn "Duplicate UDP packets was removed with quic in 2.3.22 (only quic could carry it)."; ui_pause;;
+        13) change_direction "$n"; ui_pause;;
+        14) edit_security "$n"; ui_pause;;
         15) speed_test "$n"; read -t 120 -rp "  ▶ press ENTER to continue... " _;;
-        16) apply_preset "$n";;
-        17) manage_ports "$n";;
-        18) diagnose "$n";;
+        16) apply_preset "$n"; ui_pause;;
+        17) manage_ports "$n"; ui_pause;;
+        18) diagnose "$n"; ui_pause;;
         19) SHARE_PUB=""; show_pair_code "$n" 1; read -rp "  ▶ press ENTER to continue... " _;;
         __eof__) return;;
         0) break;;
-        *) warn "Invalid.";;
+        *) UI_NOTE="${C_Y}not an option — pick a number shown above${C_N}";;
       esac
     done
   done
@@ -3461,7 +3853,7 @@ PYEOF
 }
 
 # has_local_addr ADDR — an interface of this machine holds ADDR.
-has_local_addr(){ ip -o addr show 2>/dev/null | awk '{print $4}' | sed 's#/.*##' | grep -qxF "$1"; }
+has_local_addr(){ local a; a="$(ip -o addr show 2>/dev/null | awk '{print $4}' | sed 's#/.*##')"; grep -qxF "$1" <<<"$a"; }
 
 # share_pubip ASK — this server's public IP, the one the other server dials.
 # Detected; asked (the detected one offered) when ASK is 1 or when detection
@@ -3866,12 +4258,15 @@ pick_tunnel(){
 
 share_menu(){
   while true; do
+    banner; ui_crumb "Share codes"
+    echo -e "  ${C_D}One line to paste into the other server's terminal.${C_N}"
     echo
-    echo -e "${C_B}  Share codes${C_N}  ${C_D}(one line to paste into another server's terminal)${C_N}"
-    echo "   1) Code for the OTHER end of a tunnel   (pasted there, it sets up that server's side)"
-    echo "   2) Backup code of ALL tunnels here      (pasted on a new server when this one's IP is filtered)"
-    echo "   3) Paste a code                         (a share or backup code from another server)"
-    echo "   0) Back"
+    ui_item 1 "Code for the other end" "pasted there, it sets up that server's side of a tunnel"
+    ui_item 2 "Backup of all tunnels" "pasted on a new server when this one's IP is filtered"
+    ui_item 3 "Paste a code" "a share or backup code from another server"
+    echo
+    ui_item 0 "Back"
+    echo
     case "$(menu_ask 'Choice')" in
       1) SHARE_PUB=""; pick_tunnel && show_pair_code "$PICKED" 1; read -rp "  ▶ press ENTER to continue... " _ ;;
       2) show_backup_code; read -rp "  ▶ press ENTER to continue... " _ ;;
@@ -3982,7 +4377,49 @@ health_check(){
   /usr/local/bin/brokennode cleanup >/dev/null 2>&1 || true
 }
 
-# restart_all_tunnels: refresh the unit and restart every configured instance.
+# running_cores — one line per core process running on this server:
+# "PID VERSION UNIT", UNIT "-" for one no tunnel unit started. VERSION is that
+# of the program the process actually runs (/proc/PID/exe, which still points
+# at the old core after the file was replaced), not of the file on disk: the
+# menu showed the installed core's version while a tunnel went on running the
+# old one, and the other server's log named a release nobody had installed.
+running_cores(){
+  local p exe v unit
+  for p in /proc/[0-9]*; do
+    exe="$(readlink "$p/exe" 2>/dev/null)" || continue
+    case "${exe##*/}" in brokennode|brokennode\ *|brokennode.new*|brokennode-linux-*) ;; *) continue ;; esac
+    v="$("$p/exe" version 2>/dev/null | sed -n 's/.* v\{0,1\}\([0-9][0-9.]*\)$/\1/p' | head -n 1)"
+    unit="$(grep -o 'brokennode@[^/]*\.service' "$p/cgroup" 2>/dev/null | head -n 1)"
+    echo "${p#/proc/} ${v:-?} ${unit:--}"
+  done
+}
+
+# restart_stale_cores — restart each tunnel whose process runs another core
+# than the one installed (an update interrupted between installing the core
+# and restarting the tunnels left them on the old one for good: the next run
+# found the core already installed and restarted nothing), and name core
+# processes no tunnel unit started (an old copy started by hand, from another
+# folder), which keep connecting to the other server with the old release.
+restart_stale_cores(){
+  [ -x "$BIN" ] || return 0
+  local have pid v unit; have="$(core_version "$BIN")"
+  [ -n "$have" ] || return 0
+  while read -r pid v unit; do
+    [ -n "$pid" ] && [ "$v" != "$have" ] || continue
+    if [ "$unit" != - ]; then
+      warn "${unit%.service} still runs core v$v (installed: v$have) — restarting it onto v$have"
+      systemctl restart "$unit"
+    else
+      warn "A core v$v not started by any tunnel is running (pid $pid: $(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)) — it is not managed here; stop it with: kill $pid"
+    fi
+  done < <(running_cores)
+}
+
+# restart_all_tunnels: refresh the unit and restart every tunnel that is meant
+# to run, onto the new core. Enabled means "wanted running" (the menu's Stop and
+# stop-all disable): a tunnel stopped on purpose stays stopped through an update
+# — it used to be enabled and started again by every update — and gets the new
+# core when it is next started.
 restart_all_tunnels(){
   write_template
   install_health
@@ -3991,7 +4428,11 @@ restart_all_tunnels(){
   for f in "$CFG_DIR"/*.json; do
     [ -e "$f" ] || continue
     any=1; n="$(basename "$f" .json)"
-    systemctl enable "brokennode@$n" >/dev/null 2>&1
+    if ! systemctl is-enabled "brokennode@$n" >/dev/null 2>&1 &&
+       [ "$(systemctl is-active "brokennode@$n" 2>/dev/null)" != active ]; then
+      info "brokennode@$n is stopped — left stopped (it starts on the new core)"
+      continue
+    fi
     systemctl restart "brokennode@$n"
     local st; st="$(systemctl is-active "brokennode@$n" 2>/dev/null)"
     [ "$st" = active ] && info "restarted brokennode@$n (${C_G}active${C_N})" || err "brokennode@$n -> $st"
@@ -4051,8 +4492,11 @@ auto_apply_bundled(){
     info "Core: $("$BIN" version)"
     restart_all_tunnels
     info "Auto-update done — configs untouched."
+    restart_stale_cores
     read -t 15 -rp "  ▶ Press ENTER to continue (auto-continuing in 15s)... " _ 2>/dev/null || true
+    return 0
   fi
+  restart_stale_cores
 }
 
 # update_self downloads the latest release into THIS folder — the one the
@@ -4072,11 +4516,18 @@ update_self(){
   # (`ssh host BrokenNode update`, a script, cron) the installer opened none:
   # it downloaded the release, said "Installed", and the old core went on
   # running. Hand it "apply" then, which installs the core without the menu.
+  # Run, not exec: the downloaded installer is deleted afterwards (exec left one
+  # file in /tmp per update). The installer execs the new menu itself.
+  local rc
   if [ -t 0 ]; then
-    BROKENNODE_DIR="$(basename "$SRC_DIR")" exec bash "$tmp"
+    BROKENNODE_DIR="$(basename "$SRC_DIR")" bash "$tmp"; rc=$?
   else
-    BROKENNODE_DIR="$(basename "$SRC_DIR")" exec bash "$tmp" apply
+    BROKENNODE_DIR="$(basename "$SRC_DIR")" bash "$tmp" apply; rc=$?
   fi
+  rm -f "$tmp"
+  # A failed update (download, checksum) changed nothing: back to this menu.
+  [ "$rc" = 0 ] || { err "The update did not complete — nothing was changed."; return; }
+  exit 0
 }
 
 # uninstall_all: remove EVERYTHING — tunnels, core, configs, units.
@@ -4417,15 +4868,23 @@ main_menu(){
   [ -f "$HEALTH_SVC" ] && ! grep -q "$HEALTH_SH" "$HEALTH_SVC" 2>/dev/null && install_health
   while true; do
     banner
+    dashboard
+    local nt=0 f; for f in "$CFG_DIR"/*.json; do [ -e "$f" ] && nt=$((nt+1)); done
     echo
-    echo "   1) Create SERVER tunnel   (Iran relay)"
-    echo "   2) Create CLIENT tunnel   (foreign server)"
-    echo "   3) Manage tunnels         (edit / transport / IP / logs / stats)"
-    echo "   4) Health check           (doctor: BBR / ports / loss / IP)"
-    echo "   5) Update BrokenNode      (download the latest into this folder)"
-    echo "   6) Share codes            (set up the other server, or move every tunnel, with one paste)"
-    echo "   0) Exit"
-    echo -e "  ${C_D}(the core in this folder is applied automatically on start)${C_N}"
+    ui_section TUNNELS
+    ui_item 1 "Create server tunnel" "this server is the Iran relay"
+    ui_item 2 "Create client tunnel" "this server is the foreign end"
+    ui_item 3 "Manage tunnels" "$nt tunnel(s) · status, users, edit, logs, stats"
+    echo
+    ui_section TOOLS
+    ui_item 4 "Health check" "BBR, ports, path MTU, versions, running cores"
+    ui_item 6 "Share codes" "set up the other server, or move every tunnel, with one paste"
+    echo
+    ui_section SYSTEM
+    ui_item 5 "Update BrokenNode" "download the latest into this folder"
+    ui_item 0 "Exit"
+    echo
+    down_alerts
     echo
     case "$(menu_ask 'Choice')" in
       1) create_tunnel server; read -t 30 -rp "  ▶ press ENTER to continue... " _ ;;
