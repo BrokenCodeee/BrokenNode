@@ -3,6 +3,34 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.28
+
+### Changed
+- **Speed test (15) is thorough, asks nothing, and measures the path too.**
+  1. The path between the two servers, outside the tunnel: ping and loss,
+     and its raw speed (download and upload, one connection and eight),
+     over the servers' own link (TCP 9443).
+  2. The tunnel, with its own transport only: ping, spread and jitter, one
+     user's speed (one connection) and all users' (eight), each direction.
+  Every second's speed is kept, so the result says how steady it was, and
+  whether a swing (900, then 500) comes from the path itself — the route
+  between the servers — or from the tunnel. The table puts the path and the
+  tunnel side by side, with the share of the path the tunnel delivers. The
+  UDP question is gone.
+- **Logs (4) holds everything about both servers:** what each end says now
+  (at the top), this server's log live, both servers' logs live in time
+  order, their history, problems only, and the diagnosis from both ends.
+  The separate "Both servers" section (20–23) is gone.
+- **Live stats (8) shows the charts and the exact numbers together**:
+  charts above (the traffic now, the last 24 hours, CPU — as many as the
+  window holds), the numbers below. `c` switches to charts only, numbers
+  only, and back.
+
+### Fixed
+- The speed test's summary showed the UDP figures as the TCP result, with
+  an empty ping, when the UDP test had run, and so a negative "the tunnel
+  adds -76ms" and a wrong line in the history.
+
 ## 2.8.27
 
 ### Changed

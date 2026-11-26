@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.27"
+VERSION="2.8.28"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -1866,7 +1866,7 @@ tunnel_menu(){
   IFS=$'\t' read -r mode tr enc dir how peer ports np socks car < <(cfg_info "$f")
   echo
   ui_two "$(ui_section RUN)" "$(ui_section 'WATCH & TEST')"
-  ui_two "  $(ui_item2 1 Start)"   "$(ui_item2 4 'Live logs')"
+  ui_two "  $(ui_item2 1 Start)"   "$(ui_item2 4 'Logs' 'both servers · diagnose')"
   ui_two "  $(ui_item2 2 Stop)"    "$(ui_item2 8 'Live stats' 'charts: traffic, CPU, RAM, net')"
   ui_two "  $(ui_item2 3 Restart)" "$(ui_item2 15 'Speed test')"
   ui_two "  $(ui_item2 7 "${C_R}Delete${C_N}")" "$(ui_item2 18 Diagnose 'users get nothing?')"
@@ -1879,11 +1879,6 @@ tunnel_menu(){
   echo "  $(ui_item2 14 Encryption "$enc")"
   echo "  $(ui_item2 16 Preset 'Optimized · High-Speed · Stable · Low-Latency · Eco')"
   echo "  $(ui_item2 17 Port-forwards "$np port(s)")"
-  echo
-  local lk="${C_R}not linked${C_N}"; sync_running && lk="${C_G}linked by the tunnel's token${C_N}"
-  ui_section "BOTH SERVERS  ${C_D}(${C_N}$lk${C_D})${C_N}"
-  ui_two "  $(ui_item2 20 'Logs of both servers')" "$(ui_item2 22 'Diagnose from both ends')"
-  ui_two "  $(ui_item2 21 'Both ends now')" "$(ui_item2 23 'Recovery history')"
   echo
   echo -e "  ${C_Y}${C_BOLD}0${C_N} back"
 }
@@ -2261,6 +2256,13 @@ ls_charts(){
   local -a L=(dl ul h_dl h_ul conn "$T" scpu pcpu ram "$S")
   [ -n "${LSC[ifc]:-}" ] && L+=(nrx ntx)
   [ -n "${LSC[k_rd]:-}" ] && L+=(drd dwr)
+  # Beside the numbers (3rd argument "compact"): the traffic now, the last
+  # 24 hours and the CPU, as many of them as the room above the numbers holds.
+  if [ "${3:-}" = compact ]; then
+    L=(dl ul h_dl h_ul scpu pcpu)
+    [ "$room" -lt 22 ] && L=(dl ul scpu pcpu)
+    [ "$room" -lt 12 ] && L=(dl ul)
+  fi
   local e two=0 pw; if [ "$cols" -ge 100 ]; then two=1; pw=$(( (cols - 7) / 2 )); else pw=$(( cols - 5 )); fi
   [ "$pw" -gt 90 ] && pw=90
   local bw=$(( pw - 9 )); [ "$bw" -lt 4 ] && bw=4
@@ -2297,10 +2299,10 @@ ls_charts(){
 # stats_page NAME — redrawn in place every second. "c" switches between the
 # charts and the exact numbers; any other key or Ctrl+C = back.
 stats_page(){
-  local n="$1" leave=0 key view=charts
+  local n="$1" leave=0 key view=both
   trap 'leave=1' INT
   local hdr
-  hdr="$(banner; ui_crumb "Manage tunnels" "$n" "Live stats"; echo -e "  ${C_D}redrawn every second · exact counts · ${C_N}${C_Y}c${C_N}${C_D} = charts ⇄ numbers · any other key or Ctrl+C = back${C_N}")"
+  hdr="$(banner; ui_crumb "Manage tunnels" "$n" "Live stats"; echo -e "  ${C_D}redrawn every second · exact counts · ${C_N}${C_Y}c${C_N}${C_D} = charts + numbers → charts → numbers · any other key or Ctrl+C = back${C_N}")"
   clear 2>/dev/null || true
   printf '%s\n' "$hdr"
   local top; top=$(printf '%s\n' "$hdr" | wc -l)
@@ -2314,7 +2316,14 @@ stats_page(){
     local rows; rows=$(tput lines 2>/dev/null || echo 60)
     local room=$(( rows - top - 1 )); [ "$room" -lt 3 ] && room=3
     local out
-    if [ "$view" = charts ]; then out="$(ls_charts "$n" "$room")"; else out="$(ls_frame "$n")"; fi
+    case "$view" in
+      charts) out="$(ls_charts "$n" "$room")" ;;
+      numbers) out="$(ls_frame "$n")" ;;
+      *) # Both: the numbers below, the charts in the room above them.
+         local fr; fr="$(ls_frame "$n" | sed '1,2d')"
+         local fl; fl=$(printf '%s\n' "$fr" | wc -l)
+         out="$(ls_charts "$n" $(( room - fl - 1 )) compact)"$'\n'"$(ui_rule)"$'\n'"$fr" ;;
+    esac
     for k in "${!LSC[@]}"; do LSP[$k]="${LSC[$k]}"; done
     tput cup "$top" 0 2>/dev/null || printf '\033[%d;1H' $(( top + 1 ))
     printf '%s\n' "$out" | head -n "$room" | sed 's/$/\x1b[K/'
@@ -2322,7 +2331,7 @@ stats_page(){
     if [ -t 0 ]; then
       if read -rsn1 -t 1 key 2>/dev/null; then
         if [ "$key" = c ] || [ "$key" = C ]; then
-          if [ "$view" = charts ]; then view=numbers; else view=charts; fi
+          case "$view" in both) view=charts ;; charts) view=numbers ;; *) view=both ;; esac
         else
           leave=1
         fi
@@ -2346,7 +2355,7 @@ speed_test(){
   local n="$1" cfg="$CFG_DIR/$1.json" histf="$CFG_DIR/.speedtests"
   local tr role; tr="$(jget "$cfg" transport)"; role="$(jget "$cfg" mode)"
   echo
-  echo -e "${C_B}  Speed test: $n  (${tr})${C_N}"
+  echo -e "${C_B}  Speed test: $n  (${tr})${C_N}  ${C_D}— the path between the servers, then the tunnel; about 1½ minutes${C_N}"
   echo -e "  ${C_D}──────────────────────────────────────────────${C_N}"
   local cv; cv="$(core_version "$BIN")"
   if [ -n "$cv" ] && version_lt "$cv" 2.3.9; then
@@ -2357,79 +2366,117 @@ speed_test(){
     warn "The tunnel is not running — start it first (option 1)."
     return
   fi
-  local p2p=0
   case "$tr" in
-    gre|gretap|ipip|sit|l2tp|udp|icmp|tcptun) p2p=1 ;;
+    gre|gretap|ipip|sit|l2tp|udp|icmp|tcptun) : ;;
     *) if [ "$role" != server ]; then
          warn "For $tr the test runs on the Iran relay (the server that forwards the users' ports)."
          echo -e "  ${C_D}Its tunnel opens the test streams and this server answers them. Open this menu there.${C_N}"
          return
        fi ;;
   esac
-  # The path itself, outside the tunnel: the floor the tunnel is measured against.
+  local secs=10 streams=8 full=-full
+  [ -n "$cv" ] && version_lt "$cv" 2.8.28 && full=""
+  local ttyf=""; [ -t 2 ] && ttyf=-tty
+
+  # 1. The path itself, outside the tunnel: what the tunnel is measured against.
+  echo -e "  ${C_B}${C_BOLD}1  THE PATH${C_N} ${C_D}(between the two servers' real addresses, outside the tunnel)${C_N}"
   local peer; peer="$(jget "$cfg" remote_ip)"
   [ -z "$peer" ] && { peer="$(jget "$cfg" remote_addr)"; peer="${peer%:*}"; peer="${peer#[}"; peer="${peer%]}"; }
   local pavg="" ploss=""
   if [ -n "$peer" ] && command -v ping >/dev/null 2>&1; then
-    echo -e "  ${C_D}Path to $peer outside the tunnel (10 pings)…${C_N}"
-    local pres; pres="$(ping -c 10 -i 0.2 -w 6 "$peer" 2>/dev/null | tail -2)"
+    local pres; pres="$(ping -c 20 -i 0.2 -w 8 "$peer" 2>/dev/null | tail -2)"
     ploss="$(printf '%s' "$pres" | sed -n 's/.*, \([0-9.]*\)% packet loss.*/\1/p')"
     pavg="$(printf '%s' "$pres" | sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p')"
-    if [ -n "$pavg" ]; then echo "  path   ping ${pavg}ms   loss ${ploss}%"
-    else echo -e "  ${C_D}  (the other server does not answer ping — fine, the test below does not need it)${C_N}"; fi
+    if [ -n "$pavg" ]; then echo "  ping   ${pavg}ms   loss ${ploss}%   (20 pings to $peer)"
+    else echo -e "  ${C_D}ping   the other server does not answer ping (the speed below does not need it)${C_N}"; fi
   fi
-  local secs streams
-  secs=$(ask "Seconds per direction (3-30)" "10"); case "$secs" in ''|*[!0-9]*) secs=10 ;; esac
-  streams=$(ask "Parallel streams (1 = one user, 8 = many users)" "4"); case "$streams" in ''|*[!0-9]*) streams=4 ;; esac
-  # The UDP test (rate and loss, like iperf3 -u) runs between the two tunnel
-  # addresses, so only point-to-point tunnels have it, from 2.8.18 on.
-  local udpf=""
-  if [ "$p2p" = 1 ] && ! { [ -n "$cv" ] && version_lt "$cv" 2.8.18; }; then
-    yes_no "Also test UDP (games, calls: rate and loss, like iperf3 -u; about 30 s more)? Y/n" y && udpf=-udp
+  local rawres="" rawout=""
+  if [ -n "$full" ] && "$BIN" sync version >/dev/null 2>&1 && systemctl is-active brokennode-sync >/dev/null 2>&1; then
+    rawout="$("$BIN" sync speed -t "$secs" -p "$streams" "$n" 2>&1 | tee >(grep --line-buffered -v '^RESULT ' | sed -u 's/^/  /' >&2))"
+    rawres="$(printf '%s\n' "$rawout" | sed -n 's/^RESULT //p' | tail -n 1)"
+    [ -z "$rawres" ] && echo -e "  ${C_D}(no path speed: $(printf '%s\n' "$rawout" | sed -n 's/^ERROR: //p' | tail -1))${C_N}"
+  else
+    echo -e "  ${C_D}(the path speed needs the link between the servers: it starts with the menu, on both servers 2.8.28+)${C_N}"
   fi
+
+  # 2. The tunnel: its transport only, exactly what the users get.
   echo
-  local out ttyf=""
-  [ -t 2 ] && ttyf=-tty
-  out="$("$BIN" speedtest -c "$cfg" -t "$secs" -p "$streams" $ttyf $udpf 2>&1 | tee /dev/stderr)"
-  local res; res="$(printf '%s\n' "$out" | sed -n 's/.*RESULT //p' | tail -n 1)"
+  echo -e "  ${C_B}${C_BOLD}2  THE TUNNEL${C_N} ${C_D}($tr: what the users get)${C_N}"
+  local out res
+  out="$("$BIN" speedtest -c "$cfg" -t "$secs" -p "$streams" $full $ttyf 2>&1 | tee >(grep --line-buffered -v '^RESULT ' | sed -u 's/^/  /' >&2))"
+  res="$(printf '%s\n' "$out" | sed -n 's/^RESULT //p' | tail -n 1)"
   if [ -z "$res" ]; then
     echo; warn "No result — see the message above."
     return
   fi
-  local tping tjit down up
-  tping="$(printf '%s' "$res" | sed -n 's/.*ping=\([0-9.]*\)ms.*/\1/p')"
-  tjit="$(printf '%s' "$res" | sed -n 's/.*jitter=\([0-9.]*\)ms.*/\1/p')"
-  down="$(printf '%s' "$res" | sed -n 's/.*down=\([0-9.]*\)Mbit.*/\1/p')"
-  up="$(printf '%s' "$res" | sed -n 's/.*up=\([0-9.]*\)Mbit.*/\1/p')"
+  kv(){ printf '%s' "$1" | tr ' ' '\n' | sed -n "s/^$2=\([0-9.]*\).*/\1/p" | head -1; }
+  local tping tjit down up d1 u1 dmin dmax umin umax tpmax
+  tping=$(kv "$res" ping); tjit=$(kv "$res" jitter); tpmax=$(kv "$res" pmax)
+  down=$(kv "$res" down); up=$(kv "$res" up); d1=$(kv "$res" down1); u1=$(kv "$res" up1)
+  dmin=$(kv "$res" dmin); dmax=$(kv "$res" dmax); umin=$(kv "$res" umin); umax=$(kv "$res" umax)
+  local rdown rup rping rdmin rdmax rumin rumax rd1 ru1
+  rdown=$(kv "$rawres" down); rup=$(kv "$rawres" up); rping=$(kv "$rawres" ping); rd1=$(kv "$rawres" down1); ru1=$(kv "$rawres" up1)
+  rdmin=$(kv "$rawres" dmin); rdmax=$(kv "$rawres" dmax); rumin=$(kv "$rawres" umin); rumax=$(kv "$rawres" umax)
+  [ -z "$rping" ] && rping="$pavg"
+
+  # 3. Side by side.
+  pct(){ awk -v a="${1:-0}" -v b="${2:-0}" 'BEGIN{ if(b>0) printf " (%d%%)", a*100/b }'; }
   echo
-  echo -e "  ${C_B}Result${C_N}  ↓ ${C_G}${down} Mbit/s${C_N}   ↑ ${C_G}${up} Mbit/s${C_N}   ping ${tping}ms   jitter ${tjit}ms  ${C_D}(TCP, $streams streams)${C_N}"
-  local ures; ures="$(printf '%s\n' "$out" | sed -n 's/.*UDPRESULT //p' | tail -n 1)"
-  if [ -n "$ures" ]; then
-    local ud udl uu uul
-    ud="$(printf '%s' "$ures" | sed -n 's/.*down=\([0-9.]*\)Mbit.*/\1/p')"; udl="$(printf '%s' "$ures" | sed -n 's/.*downloss=\([0-9.]*\)%.*/\1/p')"
-    uu="$(printf '%s' "$ures" | sed -n 's/.* up=\([0-9.]*\)Mbit.*/\1/p')";  uul="$(printf '%s' "$ures" | sed -n 's/.*uploss=\([0-9.]*\)%.*/\1/p')"
-    echo -e "  ${C_B}UDP${C_N}     ↓ ${C_G}${ud} Mbit/s${C_N} (loss ${udl}%)   ↑ ${C_G}${uu} Mbit/s${C_N} (loss ${uul}%)"
+  echo -e "  ${C_B}${C_BOLD}RESULT${C_N}"
+  printf "  %-26s %16s %16s %12s\n" "" "↓ download" "↑ upload" "ping"
+  [ -n "$rdown" ] && printf "  %-26s %11s Mbit %11s Mbit %9s ms\n" "path (raw), $streams connections" "$rdown" "$rup" "${rping:--}"
+  [ -n "$rd1" ] && printf "  %-26s %11s Mbit %11s Mbit\n" "path (raw), 1 connection" "$rd1" "$ru1"
+  printf "  ${C_G}%-26s %11s Mbit %11s Mbit %9s ms${C_N}\n" "tunnel, $streams connections" "$down" "$up" "$tping"
+  [ -n "$d1" ] && printf "  %-26s %11s Mbit %11s Mbit\n" "tunnel, 1 connection" "$d1" "$u1"
+  [ -n "$rdown" ] && printf "  %-26s %16s %16s\n" "tunnel of the path" "$(pct "$down" "$rdown" | tr -d ' ()')" "$(pct "$up" "$rup" | tr -d ' ()')"
+  [ -n "$tjit" ] && echo -e "  ${C_D}jitter ${tjit} ms · ping spread up to ${tpmax:-?} ms${C_N}"
+  if [ -n "$dmin" ]; then
+    echo -e "  ${C_D}each second (slowest – fastest):${C_N}"
+    [ -n "$rdmin" ] && echo "    path    ↓ $rdmin – $rdmax Mbit   ↑ $rumin – $rumax Mbit"
+    echo "    tunnel  ↓ $dmin – $dmax Mbit   ↑ $umin – $umax Mbit"
   fi
-  # What the numbers say.
+
+  # 4. What the numbers say.
+  echo
+  swing(){ awk -v lo="${1:-0}" -v hi="${2:-0}" 'BEGIN{ if(hi<=0){print 0; exit} printf "%d", (hi-lo)*100/hi }'; }
+  local tsw rsw=""; tsw=$(swing "$dmin" "$dmax"); [ -n "$rdmin" ] && rsw=$(swing "$rdmin" "$rdmax")
+  if [ -n "$rdown" ]; then
+    local eff; eff=$(awk -v a="$down" -v b="$rdown" 'BEGIN{ if(b>0) printf "%d", a*100/b; else print 0 }')
+    if [ "$eff" -ge 85 ]; then okln "The tunnel gives ${eff}% of the path's download: it costs next to nothing."
+    elif [ "$eff" -ge 60 ]; then warnln "The tunnel gives ${eff}% of the path's download: some is lost in the tunnel."
+    else warnln "The tunnel gives only ${eff}% of the path's download: the tunnel is the bottleneck — try another transport (9) and compare below."; fi
+  fi
+  if [ -n "$dmin" ] && [ "$tsw" -ge 35 ]; then
+    if [ -n "$rsw" ] && [ "$rsw" -ge 35 ]; then
+      warnln "The speed swings (the slowest second is ${tsw}% under the fastest), and so does the path outside the tunnel (${rsw}%): the route between the servers is busy or shaped — not the tunnel."
+    elif [ -n "$rsw" ]; then
+      warnln "The tunnel's speed swings by ${tsw}% while the path is steady (${rsw}%): the tunnel itself — check the server's CPU in Live stats (8), or try mtcp or tcpnomux."
+    else
+      warnln "The speed swings: the slowest second is ${tsw}% under the fastest."
+    fi
+  elif [ -n "$dmin" ]; then okln "Steady: the slowest second is within ${tsw}% of the fastest."
+  fi
+  if [ -n "$d1" ] && awk -v a="$d1" -v b="$down" 'BEGIN{exit !(b>0 && a*3 < b)}'; then
+    warnln "One connection gets ${d1} Mbit of ${down}: a single user's download is limited by the distance (ping ${tping} ms). Many users together get the full speed."
+  fi
   if [ -n "$pavg" ]; then
-    local extra; extra=$(awk -v a="$tping" -v b="$pavg" 'BEGIN{printf "%.0f", a-b}')
-    if [ "$extra" -gt 30 ]; then warnln "The tunnel adds ${extra}ms over the bare path — the tunnel or its links are queueing. Try mtcp or tcpnomux."
-    else okln "The tunnel adds ${extra}ms over the bare path."; fi
-    if awk -v l="${ploss:-0}" 'BEGIN{exit !(l > 2)}'; then warnln "The path loses ${ploss}% of packets: kcp or udp copes with loss best."; fi
+    local extra; extra=$(awk -v a="${tping:-0}" -v b="$pavg" 'BEGIN{d=a-b; if(d<0)d=0; printf "%.0f", d}')
+    if [ "$extra" -gt 30 ]; then warnln "The tunnel adds ${extra} ms over the path — its links are queueing. Try mtcp or tcpnomux."
+    else okln "The tunnel adds ${extra} ms of ping over the path (${pavg} ms)."; fi
+    awk -v l="${ploss:-0}" 'BEGIN{exit !(l > 2)}' && warnln "The path loses ${ploss}% of packets."
   fi
-  if awk -v d="$down" 'BEGIN{exit !(d < 20)}'; then
-    warnln "Low speed: run the test again with another transport (option 9) and compare below."
-  fi
-  if awk -v j="$tjit" 'BEGIN{exit !(j > 20)}'; then warnln "High jitter: games and calls will feel it. Try the udp transport or the gaming profile."; fi
+  awk -v j="${tjit:-0}" 'BEGIN{exit !(j > 20)}' && warnln "High jitter: games and calls will feel it."
+
   local dir; dir="$(jget "$cfg" direction)"
-  printf '%s %s %s %s down=%s up=%s ping=%s jitter=%s streams=%s\n' "$(date '+%Y-%m-%d %H:%M')" "$n" "$tr" "${dir:-reverse}" \
-    "$down" "$up" "$tping" "$tjit" "$streams" >> "$histf" 2>/dev/null
+  printf '%s %s %s %s down=%s up=%s ping=%s jitter=%s streams=%s rawdown=%s rawup=%s\n' "$(date '+%Y-%m-%d %H:%M')" "$n" "$tr" "${dir:-reverse}" \
+    "$down" "$up" "$tping" "$tjit" "$streams" "${rdown:--}" "${rup:--}" >> "$histf" 2>/dev/null
   tail -n 200 "$histf" > "$histf.tmp" 2>/dev/null && mv "$histf.tmp" "$histf"
   echo
   echo -e "  ${C_B}Recent results${C_N} ${C_D}(all tunnels on this server — compare transports)${C_N}"
-  printf "  %-16s %-12s %-9s %9s %9s %8s %7s\n" "when" "tunnel" "transport" "↓ Mbit" "↑ Mbit" "ping" "jitter"
-  tail -n 8 "$histf" | while read -r d t nm tt dir dn u p j st; do
-    printf "  %-16s %-12s %-9s %9s %9s %8s %7s\n" "$d $t" "$nm" "$tt" "${dn#down=}" "${u#up=}" "${p#ping=}" "${j#jitter=}"
+  printf "  %-16s %-12s %-9s %9s %9s %8s %7s %11s\n" "when" "tunnel" "transport" "↓ Mbit" "↑ Mbit" "ping" "jitter" "path ↓/↑"
+  tail -n 8 "$histf" | while read -r d t nm tt dir dn u p j st rd ru; do
+    local pth=""; [ -n "$rd" ] && [ "${rd#rawdown=}" != - ] && pth="${rd#rawdown=}/${ru#rawup=}"
+    printf "  %-16s %-12s %-9s %9s %9s %8s %7s %11s\n" "$d $t" "$nm" "$tt" "${dn#down=}" "${u#up=}" "${p#ping=}" "${j#jitter=}" "$pth"
   done
 }
 
@@ -3604,7 +3651,7 @@ manage_tunnels(){
         1) systemctl enable --now "brokennode@$n" >/dev/null 2>&1; systemctl start "brokennode@$n"; UI_NOTE="started"; sleep 1;;
         2) systemctl disable --now "brokennode@$n" >/dev/null 2>&1; UI_NOTE="stopped — stays down until you start it (the health check leaves it alone)";;
         3) systemctl enable "brokennode@$n" >/dev/null 2>&1; systemctl restart "brokennode@$n"; UI_NOTE="restarted"; sleep 1;;
-        4) live_logs "$n";;
+        4) logs_page "$n";;
         5) echo; cat "$CFG_DIR/$n.json"; echo; read -t 30 -rp "  ▶ press ENTER to continue... " _;;
         6) edit_config "$n" "${EDITOR:-$ED}"; ui_pause;;
         7) local c; c=$(ask "Delete '$n' permanently? yes/no" "no")
@@ -3627,13 +3674,6 @@ manage_tunnels(){
         16) apply_preset "$n"; ui_pause;;
         17) manage_ports "$n"; ui_pause;;
         18) diagnose "$n"; ui_pause;;
-        20) need_link && both_logs "$n" || ui_pause;;
-        21) if need_link; then { "$BIN" sync health -tunnel "$n"; echo; "$BIN" sync traffic -tunnel "$n"; } | sync_log_colors | sync_pager; fi; ui_pause;;
-        22) if need_link; then echo; "$BIN" sync diagnose "$n" | sync_log_colors; fi; ui_pause;;
-        23) if need_link; then "$BIN" sync recovery -tunnel "$n"
-              local rr; rr=$(ask "Clear this tunnel's recovery limits? (y/n)" "n")
-              [ "$rr" = y ] && "$BIN" sync recovery -reset "$n"
-            fi; ui_pause;;
         19) SHARE_PUB=""; show_pair_code "$n" 1; read -rp "  ▶ press ENTER to continue... " _;;
         __eof__) return;;
         0) break;;
@@ -5320,20 +5360,37 @@ both_line(){
   fi
 }
 
-# both_logs NAME — this tunnel's events on both servers.
-both_logs(){
+# logs_page NAME — option 4: what both ends say now, and the logs — of this
+# server, or of both in time order — and the diagnosis from both ends.
+logs_page(){
   local n="$1"
   while true; do
-    banner; ui_crumb "Manage tunnels" "$n" "Logs of both servers"; echo
-    ui_item 1 "All events" "both servers, in time order"
-    ui_item 2 "Problems only" "warnings and errors"
-    ui_item 3 "Follow live" "as it happens (Ctrl+C = back)"
+    banner; ui_crumb "Manage tunnels" "$n" "Logs"; echo
+    local ol; ol="$(both_line "$n")"
+    tunnel_state "$n"
+    local u c t d; read -r u c t d < <(users_of)
+    local sp; sp="$(speed_now "$n")"
+    echo -e "  ${C_D}this end${C_N}   ${TS_TXT}   ${C_D}users $(num "$u") · connections $(num "$c")${sp:+ · $sp}${C_N}"
+    if [ -n "$ol" ]; then
+      local first=1 l
+      while IFS= read -r l; do
+        if [ "$first" = 1 ]; then echo -e "  ${C_D}other end${C_N}  $l"; first=0; else echo -e "             $l"; fi
+      done <<<"$ol"
+    fi
+    echo
+    ui_item 1 "This server, live" "this tunnel's log as it happens (Ctrl+C = back)"
+    ui_item 2 "Both servers, live" "both logs in time order, as it happens (Ctrl+C = back)"
+    ui_item 3 "Both servers, history" "every event of this tunnel on both servers"
+    ui_item 4 "Problems only" "warnings and errors on both servers"
+    ui_item 5 "Diagnose from both ends" "each end checks itself; the two are compared"
     ui_item 0 "Back"
     echo
     case "$(menu_ask 'Choice')" in
-      1) "$BIN" sync logs -tunnel "$n" -n 400 | sync_log_colors | sync_pager; ui_pause ;;
-      2) "$BIN" sync logs -tunnel "$n" -view errors -n 400 | sync_log_colors | sync_pager; ui_pause ;;
-      3) trap ':' INT; "$BIN" sync logs -tunnel "$n" -n 30 -f | sync_log_colors; trap - INT ;;
+      1) live_logs "$n" ;;
+      2) if need_link; then trap ':' INT; "$BIN" sync logs -tunnel "$n" -n 30 -f | sync_log_colors; trap - INT; else ui_pause; fi ;;
+      3) if need_link; then { "$BIN" sync health -tunnel "$n"; echo; "$BIN" sync traffic -tunnel "$n"; echo; "$BIN" sync logs -tunnel "$n" -n 400; } | sync_log_colors | sync_pager; fi; ui_pause ;;
+      4) if need_link; then "$BIN" sync logs -tunnel "$n" -view errors -n 400 | sync_log_colors | sync_pager; fi; ui_pause ;;
+      5) if need_link; then echo; "$BIN" sync diagnose "$n" | sync_log_colors; fi; ui_pause ;;
       0|__eof__) return ;;
     esac
   done

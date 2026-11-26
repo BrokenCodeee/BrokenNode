@@ -316,27 +316,29 @@ Use the same values on both servers; the Iran server's manager prints them.
 
 ## Speed test and live stats
 
-**Speed test** (Manage tunnels → a tunnel → 15) measures ping, jitter,
-download and upload *through the tunnel*, with its own transport and
-encryption, so the numbers are what your users get. It first pings the other
-server outside the tunnel, so you see what the tunnel adds, and it keeps every
-result: the table at the end lists the last runs of all tunnels side by side,
-which is how you compare transports on your own path. Stream transports run it
-on the Iran server; `gre`, `ipip`, `l2tp`, `udp`, `icmp` and `tcptun` on either.
-Both servers need 2.3.9 or newer. On point-to-point tunnels it can also test
-**UDP** (games, calls), as `iperf3 -u` does: rising rates, the loss at each,
-and the highest rate with at most 2% loss, each way (both servers 2.8.18 or
-newer).
+**Speed test** (Manage tunnels → a tunnel → 15) asks nothing and takes about a
+minute and a half. It measures **the path** between the two servers outside the
+tunnel (ping, loss and its raw speed, over the servers' own link on TCP 9443),
+then **the tunnel** with its own transport and encryption — what your users get:
+ping and jitter, one user's speed (one connection) and all users' (eight
+connections), each way. It keeps the speed of every second, so it says how
+steady each one was and whether a swing comes from the path (the route between
+the servers) or from the tunnel, and how much of the path's speed the tunnel
+delivers. Every result is kept: the table at the end lists the last runs of all
+tunnels, which is how you compare transports on your own path. Stream
+transports run it on the Iran server; `gre`, `ipip`, `l2tp`, `udp`, `icmp` and
+`tcptun` on either. The path speed needs 2.8.28 on both servers.
 
-**Live stats** (→ 8) opens on live charts: the tunnel's download and upload,
-connections, the server's CPU, RAM, network card and disk, and the last 24
-hours of traffic, with the hardware on one line. Press `c` for the exact
-numbers; any other key goes back. Traffic totals are kept across restarts and
+**Live stats** (→ 8) shows live charts (the tunnel's download and upload, the
+last 24 hours, CPU) above the exact numbers (traffic, connections, the tunnel's
+process, the server's CPU, RAM, network card and sockets). `c` switches to
+charts only (with RAM, load, network and disk too) or numbers only; any other
+key goes back. Traffic totals are kept across restarts and
 updates, on both servers and for every transport.
 
-**Both servers** (→ 20–23 on a tunnel's page): the logs of both servers in
-time order, both ends' state, a diagnosis from both ends and the recovery
-history. Nothing to set up: the tunnel's token links its two servers. The
+**Logs** (→ 4 on a tunnel's page): what both ends say now, this server's log
+live, both servers' logs in time order (live, history, problems only) and a
+diagnosis from both ends. Nothing to set up: the tunnel's token links its two servers. The
 foreign server connects to the Iran server on **TCP 9443** — if the Iran
 server has a firewall, allow that port for the foreign server's IP.
 
