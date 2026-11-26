@@ -3,6 +3,33 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.25
+
+### Fixed
+- **mtcp: sudden disconnects.** When two foreign servers (or an old copy of
+  the core left running on one) connected to the same tunnel, every new link
+  of one made the relay close every link of the other: both saw "connection
+  reset by peer" and reconnected, for ever — measured, 14 drops in 20 seconds
+  on one end. The relay now closes another run's links only when they come
+  from the same server (a restart), keeps both servers' links otherwise, and
+  says that two foreign servers share the tunnel.
+
+### Changed
+- **Node Sync is no longer a section of the main menu.** What matters of it
+  is on every tunnel's page, under "Both servers":
+  20 logs of both servers (this tunnel, in time order, or live),
+  21 both ends now, 22 diagnose from both ends, 23 recovery history,
+  24 link the two servers (pairing, on/off, settings). The tunnel's card
+  shows what the other end says about it. Nothing changes for servers that
+  are not linked; `BrokenNode sync-join <code>` still works.
+- **Live stats (8) shows everything, exactly:** the tunnel's traffic
+  (bytes per second and Mbit/s over the exact interval the core measured, to
+  the millisecond; exact byte totals), connections, links and ping, its
+  device's bytes and packets, its process (CPU of one core and of all,
+  memory, threads, open files and sockets), and the server (CPU by kind,
+  load, RAM, the network card's bytes, packets, drops and errors, sockets,
+  conntrack).
+
 ## 2.8.24
 
 ### New

@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.24"
+VERSION="2.8.25"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -1836,6 +1836,13 @@ tunnel_card(){
     echo -e "  $bar $(ui_pad '' 10)↑ $(hbs "$(lvn life_up)")  ↓ $(hbs "$(lvn life_down)") ${C_D}all time${C_N}"
   fi
   echo -e "  $bar $(ui_pad running 10)$(hdur $(( now - $(lvn started) )))   ${C_D}core ${LV[version]:-?} · pid ${LV[pid]:-?}${C_N}"
+  local ol; ol="$(both_line "$n")"
+  if [ -n "$ol" ]; then
+    local first=1 l
+    while IFS= read -r l; do
+      if [ "$first" = 1 ]; then echo -e "  $bar $(ui_pad 'other end' 10)$l"; first=0; else echo -e "  $bar $(ui_pad '' 10)$l"; fi
+    done <<<"$ol"
+  fi
   echo -e "  ${C_D}└$(printf '%*s' 70 '' | sed 's/ /─/g')${C_N}"
   local pls; pls="$(port_lines)"
   if [ -n "$pls" ]; then
@@ -1854,7 +1861,7 @@ tunnel_menu(){
   echo
   ui_two "$(ui_section RUN)" "$(ui_section 'WATCH & TEST')"
   ui_two "  $(ui_item2 1 Start)"   "$(ui_item2 4 'Live logs')"
-  ui_two "  $(ui_item2 2 Stop)"    "$(ui_item2 8 'Live stats' 'speed, users, ports')"
+  ui_two "  $(ui_item2 2 Stop)"    "$(ui_item2 8 'Live stats' 'exact: traffic, CPU, RAM')"
   ui_two "  $(ui_item2 3 Restart)" "$(ui_item2 15 'Speed test')"
   ui_two "  $(ui_item2 7 "${C_R}Delete${C_N}")" "$(ui_item2 18 Diagnose 'users get nothing?')"
   echo
@@ -1866,6 +1873,12 @@ tunnel_menu(){
   echo "  $(ui_item2 14 Encryption "$enc")"
   echo "  $(ui_item2 16 Preset 'Optimized · High-Speed · Stable · Low-Latency · Eco')"
   echo "  $(ui_item2 17 Port-forwards "$np port(s)")"
+  echo
+  local lk="not linked"; sync_ready && sync_running && lk="linked"
+  ui_section "BOTH SERVERS  ${C_D}($lk)${C_N}"
+  ui_two "  $(ui_item2 20 'Logs of both servers')" "$(ui_item2 23 'Recovery history')"
+  ui_two "  $(ui_item2 21 'Both ends now')" "$(ui_item2 24 'Link the two servers')"
+  echo "  $(ui_item2 22 'Diagnose from both ends')"
   echo
   echo -e "  ${C_Y}${C_BOLD}0${C_N} back"
 }
@@ -1901,140 +1914,198 @@ hr_rate(){
     if(u=="bit/s")printf "%d %s",x,u; else printf "%.1f %s",x,u }'
 }
 
-# stats_page: live traffic for one tunnel, redrawn IN PLACE once a second.
-#
-# It used to clear the screen and redraw every 2 seconds from the 30-second
-# lifetime file, which only the Iran relay writes: on the foreign server, and
-# for gre/ipip/l2tp/udp/icmp whose traffic never passes a user socket, that file
-# never existed, so the page flashed "No stats yet" for ever. The core (2.3.9+)
-# now writes /run/brokennode/<name>.live every second on BOTH ends for EVERY
-# transport; this page turns two samples into a speed. Any key or Ctrl+C
-# returns to the menu.
+# ---------------------------------------------------------------------------
+#  Live stats — everything one tunnel uses, live and exact: the tunnel's own
+#  traffic and connections (the core's counters), its process (CPU, memory,
+#  threads, files, sockets), its device, and the server (CPU, RAM, network
+#  card, sockets, conntrack). Rates are the bytes counted between two reads
+#  divided by the time between them, measured to the millisecond (the core
+#  stamps its counters, ts_ms) or the nanosecond (/proc, /sys): no estimate.
+#  Totals are exact byte counts, with the same in GiB/MiB beside them.
+# ---------------------------------------------------------------------------
+declare -A LSP=() LSC=()   # previous and current sample
+
+# ls_bytes N — "1,234,567,890 B (1.150 GiB)": the exact count, then readable.
+ls_bytes(){ local b="${1:-0}"; printf '%s B (%s)' "$(num "$b")" "$(awk -v b="$b" 'BEGIN{u="B";x=b+0;
+  if(x>=1024){x/=1024;u="KiB"} if(x>=1024){x/=1024;u="MiB"} if(x>=1024){x/=1024;u="GiB"} if(x>=1024){x/=1024;u="TiB"}
+  if(u=="B")printf "%d B",x; else printf "%.3f %s",x,u}')"; }
+# ls_rate DELTA_BYTES DELTA_NS — "12,345,678 B/s · 98.765 Mbit/s"
+ls_rate(){ awk -v d="${1:-0}" -v ns="${2:-0}" 'BEGIN{ if(ns<=0){print "—"; exit}
+  r=d*1e9/ns; s=sprintf("%.0f",r); n=length(s); o="";
+  for(i=1;i<=n;i++){o=o substr(s,i,1); if((n-i)%3==0 && i<n) o=o ","}
+  printf "%s B/s · %.3f Mbit/s", o, r*8/1e6 }'; }
+# ls_per DELTA DELTA_NS — a count per second ("1,234.5")
+ls_per(){ awk -v d="${1:-0}" -v ns="${2:-0}" 'BEGIN{ if(ns<=0){print "—"; exit} r=d*1e9/ns; s=sprintf("%.1f",r);
+  split(s,p,"."); n=length(p[1]); o=""; for(i=1;i<=n;i++){o=o substr(p[1],i,1); if((n-i)%3==0 && i<n) o=o ","} printf "%s.%s", o, p[2] }'; }
+# ls_pct PART WHOLE — "12.34%"
+ls_pct(){ awk -v p="${1:-0}" -v w="${2:-0}" 'BEGIN{ if(w<=0){print "—"} else printf "%.2f%%", p*100/w }'; }
+
+ls_read_net(){ # ls_read_net PREFIX DEV — its counters into LSC[PREFIX_*]
+  local k d="/sys/class/net/$2/statistics"
+  for k in rx_bytes tx_bytes rx_packets tx_packets rx_dropped tx_dropped rx_errors tx_errors; do
+    LSC[$1_$k]="$(cat "$d/$k" 2>/dev/null || echo 0)"
+  done
+}
+
+# ls_sample NAME — one reading of everything.
+ls_sample(){
+  local n="$1" k v
+  LSC=()
+  LSC[ns]="$(date +%s%N)"
+  live_load "$n" || true
+  for k in "${!LV[@]}"; do LSC["l_$k"]="${LV[$k]}"; done
+  local pid="${LV[pid]:-}"
+  if [ -n "$pid" ] && [ -r "/proc/$pid/stat" ]; then
+    local st; st="$(cat "/proc/$pid/stat" 2>/dev/null)"; st="${st##*) }"
+    read -r -a f <<<"$st"
+    LSC[p_ticks]=$(( ${f[11]:-0} + ${f[12]:-0} ))
+    while read -r k v _; do
+      case "$k" in VmRSS:) LSC[p_rss]="$v" ;; VmHWM:) LSC[p_hwm]="$v" ;; VmSize:) LSC[p_vsz]="$v" ;; Threads:) LSC[p_thr]="$v" ;; esac
+    done < "/proc/$pid/status"
+    local fd fds=0 socks=0
+    for fd in /proc/"$pid"/fd/*; do
+      fds=$((fds+1))
+      [[ "$(readlink "$fd" 2>/dev/null)" == socket:* ]] && socks=$((socks+1))
+    done
+    LSC[p_fds]=$fds; LSC[p_socks]=$socks
+  fi
+  local cu cn cs ci cw cq cx ct
+  read -r _ cu cn cs ci cw cq cx ct _ < /proc/stat
+  LSC[c_user]=$cu; LSC[c_nice]=$cn; LSC[c_sys]=$cs; LSC[c_idle]=$ci; LSC[c_iow]=$cw; LSC[c_irq]=$cq; LSC[c_sirq]=$cx; LSC[c_steal]=$ct
+  while read -r k v _; do
+    case "$k" in MemTotal:|MemAvailable:|MemFree:|Buffers:|Cached:|SwapTotal:|SwapFree:) LSC["m_${k%:}"]="$v" ;; esac
+  done < /proc/meminfo
+  local l1 l5 l15
+  read -r l1 l5 l15 _ < /proc/loadavg
+  LSC[load1]=$l1; LSC[load5]=$l5; LSC[load15]=$l15
+  local ifc; ifc="$(default_iface)"; LSC[ifc]="${ifc:-}"
+  [ -n "$ifc" ] && ls_read_net i "$ifc"
+  [ -n "${LV[dev]:-}" ] && ls_read_net d "${LV[dev]}"
+  while read -r k v; do
+    case "$k" in TCP:) set -- $v; LSC[s_tcp]="$2"; LSC[s_tw]="$6" ;; UDP:) set -- $v; LSC[s_udp]="$2" ;; esac
+  done < /proc/net/sockstat
+  LSC[ct]="$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo -)"
+  LSC[ctmax]="$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo -)"
+}
+
+# d KEY — current minus previous (0 when either is missing or it went back).
+ls_d(){ local a="${LSC[$1]:-}" b="${LSP[$1]:-}"; case "$a$b" in *[!0-9]*|'') echo 0; return ;; esac
+  [ "$a" -ge "$b" ] && echo $(( a - b )) || echo 0; }
+
+# ls_frame NAME — the page body from the last two samples.
+ls_frame(){
+  local n="$1" out="" dt_ns cdt_ns
+  dt_ns=$(( ${LSC[ns]} - ${LSP[ns]:-${LSC[ns]}} ))
+  # The core's counters: their own interval, stamped in milliseconds.
+  cdt_ns=0
+  local a="${LSC[l_ts_ms]:-}" b="${LSP[l_ts_ms]:-}"
+  case "$a$b" in ''|*[!0-9]*) : ;; *) cdt_ns=$(( (a - b) * 1000000 )) ;; esac
+  local st; st=$(systemctl is-active "brokennode@$n" 2>/dev/null); [ -z "$st" ] && st=unknown
+  local now; now=$(date +%s)
+  if [ "$st" != active ] || [ -z "${LSC[l_ts]:-}" ]; then
+    out+="    Service: ${C_R}${st}${C_N} — the tunnel is not running (or its core predates live numbers).\n"
+    printf '%b' "$out"; return
+  fi
+  local role="foreign end"; [ "${LSC[l_role]:-}" = server ] && role="Iran relay"
+  out+="    ${C_G}● running${C_N} $(hdur $(( now - ${LSC[l_started]:-$now} )))   ${role} · ${LSC[l_transport]:-} · core ${LSC[l_version]:-?} · pid ${LSC[l_pid]:-?}\n"
+  out+="$(ui_rule)\n"
+  # Traffic.
+  local dup ddn; dup=$(ls_d l_up); ddn=$(ls_d l_down)
+  out+="    ${C_B}${C_BOLD}TRAFFIC${C_N}  ${C_D}(users' bytes through this tunnel; measured over $(awk -v n="$cdt_ns" 'BEGIN{printf "%.3f", n/1e9}') s)${C_N}\n"
+  out+="    ↓ download   $(ls_rate "$ddn" "$cdt_ns")   ${C_D}+$(num "$ddn") B${C_N}\n"
+  out+="    ↑ upload     $(ls_rate "$dup" "$cdt_ns")   ${C_D}+$(num "$dup") B${C_N}\n"
+  out+="    this run     ↓ $(ls_bytes "${LSC[l_down]:-0}")   ↑ $(ls_bytes "${LSC[l_up]:-0}")\n"
+  if [ -n "${LSC[l_life_up]:-}" ] && [ "${LSC[l_src]:-}" != dev ]; then
+    out+="    all time     ↓ $(ls_bytes "${LSC[l_life_down]:-0}")   ↑ $(ls_bytes "${LSC[l_life_up]:-0}")   ${C_D}(every run, kept across restarts)${C_N}\n"
+  fi
+  # Connections.
+  local u c t d; read -r u c t d < <(users_of)
+  out+="    ${C_B}${C_BOLD}CONNECTIONS${C_N}\n"
+  local who=""; [ "${LSC[l_role]:-}" = server ] && who="users $(num "$u") · "
+  out+="    now          ${who}connections $(num "$c") (tcp $(num "$t") · udp $(num "$d"))\n"
+  if [ "${LV[ct]:-}" = ok ]; then
+    out+="                 $(ct_note)\n"
+  else
+    out+="    since start  peak $(num "${LSC[l_peak]:-0}") at once · $(num "${LSC[l_conns]:-0}") opened\n"
+  fi
+  local lk="${LSC[l_links]:--1}"
+  if [ "$lk" != -1 ]; then
+    local ping=""; [ -n "${LSC[l_rtt_avg]:-}" ] && ping=" · ping min ${LSC[l_rtt_min]} / avg ${LSC[l_rtt_avg]} / max ${LSC[l_rtt_max]} ms"
+    out+="    links        $(num "$lk") up · $(num "${LSC[l_links_backoff]:-0}") retransmitting${ping}\n"
+  fi
+  local pls; pls="$(port_lines)"; [ -n "$pls" ] && out+="    by port\n$(printf '%s' "$pls" | sed 's/^  //')\n"
+  # The tunnel's device (kernel and packet tunnels).
+  if [ -n "${LSC[l_dev]:-}" ] && [ -n "${LSC[d_rx_bytes]:-}" ]; then
+    out+="    ${C_B}${C_BOLD}DEVICE${C_N} ${LSC[l_dev]}\n"
+    out+="    receive      $(ls_rate "$(ls_d d_rx_bytes)" "$dt_ns") · $(ls_per "$(ls_d d_rx_packets)" "$dt_ns") packets/s · total $(num "${LSC[d_rx_bytes]}") B, $(num "${LSC[d_rx_packets]}") packets\n"
+    out+="    send         $(ls_rate "$(ls_d d_tx_bytes)" "$dt_ns") · $(ls_per "$(ls_d d_tx_packets)" "$dt_ns") packets/s · total $(num "${LSC[d_tx_bytes]}") B, $(num "${LSC[d_tx_packets]}") packets\n"
+    out+="    dropped/errors  rx $(num "${LSC[d_rx_dropped]}")/$(num "${LSC[d_rx_errors]}") · tx $(num "${LSC[d_tx_dropped]}")/$(num "${LSC[d_tx_errors]}")\n"
+  fi
+  # The process.
+  if [ -n "${LSC[p_ticks]:-}" ]; then
+    local tck; tck=$(getconf CLK_TCK 2>/dev/null || echo 100)
+    local cores; cores=$(nproc 2>/dev/null || echo 1)
+    local pt; pt=$(ls_d p_ticks)
+    local one; one=$(awk -v t="$pt" -v k="$tck" -v n="$dt_ns" 'BEGIN{ if(n<=0){print "—"} else printf "%.2f%%", t/k*1e9/n*100 }')
+    local all; all=$(awk -v t="$pt" -v k="$tck" -v n="$dt_ns" -v c="$cores" 'BEGIN{ if(n<=0){print "—"} else printf "%.2f%%", t/k*1e9/n*100/c }')
+    out+="    ${C_B}${C_BOLD}THIS TUNNEL'S PROCESS${C_N}\n"
+    out+="    CPU          $one of one core · $all of all $cores\n"
+    out+="    memory       $(num "${LSC[p_rss]:-0}") KiB in use (peak $(num "${LSC[p_hwm]:-0}") KiB) · $(num "${LSC[p_vsz]:-0}") KiB reserved\n"
+    out+="    threads      $(num "${LSC[p_thr]:-0}") · open files $(num "${LSC[p_fds]:-0}") (sockets $(num "${LSC[p_socks]:-0}"))\n"
+  fi
+  # The server.
+  local cu cs cio cirq csi cst cid total busy
+  cu=$(( $(ls_d c_user) + $(ls_d c_nice) )); cs=$(ls_d c_sys); cio=$(ls_d c_iow)
+  cirq=$(ls_d c_irq); csi=$(ls_d c_sirq); cst=$(ls_d c_steal); cid=$(ls_d c_idle)
+  total=$(( cu + cs + cio + cirq + csi + cst + cid )); busy=$(( total - cid - cio ))
+  out+="    ${C_B}${C_BOLD}THIS SERVER${C_N}\n"
+  out+="    CPU          $(ls_pct "$busy" "$total") busy · user $(ls_pct "$cu" "$total") · system $(ls_pct "$cs" "$total") · irq $(ls_pct $(( cirq + csi )) "$total") · steal $(ls_pct "$cst" "$total") · iowait $(ls_pct "$cio" "$total")\n"
+  out+="    load         ${LSC[load1]} ${LSC[load5]} ${LSC[load15]} (1/5/15 min) · $(nproc 2>/dev/null || echo ?) cores\n"
+  local mt="${LSC[m_MemTotal]:-0}" ma="${LSC[m_MemAvailable]:-0}"
+  out+="    RAM          $(num $(( mt - ma ))) KiB used of $(num "$mt") KiB ($(ls_pct $(( mt - ma )) "$mt")) · $(num "$ma") KiB available\n"
+  local swt="${LSC[m_SwapTotal]:-0}" swf="${LSC[m_SwapFree]:-0}"
+  [ "$swt" -gt 0 ] && out+="    swap         $(num $(( swt - swf ))) KiB used of $(num "$swt") KiB\n"
+  if [ -n "${LSC[ifc]}" ]; then
+    out+="    network ${LSC[ifc]}  ↓ $(ls_rate "$(ls_d i_rx_bytes)" "$dt_ns")   ↑ $(ls_rate "$(ls_d i_tx_bytes)" "$dt_ns")\n"
+    out+="                 packets/s ↓ $(ls_per "$(ls_d i_rx_packets)" "$dt_ns") ↑ $(ls_per "$(ls_d i_tx_packets)" "$dt_ns") · dropped rx $(num "${LSC[i_rx_dropped]}") tx $(num "${LSC[i_tx_dropped]}") · errors rx $(num "${LSC[i_rx_errors]}") tx $(num "${LSC[i_tx_errors]}")\n"
+  fi
+  out+="    sockets      TCP $(num "${LSC[s_tcp]:-0}") in use ($(num "${LSC[s_tw]:-0}") closing) · UDP $(num "${LSC[s_udp]:-0}") · conntrack $(num "${LSC[ct]}") of $(num "${LSC[ctmax]}")\n"
+  local ol; ol="$(both_line "$n")"
+  if [ -n "$ol" ]; then
+    out+="    ${C_B}${C_BOLD}OTHER END${C_N}\n$(printf '%s\n' "$ol" | sed 's/^/    /')\n"
+  fi
+  printf '%b' "$out"
+}
+
+# stats_page NAME — redrawn in place every second; any key or Ctrl+C = back.
 stats_page(){
-  local n="$1" unit="brokennode@$1" lf="/run/brokennode/$1.live" sf="/var/lib/brokennode/$1.stats"
-  local leave=0 key k
-  local pts=0 pup=0 pdown=0 rup=0 rdown=0 mup=0 mdown=0 hist=()
+  local n="$1" leave=0 key
   trap 'leave=1' INT
-  # The header is drawn once; each frame is then drawn from a fixed row
-  # below it. (Saving and restoring the cursor broke on a short terminal:
-  # the first frame scrolled the screen and every later one landed higher.)
   local hdr
-  hdr="$(banner; ui_crumb "Manage tunnels" "$n" "Live stats"; echo -e "  ${C_D}redrawn every second · any key or Ctrl+C = back${C_N}")"
+  hdr="$(banner; ui_crumb "Manage tunnels" "$n" "Live stats"; echo -e "  ${C_D}redrawn every second · exact counts · any key or Ctrl+C = back${C_N}")"
   clear 2>/dev/null || true
   printf '%s\n' "$hdr"
   local top; top=$(printf '%s\n' "$hdr" | wc -l)
-  tput civis 2>/dev/null   # no blinking cursor jumping around
+  tput civis 2>/dev/null
+  LSP=(); ls_sample "$n"
+  local k; for k in "${!LSC[@]}"; do LSP[$k]="${LSC[$k]}"; done
+  sleep 1
   while [ "$leave" -eq 0 ]; do
-    local out="" st; st=$(systemctl is-active "$unit" 2>/dev/null); [ -z "$st" ] && st=unknown
-    local now; now=$(date +%s)
-    declare -A L=()
-    if [ -f "$lf" ]; then
-      # Every key but these few is a counter used in $(( )), where bash would
-      # evaluate anything else as an expression: keep only plain numbers.
-      while IFS='=' read -r k v; do
-        [[ "$k" =~ ^[a-z_0-9]+$ ]] || continue
-        case "$k" in
-          dev|role|src|transport|ct|version|peer_version) : ;;
-          port_*|ctport_*) [[ "$v" =~ ^[0-9]+( [0-9]+)?$ ]] || v=0 ;;
-          *) [[ "$v" =~ ^[0-9]+$ ]] || v=0 ;;
-        esac
-        L[$k]="$v"
-      done < "$lf"
-    fi
-    local ts="${L[ts]:-0}"; case "$ts" in ""|*[!0-9]*) ts=0 ;; esac; local age=$(( now - ts ))
-    if [ "$st" != active ]; then
-      out+="    Service: ${C_R}${st}${C_N} — the tunnel is not running. Start it from this menu.\n"
-      pts=0
-    elif [ ! -f "$lf" ] || [ "$age" -gt 5 ]; then
-      out+="    Service: ${C_G}active${C_N}\n"
-      if [ ! -f "$lf" ] && [ -f "$sf" ]; then
-        out+="    ${C_Y}The running core is older than this manager and has no live counters.${C_N}\n"
-        out+="    ${C_D}Update (main menu → Update) and restart the tunnel for live speeds.${C_N}\n"
-        out+="    Lifetime traffic: $(hb "$(sed -n 's/^life_total=//p' "$sf")")\n"
-      else
-        out+="    ${C_Y}Waiting for the core's first counters…${C_N}\n"
-        out+="    ${C_D}(If this stays, the core is older than 2.3.9: update, then restart.)${C_N}\n"
-      fi
-    else
-      local up="${L[up]:-0}" down="${L[down]:-0}"
-      if [ "$pts" -gt 0 ] && [ "$ts" -gt "$pts" ]; then
-        local dt=$(( ts - pts ))
-        rup=$(( (up - pup) / dt )); rdown=$(( (down - pdown) / dt ))
-        [ "$rup" -lt 0 ] && rup=0; [ "$rdown" -lt 0 ] && rdown=0
-        [ "$rup" -gt "$mup" ] && mup=$rup; [ "$rdown" -gt "$mdown" ] && mdown=$rdown
-        # a 40-second picture of the download speed, scaled to its own peak
-        local bars=(▁ ▂ ▃ ▄ ▅ ▆ ▇ █) lvl=0
-        [ "$mdown" -gt 0 ] && lvl=$(( rdown * 7 / mdown ))
-        hist+=("${bars[$lvl]}"); [ "${#hist[@]}" -gt 40 ] && hist=("${hist[@]: -40}")
-      fi
-      if [ "$ts" -gt "$pts" ]; then pts=$ts; pup=$up; pdown=$down; fi
-      local role="foreign server"; [ "${L[role]:-}" = server ] && role="Iran relay"
-      local upt=$(( now - ${L[started]:-$now} ))
-      out+="    Service: ${C_G}active${C_N}   ${role} · ${L[transport]:-}   up $(printf '%dh%02dm%02ds' $((upt/3600)) $((upt%3600/60)) $((upt%60)))\n"
-      if [ "${L[src]:-}" = dev ]; then
-        local dst="gone"; [ -n "${L[dev]:-}" ] && dst=$(cat "/sys/class/net/${L[dev]:-}/operstate" 2>/dev/null || echo gone)
-        # Tunnel devices have no carrier to report and say "unknown" while up.
-        if [ "$dst" = unknown ]; then
-          local fl; fl=$(cat "/sys/class/net/${L[dev]:-}/flags" 2>/dev/null)
-          [ -n "$fl" ] && [ $(( fl & 1 )) -eq 1 ] && dst=up
-        fi
-        out+="    Device : ${L[dev]:-none yet} (${dst})\n"
-      else
-        local lk="${L[links]:--1}"
-        if [ "$lk" -gt 0 ]; then out+="    Links  : ${C_G}${lk} up${C_N}\n"
-        elif [ "$lk" -eq 0 ]; then out+="    Links  : ${C_R}0 up — not connected to the other server${C_N}\n"; fi
-      fi
-      out+="$(ui_rule)\n"
-      out+="    ${C_B}Speed now${C_N}    ↓ download $(hr_rate "$rdown")   ↑ upload $(hr_rate "$rup")\n"
-      out+="    ${C_D}Peak here${C_N}    ↓ $(hr_rate "$mdown")   ↑ $(hr_rate "$mup")\n"
-      out+="    ${C_D}↓ history${C_N}    $(printf '%s' "${hist[@]}")\n"
-      out+="    ${C_B}This run${C_N}     ↓ $(hb "$down")   ↑ $(hb "$up")   total $(hb $(( up + down )))\n"
-      # The all-time totals count user sockets; a kernel or packet tunnel's
-      # users never touch one (they showed 0 B for ever).
-      if [ -n "${L[life_up]:-}" ] && [ "${L[src]:-}" != dev ]; then
-        out+="    ${C_B}Lifetime${C_N}     ↓ $(hb "${L[life_down]:-}")   ↑ $(hb "${L[life_up]:-}")   ${C_D}(survives restarts)${C_N}\n"
-      fi
-      # Users and connections: the core's own counts, or for a kernel or
-      # packet tunnel conntrack's (see users_of); then link health and the
-      # connections open on each port.
-      LV=(); local k2; for k2 in "${!L[@]}"; do LV[$k2]="${L[$k2]}"; done
-      local u c t d; read -r u c t d < <(users_of)
-      out+="$(ui_rule)\n"
-      local who=""; [ "${L[role]:-}" = server ] && who="users ${C_W}$(num "$u")${C_N}   "
-      out+="    ${C_B}Now${C_N}          ${who}connections ${C_W}$(num "$c")${C_N}  ${C_D}tcp $(num "$t") · udp $(num "$d")${C_N}\n"
-      if [ -n "${LV[ct]:-}" ]; then
-        out+="                 $(ct_note)\n"
-      else
-        out+="    ${C_D}Since start${C_N}  peak $(num "${L[peak]:-0}") at once · $(num "${L[conns]:-0}") opened\n"
-      fi
-      if [ -n "${L[rtt_avg]:-}" ]; then
-        out+="    ${C_B}Ping${C_N}         $(rtt_col "${L[rtt_avg]}") avg  ${C_D}min ${L[rtt_min]} · max ${L[rtt_max]} ms over the links${C_N}"
-        [ "${L[links_backoff]:-0}" -gt 0 ] && out+="  ${C_Y}${L[links_backoff]} retransmitting${C_N}"
-        out+="\n"
-      fi
-      local pls; pls="$(port_lines)"
-      if [ -n "$pls" ]; then
-        out+="    ${C_B}By port${C_N}\n$(printf '%s' "$pls" | sed 's/^  //')\n"
-      fi
-    fi
-    # Redraw over the previous frame instead of clearing: no flashing. Only
-    # as many lines as the terminal has room for, so nothing ever scrolls.
-    local rows; rows=$(tput lines 2>/dev/null || echo 40)
+    ls_sample "$n"
+    local out; out="$(ls_frame "$n")"
+    for k in "${!LSC[@]}"; do LSP[$k]="${LSC[$k]}"; done
+    local rows; rows=$(tput lines 2>/dev/null || echo 60)
     local room=$(( rows - top - 1 )); [ "$room" -lt 3 ] && room=3
     tput cup "$top" 0 2>/dev/null || printf '\033[%d;1H' $(( top + 1 ))
-    printf '%b' "$out" | head -n "$room" | sed 's/$/\x1b[K/'
+    printf '%s\n' "$out" | head -n "$room" | sed 's/$/\x1b[K/'
     printf '\033[J'
-    unset L
-    # Waits one second, or returns at once on a key press.
     if [ -t 0 ]; then
       if read -rsn1 -t 1 key 2>/dev/null; then
         leave=1
-        # An arrow or function key is several bytes: take the rest too, or
-        # the menu reads them next and answers "Invalid."
         while read -rsn1 -t 0.05 key 2>/dev/null; do :; done
       fi
     else
-      leave=1   # no terminal to watch or to press a key on: one frame
+      leave=1
     fi
   done
   tput cnorm 2>/dev/null
@@ -3323,6 +3394,14 @@ manage_tunnels(){
         17) manage_ports "$n"; ui_pause;;
         18) diagnose "$n"; ui_pause;;
         19) SHARE_PUB=""; show_pair_code "$n" 1; read -rp "  ▶ press ENTER to continue... " _;;
+        20) need_link && both_logs "$n" || ui_pause;;
+        21) if need_link; then { "$BIN" sync health -tunnel "$n"; echo; "$BIN" sync traffic -tunnel "$n"; } | sync_log_colors | sync_pager; fi; ui_pause;;
+        22) if need_link; then echo; "$BIN" sync diagnose "$n" | sync_log_colors; fi; ui_pause;;
+        23) if need_link; then "$BIN" sync recovery -tunnel "$n"
+              local rr; rr=$(ask "Clear this tunnel's recovery limits? (y/n)" "n")
+              [ "$rr" = y ] && "$BIN" sync recovery -reset "$n"
+            fi; ui_pause;;
+        24) sync_link_menu;;
         __eof__) return;;
         0) break;;
         *) UI_NOTE="${C_Y}not an option — pick a number shown above${C_N}";;
@@ -4909,7 +4988,7 @@ sync_running(){ systemctl is-active brokennode-sync >/dev/null 2>&1; }
 # sync_hint — the main menu's line for Node Sync.
 sync_hint(){
   if ! sync_ready; then echo "off · share logs, status and recovery with the other server"; return; fi
-  if ! sync_running; then echo "stopped · 10 on its page starts it"; return; fi
+  if ! sync_running; then echo "off · a tunnel → 24 turns it on"; return; fi
   local on=0 total=0 f
   for f in "$SYNC_DIR"/peer-*.json; do
     [ -e "$f" ] || continue
@@ -4995,68 +5074,7 @@ sync_disable(){
 # sync_pager — long output, page by page when it is longer than the screen.
 sync_pager(){ if [ -t 1 ] && command -v less >/dev/null 2>&1; then less -R -F -X; else cat; fi; }
 
-sync_peers_menu(){
-  while true; do
-    banner; ui_crumb "Node Sync" "Peer connection"; echo
-    "$BIN" sync peers 2>&1 | sed 's/^/    /'
-    echo
-    ui_item 1 "Make a pairing code" "on the server that takes connections; paste it on the other one"
-    ui_item 2 "Join with a code" "paste the code the other server made"
-    ui_item 3 "Revoke a peer" "it is refused from now on (its logs stay)"
-    ui_item 0 "Back"
-    echo
-    case "$(menu_ask 'Choice')" in
-      1) local lis; lis="$("$BIN" sync settings 2>/dev/null | sed -n 's/.*"listen": "\(.*\)".*/\1/p')"
-         if [ -z "$lis" ]; then
-           warn "This server does not take connections: set a port first (8 API settings), or make the code on the other server."
-         else
-           local ip; ip="$(share_pubip)"
-           local code; code="$("$BIN" sync invite -addr "$(hostport "$ip" "${lis##*:}")")" || { ui_pause; continue; }
-           echo
-           echo -e "  ${C_Y}Paste this on the other server (Node Sync → 2 → 2). It works once, for one hour,${C_N}"
-           echo -e "  ${C_Y}and it is a secret: whoever has it can pair with this server.${C_N}"
-           echo
-           echo "$code"
-           echo
-           echo -e "  ${C_D}or there, in one line:  BrokenNode sync-join $code${C_N}"
-         fi
-         ui_pause ;;
-      2) local c; c=$(ask "Paste the code" "")
-         [ -n "$c" ] && "$BIN" sync join "$c" | sed 's/^/  /'
-         sync_running || sync_enable
-         ui_pause ;;
-      3) local who; who=$(ask "Peer to revoke (name or id)" "")
-         [ -n "$who" ] && "$BIN" sync revoke "$who" | sed 's/^/  /'
-         ui_pause ;;
-      0|__eof__) return ;;
-    esac
-  done
-}
 
-sync_logs_menu(){
-  while true; do
-    banner; ui_crumb "Node Sync" "Shared logs"; echo
-    ui_item 1 "Combined" "both servers, in time order"
-    ui_item 2 "Local" "this server's events"
-    ui_item 3 "Remote" "the other servers' events"
-    ui_item 4 "Errors" "warnings and errors, every server"
-    ui_item 5 "Recovery" "restarts, diagnoses, what they found"
-    ui_item 6 "Traffic" "started, idle, RX/TX totals"
-    ui_item 7 "API" "the link between the servers"
-    ui_item 8 "Follow live" "combined, as it happens (Ctrl+C = back)"
-    ui_item 0 "Back"
-    echo
-    local v=""
-    case "$(menu_ask 'Choice')" in
-      1) v=combined ;; 2) v=local ;; 3) v=remote ;; 4) v=errors ;; 5) v=recovery ;; 6) v=traffic ;; 7) v=api ;;
-      8) trap ':' INT; "$BIN" sync logs -view combined -n 30 -f; trap - INT; continue ;;
-      0|__eof__) return ;;
-      *) continue ;;
-    esac
-    "$BIN" sync logs -view "$v" -n 300 | sync_log_colors | sync_pager
-    ui_pause
-  done
-}
 
 # sync_log_colors — the severity in colour.
 sync_log_colors(){
@@ -5068,7 +5086,7 @@ sync_log_colors(){
 sync_settings_menu(){
   local what="$1"
   while true; do
-    banner; ui_crumb "Node Sync" "$what"; echo
+    banner; ui_crumb "Manage tunnels" "Link the two servers" "$what"; echo
     "$BIN" sync settings 2>/dev/null | sed 's/^/    /'
     echo
     if [ "$what" = "API settings" ]; then
@@ -5100,49 +5118,123 @@ sync_settings_menu(){
   done
 }
 
-sync_menu(){
+# sync_link_menu — linking this server with the other one (pairing, on/off,
+# settings): what the tunnel page's "both servers" options need. Reached from
+# any tunnel's page (24); the link serves every tunnel between the two.
+sync_link_menu(){
   if ! sync_supported; then
-    err "This core has no node sync: update BrokenNode (main menu → 5) on BOTH servers."
+    err "This core cannot link servers: update BrokenNode (main menu → 5) on BOTH servers."
     ui_pause; return
   fi
   while true; do
-    banner; ui_crumb "Node Sync"; echo
-    if ! sync_ready; then
-      echo -e "  ${C_D}Node sync is not set up. It lets this server and the other one share${C_N}"
-      echo -e "  ${C_D}their logs and tunnel status, diagnose a broken tunnel from both ends and${C_N}"
-      echo -e "  ${C_D}restart what should run — over a connection of its own, never the tunnels'.${C_N}"
+    banner; ui_crumb "Manage tunnels" "Link the two servers"; echo
+    echo -e "  ${C_D}Linked, the two servers share each tunnel's logs and state, diagnose it from both${C_N}"
+    echo -e "  ${C_D}ends and restart what should run — over a connection of their own: the tunnels${C_N}"
+    echo -e "  ${C_D}never depend on it, and work the same when it is off or cannot connect.${C_N}"
+    echo
+    if sync_ready; then
+      local st="${C_R}off${C_N}"; sync_running && st="${C_G}on${C_N}"
+      echo -e "  link $st · $(sync_hint | sed 's/^[a-z]* · //')"
       echo
-    else
-      local st="${C_R}stopped${C_N}"; sync_running && st="${C_G}running${C_N}"
-      echo -e "  node sync $st · $(sync_hint | sed 's/^[a-z]* · //')"
+      "$BIN" sync peers 2>&1 | sed 's/^/    /'
       echo
     fi
-    ui_two "$(ui_section 'SEE')" "$(ui_section 'ACT')"
-    ui_two "  $(ui_item2 1 'Node status' 'both servers')" "$(ui_item2 6 'Diagnose peer' 'from both ends')"
-    ui_two "  $(ui_item2 2 'Peer connection' 'pairing')" "$(ui_item2 7 'Recovery history')"
-    ui_two "  $(ui_item2 3 'Shared logs')" "$(ui_item2 8 'API settings')"
-    ui_two "  $(ui_item2 4 'Tunnel health' 'both ends')" "$(ui_item2 9 'Sync settings')"
-    ui_two "  $(ui_item2 5 'Traffic status')" "$(ui_item2 10 "$(sync_running && echo Disable || echo Enable)" 'node sync')"
-    echo
-    echo -e "  ${C_Y}${C_BOLD}0${C_N} back"
+    ui_item 1 "$(sync_running && echo 'Turn off' || echo 'Turn on')" "the link on this server (the tunnels are not affected)"
+    ui_item 2 "Make a pairing code" "on the server that takes connections (usually Iran)"
+    ui_item 3 "Join with a code" "paste the code the other server made"
+    ui_item 4 "Revoke a server" "it is refused from now on (its logs stay)"
+    ui_item 5 "Connection settings" "port, allowed IPs"
+    ui_item 6 "Behaviour" "idle time, recovery, what the other server may ask"
+    ui_item 0 "Back"
     echo
     case "$(menu_ask 'Choice')" in
-      1) "$BIN" sync status | sync_pager; ui_pause ;;
-      2) sync_peers_menu ;;
-      3) sync_logs_menu ;;
-      4) "$BIN" sync health | sync_pager; ui_pause ;;
-      5) "$BIN" sync traffic | sync_pager; ui_pause ;;
-      6) pick_tunnel && { echo; "$BIN" sync diagnose "$PICKED"; }; ui_pause ;;
-      7) "$BIN" sync recovery | sync_pager
-         local r; r=$(ask "Clear the recovery limits of a tunnel? (its name, 'all', or empty)" "")
-         case "$r" in "") ;; all) "$BIN" sync recovery -reset ;; *) "$BIN" sync recovery -reset "$r" ;; esac
+      1) if sync_running; then sync_disable; else sync_enable; fi; ui_pause ;;
+      2) sync_ready || sync_enable
+         local lis; lis="$("$BIN" sync settings 2>/dev/null | sed -n 's/.*"listen": "\(.*\)".*/\1/p')"
+         if [ -z "$lis" ]; then
+           warn "This server does not take connections: set a port (5), or make the code on the other server."
+         else
+           local ip; ip="$(share_pubip)"
+           local code; code="$("$BIN" sync invite -addr "$(hostport "$ip" "${lis##*:}")")" || { ui_pause; continue; }
+           echo
+           echo -e "  ${C_Y}Paste this on the other server (a tunnel → 24 → 3). It works once, for one hour,${C_N}"
+           echo -e "  ${C_Y}and it is a secret: whoever has it can link with this server.${C_N}"
+           echo
+           echo "$code"
+           echo
+           echo -e "  ${C_D}or there, in one line:  BrokenNode sync-join $code${C_N}"
+           echo -e "  ${C_D}Allow TCP ${lis##*:} in this server's firewall for the other server's IP.${C_N}"
+         fi
          ui_pause ;;
-      8) sync_settings_menu "API settings" ;;
-      9) sync_settings_menu "Sync settings" ;;
-      10) if sync_running; then sync_disable; else sync_enable; fi; ui_pause ;;
+      3) local c; c=$(ask "Paste the code" "")
+         if [ -n "$c" ]; then
+           sync_ready || IMPORT_AUTO=1 sync_setup_dialer
+           "$BIN" sync join "$c" | sed 's/^/  /'
+           sync_running || sync_enable
+         fi
+         ui_pause ;;
+      4) local who; who=$(ask "Server to revoke (name or id)" "")
+         [ -n "$who" ] && "$BIN" sync revoke "$who" | sed 's/^/  /'
+         ui_pause ;;
+      5) sync_settings_menu "API settings" ;;
+      6) sync_settings_menu "Sync settings" ;;
       0|__eof__) return ;;
     esac
   done
+}
+
+# sync_setup_dialer — set up a server that only dials (the one joining).
+sync_setup_dialer(){
+  local name="foreign" f m
+  for f in "$CFG_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    m="$(sed -n 's/.*"mode"[ ]*:[ ]*"\([^"]*\)".*/\1/p' "$f")"
+    [ "$m" = server ] && name=iran
+  done
+  name=$(ask "This server's name in the shared logs" "$name")
+  "$BIN" sync init -name "$name" | sed 's/^/  /'
+}
+
+# both_line NAME — the other end of tunnel NAME, as the linked server says
+# (empty when the servers are not linked).
+both_line(){
+  sync_ready || return 0
+  local node ok rest any=0
+  while IFS=$'\t' read -r node ok rest; do
+    [ -n "$node" ] || continue
+    any=1
+    local c="$C_G"; [ "$ok" = ok ] || c="$C_R"
+    printf '%b\n' "${C_W}$node${C_N}  ${c}${rest}${C_N}"
+  done < <("$BIN" sync health -tunnel "$1" -brief 2>/dev/null)
+  [ "$any" = 1 ] || echo -e "${C_D}no linked server reports this tunnel${C_N}"
+}
+
+# both_logs NAME — this tunnel's events on every linked server.
+both_logs(){
+  local n="$1"
+  while true; do
+    banner; ui_crumb "Manage tunnels" "$n" "Logs of both servers"; echo
+    ui_item 1 "All events" "both servers, in time order"
+    ui_item 2 "Problems only" "warnings and errors"
+    ui_item 3 "Follow live" "as it happens (Ctrl+C = back)"
+    ui_item 0 "Back"
+    echo
+    case "$(menu_ask 'Choice')" in
+      1) "$BIN" sync logs -tunnel "$n" -n 400 | sync_log_colors | sync_pager; ui_pause ;;
+      2) "$BIN" sync logs -tunnel "$n" -view errors -n 400 | sync_log_colors | sync_pager; ui_pause ;;
+      3) trap ':' INT; "$BIN" sync logs -tunnel "$n" -n 30 -f | sync_log_colors; trap - INT ;;
+      0|__eof__) return ;;
+    esac
+  done
+}
+
+# need_link — the both-servers options need the link; say how to make it.
+need_link(){
+  if ! sync_supported; then err "This core cannot link servers: update BrokenNode on BOTH servers."; return 1; fi
+  if ! sync_ready || ! sync_running; then
+    warn "The two servers are not linked: 24) Link the two servers (shared logs, both ends' state, diagnosis from both)."
+    return 1
+  fi
 }
 
 main_menu(){
@@ -5166,7 +5258,6 @@ main_menu(){
     ui_section TOOLS
     ui_item 4 "Health check" "BBR, ports, path MTU, versions, running cores"
     ui_item 6 "Share codes" "set up the other server, or move every tunnel, with one paste"
-    ui_item 7 "Node Sync" "$(sync_hint)"
     echo
     ui_section SYSTEM
     ui_item 5 "Update BrokenNode" "download the latest into this folder"
@@ -5181,7 +5272,6 @@ main_menu(){
       4) doctor; read -t 30 -rp "  ▶ press ENTER to continue... " _ ;;
       5) update_self ;;
       6) share_menu ;;
-      7) sync_menu ;;
       0|__eof__) echo; exit 0 ;;
       *) warn "Invalid." ;;
     esac
