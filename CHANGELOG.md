@@ -3,6 +3,44 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.24
+
+### New
+- **Node Sync (main menu → 7).** The servers at the two ends of your tunnels
+  now talk to each other — over a connection of their own, never a tunnel's,
+  so it works the same with every transport and stopping it changes nothing
+  for users. Off until you turn it on.
+  - **Shared logs:** what happens on one server shows on the other, marked
+    with the server it came from: tunnels started, stopped, connected,
+    disconnected, reconnected, handshake failures, health, traffic (started,
+    idle, RX/TX totals), recoveries, settings changed. Nothing is lost while
+    the servers cannot reach each other: it follows when they can again, once,
+    without duplicates. Views: combined, local, remote, errors, recovery,
+    traffic, the link itself, and live.
+  - **Each tunnel's three states, on both ends:** connected, healthy, and
+    traffic — a tunnel nobody uses is "idle", never "disconnected".
+  - **Diagnosis from both ends:** when a tunnel breaks, each server checks its
+    side (the same checks as Diagnose) and the two are compared: the other end
+    stopped, no tunnel with this token there, a different release, transport,
+    encryption, port or tunnel addresses that differ, the other server's IP
+    changed, the path dropping the tunnel's protocol and port, handshake
+    failures, packet loss.
+  - **Safe recovery:** a tunnel that should run and does not is restarted,
+    at most 5 times in 2 hours with growing pauses, and only after asking the
+    other server (when its end is the one down, that server is asked to
+    restart its own). Then it waits for you. Routing, firewall, addresses,
+    MTU, tokens and encryption are never changed by it.
+  - **Settings both ends should share** are compared, and a difference is
+    reported — never changed on its own.
+  - Secure: TLS with the other server's certificate pinned, every request
+    signed with the pair's own key, replays refused, a pairing code that
+    works once for an hour, peers you can revoke. No token or code ever goes
+    into the shared log or across.
+- To pair: on the server that takes connections (usually Iran) Node Sync →
+  10 to enable it, then 2 → 1 for a code; on the other server Node Sync → 2 →
+  2 and paste it (or `BrokenNode sync-join <code>`). Allow the sync port
+  (default TCP 9443) for the other server's IP in that server's firewall.
+
 ## 2.8.23
 
 ### Fixed

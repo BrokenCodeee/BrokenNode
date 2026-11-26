@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.23"
+VERSION="2.8.24"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -4359,8 +4359,14 @@ EOF
 # links up ("· N link(s) left", N > 0) is a healthy multi-link tunnel shedding
 # one link, not an outage. A fresh start gets 3 minutes to connect first.
 health_check(){
-  local f n st now started inv last ts
+  local f n st now started inv last ts syncrec=0
   now="$(date +%s)"
+  # Node sync, when it runs with recovery on, restarts tunnels itself — with
+  # limits and backoff, after asking the other server: two restarters would
+  # fight. This then only cleans up. Without it, as always.
+  if [ -f /run/brokennode/sync-recovery ] && kill -0 "$(cat /run/brokennode/sync-recovery 2>/dev/null)" 2>/dev/null; then
+    syncrec=1
+  fi
   for f in "$CFG_DIR"/*.json; do
     [ -e "$f" ] || continue
     n="$(basename "$f" .json)"
@@ -4369,10 +4375,12 @@ health_check(){
     case "$st" in
       active) : ;;
       activating|reloading|deactivating) continue ;;   # systemd is already on it
-      *) logger -t brokennode-health "restarting brokennode@$n (state: $st)" 2>/dev/null
+      *) [ "$syncrec" = 1 ] && continue
+         logger -t brokennode-health "restarting brokennode@$n (state: $st)" 2>/dev/null
          systemctl restart "brokennode@$n" 2>/dev/null
          continue ;;
     esac
+    [ "$syncrec" = 1 ] && continue
     started="$(date -d "$(systemctl show -p ActiveEnterTimestamp --value "brokennode@$n" 2>/dev/null)" +%s 2>/dev/null)"
     case "$started" in ''|*[!0-9]*) started=0 ;; esac
     [ $((now - started)) -lt 180 ] && continue
@@ -4409,7 +4417,7 @@ running_cores(){
     exe="$(readlink "$p/exe" 2>/dev/null)" || continue
     case "${exe##*/}" in brokennode|brokennode\ *|brokennode.new*|brokennode-linux-*) ;; *) continue ;; esac
     v="$("$p/exe" version 2>/dev/null | sed -n 's/.* v\{0,1\}\([0-9][0-9.]*\)$/\1/p' | head -n 1)"
-    unit="$(grep -o 'brokennode@[^/]*\.service' "$p/cgroup" 2>/dev/null | head -n 1)"
+    unit="$(grep -o 'brokennode@[^/]*\.service\|brokennode-sync\.service' "$p/cgroup" 2>/dev/null | head -n 1)"
     echo "${p#/proc/} ${v:-?} ${unit:--}"
   done
 }
@@ -4458,6 +4466,10 @@ restart_all_tunnels(){
     [ "$st" = active ] && info "restarted brokennode@$n (${C_G}active${C_N})" || err "brokennode@$n -> $st"
   done
   [ "$any" = 0 ] && warn "No tunnels configured yet."
+  # Node sync runs the core too: onto the new one.
+  if systemctl is-active brokennode-sync >/dev/null 2>&1; then
+    systemctl restart brokennode-sync && info "restarted node sync (${C_G}active${C_N})"
+  fi
 }
 
 # auto_tune_once applies the network tuning (BBR + fq + buffers) the first time
@@ -4563,6 +4575,8 @@ uninstall_all(){
   systemctl list-units --all --no-legend 2>/dev/null | grep -o 'brokennode@[^ ]*\.service' | sort -u | while read -r u; do systemctl disable --now "$u" >/dev/null 2>&1; done
   systemctl disable --now brokennode-autoupdate.timer >/dev/null 2>&1
   systemctl disable --now brokennode-health.timer >/dev/null 2>&1
+  systemctl disable --now brokennode-sync.service >/dev/null 2>&1
+  rm -f "$SYNC_SVC"
   # Every rule any release added, now that no tunnel runs.
   "$BIN" cleanup --all 2>/dev/null | sed 's/^/  /'
   unshape_egress
@@ -4878,6 +4892,259 @@ remove_command(){
 
 sweep_temp(){ rm -f "$CFG_DIR"/.tune-*.json "$CFG_DIR"/.undo-*.json "$CFG_DIR"/.pair-*.json "$CFG_DIR"/.check-*.json 2>/dev/null; rm -rf "$CFG_DIR"/.import.* 2>/dev/null; }
 
+# ============================================================================
+#  Node Sync — the servers at the two ends of the tunnels share their logs,
+#  their tunnels' state and settings, look into each other's problems and
+#  recover what is safe to recover. It is the core's own `brokennode sync`
+#  (a daemon of its own, brokennode-sync.service): never on a user's packet
+#  path, and stopping it changes nothing for the tunnels.
+# ============================================================================
+SYNC_SVC=/etc/systemd/system/brokennode-sync.service
+SYNC_DIR=/var/lib/brokennode/sync
+
+sync_supported(){ [ -x "$BIN" ] && "$BIN" sync version >/dev/null 2>&1; }
+sync_ready(){ [ -f "$SYNC_DIR/node.json" ]; }
+sync_running(){ systemctl is-active brokennode-sync >/dev/null 2>&1; }
+
+# sync_hint — the main menu's line for Node Sync.
+sync_hint(){
+  if ! sync_ready; then echo "off · share logs, status and recovery with the other server"; return; fi
+  if ! sync_running; then echo "stopped · 10 on its page starts it"; return; fi
+  local on=0 total=0 f
+  for f in "$SYNC_DIR"/peer-*.json; do
+    [ -e "$f" ] || continue
+    total=$((total+1))
+    grep -q '"online": true' "$f" && on=$((on+1))
+  done
+  echo "running · $on of $total peer(s) online"
+}
+
+write_sync_unit(){
+  cat > "$SYNC_SVC" <<EOF
+[Unit]
+Description=BrokenNode node sync (logs, status and recovery shared with the other servers)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=$BIN sync run
+Restart=always
+RestartSec=5
+# Kept small on purpose: it must never take what the tunnels need.
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=25%
+MemoryMax=192M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload 2>/dev/null
+}
+
+# sync_setup — the first time: this node's name, and whether it takes the
+# other servers' connections (one server must; the relay usually does, as it
+# already takes the foreign server's tunnel connections).
+sync_setup(){
+  local role=foreign m f
+  for f in "$CFG_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    m="$(sed -n 's/.*"mode"[ ]*:[ ]*"\([^"]*\)".*/\1/p' "$f")"
+    [ "$m" = server ] && role=iran
+  done
+  echo
+  echo -e "  ${C_D}A name for this server in the shared log (IRAN, GERMANY ...).${C_N}"
+  local name; name=$(ask "This node's name" "$role")
+  echo
+  echo -e "  ${C_D}One server takes the others' connections (it needs one open TCP port;${C_N}"
+  echo -e "  ${C_D}the other servers need none). Usually the Iran relay does.${C_N}"
+  local lis="n"; [ "$role" = iran ] && lis="y"
+  lis=$(ask "Should this server take the other servers' connections? (y/n)" "$lis")
+  local args=(-name "$name")
+  if [ "$lis" = y ] || [ "$lis" = Y ]; then
+    local port; port=$(ask "Port for node sync (TCP)" "9443")
+    case "$port" in ''|*[!0-9]*) port=9443 ;; esac
+    args+=(-listen ":$port")
+    echo -e "  ${C_D}Allow TCP $port in this server's firewall for the other server's IP only. Nothing here opens it.${C_N}"
+  fi
+  "$BIN" sync init "${args[@]}" | sed 's/^/  /'
+}
+
+sync_enable(){
+  if ! sync_supported; then
+    err "This core has no node sync: update BrokenNode (main menu → 5) on BOTH servers."
+    return 1
+  fi
+  sync_ready || sync_setup || return 1
+  write_sync_unit
+  "$BIN" sync set enabled=on >/dev/null
+  systemctl enable --now brokennode-sync >/dev/null 2>&1
+  sleep 1
+  if sync_running; then info "Node sync is running."
+  else err "Node sync did not start: journalctl -u brokennode-sync -n 30"; fi
+}
+
+sync_disable(){
+  systemctl disable --now brokennode-sync >/dev/null 2>&1
+  [ -x "$BIN" ] && "$BIN" sync set enabled=off >/dev/null 2>&1
+  info "Node sync stopped. The tunnels are not affected; its logs are kept."
+}
+
+# sync_pager — long output, page by page when it is longer than the screen.
+sync_pager(){ if [ -t 1 ] && command -v less >/dev/null 2>&1; then less -R -F -X; else cat; fi; }
+
+sync_peers_menu(){
+  while true; do
+    banner; ui_crumb "Node Sync" "Peer connection"; echo
+    "$BIN" sync peers 2>&1 | sed 's/^/    /'
+    echo
+    ui_item 1 "Make a pairing code" "on the server that takes connections; paste it on the other one"
+    ui_item 2 "Join with a code" "paste the code the other server made"
+    ui_item 3 "Revoke a peer" "it is refused from now on (its logs stay)"
+    ui_item 0 "Back"
+    echo
+    case "$(menu_ask 'Choice')" in
+      1) local lis; lis="$("$BIN" sync settings 2>/dev/null | sed -n 's/.*"listen": "\(.*\)".*/\1/p')"
+         if [ -z "$lis" ]; then
+           warn "This server does not take connections: set a port first (8 API settings), or make the code on the other server."
+         else
+           local ip; ip="$(share_pubip)"
+           local code; code="$("$BIN" sync invite -addr "$(hostport "$ip" "${lis##*:}")")" || { ui_pause; continue; }
+           echo
+           echo -e "  ${C_Y}Paste this on the other server (Node Sync → 2 → 2). It works once, for one hour,${C_N}"
+           echo -e "  ${C_Y}and it is a secret: whoever has it can pair with this server.${C_N}"
+           echo
+           echo "$code"
+           echo
+           echo -e "  ${C_D}or there, in one line:  BrokenNode sync-join $code${C_N}"
+         fi
+         ui_pause ;;
+      2) local c; c=$(ask "Paste the code" "")
+         [ -n "$c" ] && "$BIN" sync join "$c" | sed 's/^/  /'
+         sync_running || sync_enable
+         ui_pause ;;
+      3) local who; who=$(ask "Peer to revoke (name or id)" "")
+         [ -n "$who" ] && "$BIN" sync revoke "$who" | sed 's/^/  /'
+         ui_pause ;;
+      0|__eof__) return ;;
+    esac
+  done
+}
+
+sync_logs_menu(){
+  while true; do
+    banner; ui_crumb "Node Sync" "Shared logs"; echo
+    ui_item 1 "Combined" "both servers, in time order"
+    ui_item 2 "Local" "this server's events"
+    ui_item 3 "Remote" "the other servers' events"
+    ui_item 4 "Errors" "warnings and errors, every server"
+    ui_item 5 "Recovery" "restarts, diagnoses, what they found"
+    ui_item 6 "Traffic" "started, idle, RX/TX totals"
+    ui_item 7 "API" "the link between the servers"
+    ui_item 8 "Follow live" "combined, as it happens (Ctrl+C = back)"
+    ui_item 0 "Back"
+    echo
+    local v=""
+    case "$(menu_ask 'Choice')" in
+      1) v=combined ;; 2) v=local ;; 3) v=remote ;; 4) v=errors ;; 5) v=recovery ;; 6) v=traffic ;; 7) v=api ;;
+      8) trap ':' INT; "$BIN" sync logs -view combined -n 30 -f; trap - INT; continue ;;
+      0|__eof__) return ;;
+      *) continue ;;
+    esac
+    "$BIN" sync logs -view "$v" -n 300 | sync_log_colors | sync_pager
+    ui_pause
+  done
+}
+
+# sync_log_colors — the severity in colour.
+sync_log_colors(){
+  sed -e "s/\[ERROR\]/$(printf '\033[0;31m')[ERROR]$(printf '\033[0m')/" \
+      -e "s/\[WARNING\]/$(printf '\033[1;33m')[WARNING]$(printf '\033[0m')/" \
+      -e "s/(remote)/$(printf '\033[0;90m')(remote)$(printf '\033[0m')/"
+}
+
+sync_settings_menu(){
+  local what="$1"
+  while true; do
+    banner; ui_crumb "Node Sync" "$what"; echo
+    "$BIN" sync settings 2>/dev/null | sed 's/^/    /'
+    echo
+    if [ "$what" = "API settings" ]; then
+      ui_item 1 "Listen address" "e.g. :9443 — empty: this server only dials"
+      ui_item 2 "Allowed IPs" "who may connect (empty: anyone with a valid key)"
+    else
+      ui_item 1 "Idle after" "seconds without traffic before 'idle'"
+      ui_item 2 "Traffic summary" "seconds between RX/TX totals while traffic flows"
+      ui_item 3 "Recovery" "restart what should run, within limits (on/off)"
+      ui_item 4 "Recovery attempts" "per tunnel, before it waits for you"
+      ui_item 5 "Down after" "seconds without a link before recovery acts"
+      ui_item 6 "Peers may ask" "diagnose, recover (comma separated; empty: nothing)"
+      ui_item 7 "Share error lines" "send tunnels' error lines to the peers (on/off)"
+    fi
+    ui_item 0 "Back"
+    echo
+    local c k="" v
+    c="$(menu_ask 'Choice')"
+    if [ "$what" = "API settings" ]; then
+      case "$c" in 1) k=listen ;; 2) k=allow_ips ;; 0|__eof__) return ;; *) continue ;; esac
+    else
+      case "$c" in 1) k=idle_after ;; 2) k=traffic_every ;; 3) k=recovery ;; 4) k=max_attempts ;; 5) k=down_after ;;
+        6) k=allow_remote ;; 7) k=share_logs ;; 0|__eof__) return ;; *) continue ;; esac
+    fi
+    v=$(ask "New value for $k" "")
+    "$BIN" sync set "$k=$v" | sed 's/^/  /'
+    if [ "$k" = listen ] && sync_running; then systemctl restart brokennode-sync; fi
+    ui_pause
+  done
+}
+
+sync_menu(){
+  if ! sync_supported; then
+    err "This core has no node sync: update BrokenNode (main menu → 5) on BOTH servers."
+    ui_pause; return
+  fi
+  while true; do
+    banner; ui_crumb "Node Sync"; echo
+    if ! sync_ready; then
+      echo -e "  ${C_D}Node sync is not set up. It lets this server and the other one share${C_N}"
+      echo -e "  ${C_D}their logs and tunnel status, diagnose a broken tunnel from both ends and${C_N}"
+      echo -e "  ${C_D}restart what should run — over a connection of its own, never the tunnels'.${C_N}"
+      echo
+    else
+      local st="${C_R}stopped${C_N}"; sync_running && st="${C_G}running${C_N}"
+      echo -e "  node sync $st · $(sync_hint | sed 's/^[a-z]* · //')"
+      echo
+    fi
+    ui_two "$(ui_section 'SEE')" "$(ui_section 'ACT')"
+    ui_two "  $(ui_item2 1 'Node status' 'both servers')" "$(ui_item2 6 'Diagnose peer' 'from both ends')"
+    ui_two "  $(ui_item2 2 'Peer connection' 'pairing')" "$(ui_item2 7 'Recovery history')"
+    ui_two "  $(ui_item2 3 'Shared logs')" "$(ui_item2 8 'API settings')"
+    ui_two "  $(ui_item2 4 'Tunnel health' 'both ends')" "$(ui_item2 9 'Sync settings')"
+    ui_two "  $(ui_item2 5 'Traffic status')" "$(ui_item2 10 "$(sync_running && echo Disable || echo Enable)" 'node sync')"
+    echo
+    echo -e "  ${C_Y}${C_BOLD}0${C_N} back"
+    echo
+    case "$(menu_ask 'Choice')" in
+      1) "$BIN" sync status | sync_pager; ui_pause ;;
+      2) sync_peers_menu ;;
+      3) sync_logs_menu ;;
+      4) "$BIN" sync health | sync_pager; ui_pause ;;
+      5) "$BIN" sync traffic | sync_pager; ui_pause ;;
+      6) pick_tunnel && { echo; "$BIN" sync diagnose "$PICKED"; }; ui_pause ;;
+      7) "$BIN" sync recovery | sync_pager
+         local r; r=$(ask "Clear the recovery limits of a tunnel? (its name, 'all', or empty)" "")
+         case "$r" in "") ;; all) "$BIN" sync recovery -reset ;; *) "$BIN" sync recovery -reset "$r" ;; esac
+         ui_pause ;;
+      8) sync_settings_menu "API settings" ;;
+      9) sync_settings_menu "Sync settings" ;;
+      10) if sync_running; then sync_disable; else sync_enable; fi; ui_pause ;;
+      0|__eof__) return ;;
+    esac
+  done
+}
+
 main_menu(){
   auto_apply_bundled
   install_command
@@ -4899,6 +5166,7 @@ main_menu(){
     ui_section TOOLS
     ui_item 4 "Health check" "BBR, ports, path MTU, versions, running cores"
     ui_item 6 "Share codes" "set up the other server, or move every tunnel, with one paste"
+    ui_item 7 "Node Sync" "$(sync_hint)"
     echo
     ui_section SYSTEM
     ui_item 5 "Update BrokenNode" "download the latest into this folder"
@@ -4913,6 +5181,7 @@ main_menu(){
       4) doctor; read -t 30 -rp "  ▶ press ENTER to continue... " _ ;;
       5) update_self ;;
       6) share_menu ;;
+      7) sync_menu ;;
       0|__eof__) echo; exit 0 ;;
       *) warn "Invalid." ;;
     esac
@@ -4948,8 +5217,10 @@ case "${1:-}" in
   backup) show_backup_code ;;
   uninstall|purge) uninstall_all ;;
   version) echo "BrokenNode manager v$VERSION" ;;
+  sync-join) need_root; shift; "$BIN" sync join "$@" && { sync_running || sync_enable; } ;;
+  sync) shift; exec "$BIN" sync "$@" ;;
   update) update_self ;;
   apply) need_root; auto_apply_bundled </dev/null; info "Core: $("$BIN" version 2>/dev/null | head -n 1)" ;;
   ""|menu) main_menu ;;
-  *) echo "usage: sudo bash $SELF [server|client|manage|import <code>|share <tunnel>|backup|transports|tune|restart-all|start-all|stop-all|doctor|update|apply|uninstall|version]"; exit 1 ;;
+  *) echo "usage: sudo bash $SELF [server|client|manage|import <code>|share <tunnel>|backup|sync ...|sync-join <code>|transports|tune|restart-all|start-all|stop-all|doctor|update|apply|uninstall|version]"; exit 1 ;;
 esac
