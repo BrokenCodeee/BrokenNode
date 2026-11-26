@@ -3,6 +3,36 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.26
+
+### Added
+- **Live charts in Live stats (8).** The page now opens on graphs of the
+  last minutes, one value a second: the tunnel's download and upload, its
+  connections and links, the server's CPU, the tunnel's own CPU, RAM (and
+  swap), the load, the network card's receive and send, and the disk's
+  reads and writes, each with its current value, peak and average, and a
+  hardware line (CPU model and clock, cores, RAM, disk space, temperature
+  where the server reports one, uptime). Two charts a row on a wide window,
+  one on a narrow one; the charts grow with the window. Press **c** to
+  switch to the exact numbers and back; any other key returns.
+
+### Removed
+- **Node Sync is gone,** with "Both servers" (20-24) on the tunnel page and
+  `BrokenNode sync` / `sync-join`. Updating stops and removes its service
+  (`brokennode-sync`) and its stored logs; the tunnels are not touched.
+  Recovery stays with each server's own health check, which never depended
+  on the link between the two.
+
+### Fixed
+- **A tunnel moved to gre (or ipip, udp, icmp, tcptun) kept its proxy
+  setting.** The proxy only runs on the stream transports, so it never
+  worked there, the list still said "proxy" — and the core refuses such a
+  config at start, so the tunnel would not have come back after its next
+  restart (an update, a reboot, a recovery). Changing the transport now
+  removes the proxy and says so, the list and the tunnel's page no longer
+  show "proxy" on these transports, and opening the menu repairs a config
+  left that way by an older release.
+
 ## 2.8.25
 
 ### Fixed
