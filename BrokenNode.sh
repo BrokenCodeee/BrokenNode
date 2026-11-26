@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.28"
+VERSION="2.8.29"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -1572,9 +1572,12 @@ carrier = "in UDP" if t in ("gre", "gretap", "ipip", "sit") and c.get("fou_port"
 # A proxy only runs on a stream transport: a leftover setting on gre is not one.
 socks = (c.get("socks") or "") if stream else ""
 enc = c.get("encryption") or ("-" if not stream else "aead")
+# No field may be empty: read with IFS=tab merges two tabs in a row, and the
+# field after an empty one took its place ("in UDP" read as the proxy: the
+# list said "gre · proxy" for a gre-in-UDP tunnel). "-" stands for none.
 print("\t".join([c.get("mode") or "?", t, enc, "direct" if direct else "reverse",
                  "listen" if listens else "dial", peer, " · ".join(ports) or "-", str(len(ports)),
-                 socks, carrier]))
+                 socks or "-", carrier or "-"]))
 PYEOF
 }
 
@@ -1673,6 +1676,7 @@ list_tunnels(){
     n="$(basename "$f" .json)"; i=$((i+1)); TUNNELS+=("$n")
     local mode tr enc dir how peer ports np socks car
     IFS=$'\t' read -r mode tr enc dir how peer ports np socks car < <(cfg_info "$f")
+    [ "$socks" = - ] && socks=""; [ "$car" = - ] && car=""
     tunnel_state "$n"
     local users="—" conns="—" traffic="—" ping="—"
     if [ "${#LV[@]}" -gt 0 ]; then
@@ -1785,6 +1789,7 @@ tunnel_card(){
   local n="$1" f="$CFG_DIR/$1.json" now; now=$(date +%s)
   local mode tr enc dir how peer ports np socks car
   IFS=$'\t' read -r mode tr enc dir how peer ports np socks car < <(cfg_info "$f")
+  [ "$socks" = - ] && socks=""; [ "$car" = - ] && car=""
   tunnel_state "$n"
   local role="Iran relay"; [ "$mode" = client ] && role="foreign end"
   local bar="${C_D}│${C_N}"
@@ -1864,6 +1869,7 @@ tunnel_menu(){
   local n="$1" f="$CFG_DIR/$1.json"
   local mode tr enc dir how peer ports np socks car
   IFS=$'\t' read -r mode tr enc dir how peer ports np socks car < <(cfg_info "$f")
+  [ "$socks" = - ] && socks=""; [ "$car" = - ] && car=""
   echo
   ui_two "$(ui_section RUN)" "$(ui_section 'WATCH & TEST')"
   ui_two "  $(ui_item2 1 Start)"   "$(ui_item2 4 'Logs' 'both servers · diagnose')"

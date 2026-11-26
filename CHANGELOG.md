@@ -3,6 +3,16 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.29
+
+### Fixed
+- **A gre (or ipip, sit) tunnel inside UDP was listed as "gre · proxy".**
+  It has no proxy: the menu reads a tunnel's details as tab-separated
+  fields, and an empty one (no proxy) let the next one ("in UDP") take its
+  place. The list, the tunnel's card and its page now say "gre · in UDP".
+  Nothing in the tunnel's settings was wrong, and nothing changes in how it
+  runs.
+
 ## 2.8.28
 
 ### Changed
