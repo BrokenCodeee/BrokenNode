@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.26"
+VERSION="2.8.27"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -1701,7 +1701,7 @@ list_tunnels(){
 
 # dashboard — the main menu's summary of every tunnel on this server.
 dashboard(){
-  local f n up=0 down=0 stopped=0 users=0 conns=0 tu=0 td=0 vbad=0 total=0
+  local f n up=0 down=0 stopped=0 users=0 conns=0 tu=0 td=0 au=0 ad=0 vbad=0 total=0
   for f in "$CFG_DIR"/*.json; do
     [ -e "$f" ] || continue
     n="$(basename "$f" .json)"; total=$((total+1))
@@ -1711,6 +1711,7 @@ dashboard(){
       local u c t d; read -r u c t d < <(users_of)
       users=$((users+u)); conns=$((conns+c))
       tu=$((tu + $(lvn up))); td=$((td + $(lvn down)))
+      au=$((au + $(lvn life_up))); ad=$((ad + $(lvn life_down)))
       local pv="${LV[peer_version]:-}"
       [ -n "$pv" ] && [ "$pv" != "${LV[version]:-}" ] && vbad=$((vbad+1))
     fi
@@ -1728,6 +1729,8 @@ dashboard(){
   printf '%s' "$(ui_pad "  ${C_D}this run${C_N}  ↑ ${C_W}$(hbs "$tu")${C_N}  ↓ ${C_W}$(hbs "$td")${C_N}" 44)"
   if [ "$vbad" -gt 0 ]; then echo -e "${C_Y}▲ $vbad tunnel(s): other server on another release${C_N}"
   else echo -e "${C_G}✔${C_N} other servers: same release"; fi
+  # Kept across restarts and updates (the core's saved totals).
+  [ $(( au + ad )) -gt 0 ] && echo -e "  ${C_D}all time${C_N}  ↑ ${C_W}$(hbs "$au")${C_N}  ↓ ${C_W}$(hbs "$ad")${C_N}  ${C_D}(every run of the running tunnels)${C_N}"
 }
 
 # down_alerts — one line for each tunnel that should run and does not.
@@ -1834,10 +1837,18 @@ tunnel_card(){
   local sp; sp="$(speed_now "$n")"
   [ -n "$sp" ] && echo -e "  $bar $(ui_pad speed 10)${C_W}$sp${C_N}"
   echo -e "  $bar $(ui_pad traffic 10)↑ ${C_W}$(hbs "$(lvn up)")${C_N}  ↓ ${C_W}$(hbs "$(lvn down)")${C_N} ${C_D}this run${C_N}"
-  if [ -n "${LV[life_up]:-}" ] && [ "${LV[src]:-}" != dev ]; then
-    echo -e "  $bar $(ui_pad '' 10)↑ $(hbs "$(lvn life_up)")  ↓ $(hbs "$(lvn life_down)") ${C_D}all time${C_N}"
+  if [ -n "${LV[life_up]:-}" ]; then
+    local since=""; [ -n "${LV[life_since]:-}" ] && since=" since $(date -d "@${LV[life_since]}" '+%Y-%m-%d' 2>/dev/null)"
+    echo -e "  $bar $(ui_pad '' 10)↑ ${C_W}$(hbs "$(lvn life_up)")${C_N}  ↓ ${C_W}$(hbs "$(lvn life_down)")${C_N} ${C_D}all time${since} · ${LV[runs]:-1} run(s), kept across restarts and updates${C_N}"
   fi
   echo -e "  $bar $(ui_pad running 10)$(hdur $(( now - $(lvn started) )))   ${C_D}core ${LV[version]:-?} · pid ${LV[pid]:-?}${C_N}"
+  local ol; ol="$(both_line "$n")"
+  if [ -n "$ol" ]; then
+    local first=1 l
+    while IFS= read -r l; do
+      if [ "$first" = 1 ]; then echo -e "  $bar $(ui_pad 'other end' 10)$l"; first=0; else echo -e "  $bar $(ui_pad '' 10)$l"; fi
+    done <<<"$ol"
+  fi
   echo -e "  ${C_D}└$(printf '%*s' 70 '' | sed 's/ /─/g')${C_N}"
   local pls; pls="$(port_lines)"
   if [ -n "$pls" ]; then
@@ -1868,6 +1879,11 @@ tunnel_menu(){
   echo "  $(ui_item2 14 Encryption "$enc")"
   echo "  $(ui_item2 16 Preset 'Optimized · High-Speed · Stable · Low-Latency · Eco')"
   echo "  $(ui_item2 17 Port-forwards "$np port(s)")"
+  echo
+  local lk="${C_R}not linked${C_N}"; sync_running && lk="${C_G}linked by the tunnel's token${C_N}"
+  ui_section "BOTH SERVERS  ${C_D}(${C_N}$lk${C_D})${C_N}"
+  ui_two "  $(ui_item2 20 'Logs of both servers')" "$(ui_item2 22 'Diagnose from both ends')"
+  ui_two "  $(ui_item2 21 'Both ends now')" "$(ui_item2 23 'Recovery history')"
   echo
   echo -e "  ${C_Y}${C_BOLD}0${C_N} back"
 }
@@ -2008,8 +2024,9 @@ ls_frame(){
   out+="    ↓ download   $(ls_rate "$ddn" "$cdt_ns")   ${C_D}+$(num "$ddn") B${C_N}\n"
   out+="    ↑ upload     $(ls_rate "$dup" "$cdt_ns")   ${C_D}+$(num "$dup") B${C_N}\n"
   out+="    this run     ↓ $(ls_bytes "${LSC[l_down]:-0}")   ↑ $(ls_bytes "${LSC[l_up]:-0}")\n"
-  if [ -n "${LSC[l_life_up]:-}" ] && [ "${LSC[l_src]:-}" != dev ]; then
-    out+="    all time     ↓ $(ls_bytes "${LSC[l_life_down]:-0}")   ↑ $(ls_bytes "${LSC[l_life_up]:-0}")   ${C_D}(every run, kept across restarts)${C_N}\n"
+  if [ -n "${LSC[l_life_up]:-}" ]; then
+    out+="    all time     ↓ $(ls_bytes "${LSC[l_life_down]:-0}")   ↑ $(ls_bytes "${LSC[l_life_up]:-0}")   ${C_D}(${LSC[l_runs]:-1} run(s), kept across restarts and updates)${C_N}\n"
+    [ -n "${LSC[l_life_peak]:-}" ] && [ "${LSC[l_src]:-}" != dev ] && out+="                 most at once $(num "${LSC[l_life_peak]}") · $(num "${LSC[l_life_conns]:-0}") connections opened, over every run\n"
   fi
   # Connections.
   local u c t d; read -r u c t d < <(users_of)
@@ -2063,6 +2080,8 @@ ls_frame(){
     out+="                 packets/s ↓ $(ls_per "$(ls_d i_rx_packets)" "$dt_ns") ↑ $(ls_per "$(ls_d i_tx_packets)" "$dt_ns") · dropped rx $(num "${LSC[i_rx_dropped]}") tx $(num "${LSC[i_tx_dropped]}") · errors rx $(num "${LSC[i_rx_errors]}") tx $(num "${LSC[i_tx_errors]}")\n"
   fi
   out+="    sockets      TCP $(num "${LSC[s_tcp]:-0}") in use ($(num "${LSC[s_tw]:-0}") closing) · UDP $(num "${LSC[s_udp]:-0}") · conntrack $(num "${LSC[ct]}") of $(num "${LSC[ctmax]}")\n"
+  local ol; ol="$(both_line "$n")"
+  [ -n "$ol" ] && out+="    ${C_B}${C_BOLD}OTHER END${C_N}\n$(printf '%s\n' "$ol" | sed 's/^/    /')\n"
   printf '%b' "$out"
 }
 
@@ -2174,6 +2193,23 @@ ls_chart(){
   }'
 }
 
+# ls_hist NAME FIELD N — the core's saved last 24 hours (a line a minute,
+# /var/lib/brokennode/NAME.hist) as N values, oldest first: the average
+# bytes per second in each slice for "up"/"down", the most at once for
+# "conns". Kept across restarts and updates; empty slices are 0.
+ls_hist(){
+  local hf="${HIST_DIR:-/var/lib/brokennode}/$1.hist"
+  [ -r "$hf" ] || { printf '0'; return; }
+  LC_ALL=C awk -v fld="$2" -v n="$3" -v now="$(( $(date +%s) / 60 ))" '
+    BEGIN{ c=(fld=="up")?2:(fld=="down")?3:4; span=1440 }
+    /^#/ {next}
+    { m=$1+0; if(m<=now-span || m>now) next
+      b=int((m-(now-span)-1)*n/span); if(b<0)b=0; if(b>=n)b=n-1
+      if(c==4){ if($c+0>v[b]) v[b]=$c+0 } else v[b]+=$c }
+    END{ secs=span*60/n
+      for(i=0;i<n;i++){ x=v[i]+0; if(c!=4) x=x/secs; printf "%s%d", (i?" ":""), x } }' "$hf"
+}
+
 # ls_hw — the hardware, one line: CPU model and clock, cores, RAM, disk,
 # temperature, uptime.
 ls_hw(){
@@ -2222,11 +2258,15 @@ ls_charts(){
   local T=load S=""
   [ "${LSC[l_links]:--1}" != -1 ] && T=links
   if [ "${LSC[m_SwapTotal]:-0}" -gt 0 ]; then S=swap; elif [ "$T" = links ]; then S=load; fi
-  local -a L=(dl ul conn "$T" scpu pcpu ram "$S")
+  local -a L=(dl ul h_dl h_ul conn "$T" scpu pcpu ram "$S")
   [ -n "${LSC[ifc]:-}" ] && L+=(nrx ntx)
   [ -n "${LSC[k_rd]:-}" ] && L+=(drd dwr)
   local e two=0 pw; if [ "$cols" -ge 100 ]; then two=1; pw=$(( (cols - 7) / 2 )); else pw=$(( cols - 5 )); fi
   [ "$pw" -gt 90 ] && pw=90
+  local bw=$(( pw - 9 )); [ "$bw" -lt 4 ] && bw=4
+  local slice=$(( 1440 / bw )); [ "$slice" -lt 1 ] && slice=1
+  local -A LH=(); LH[h_dl]="$(ls_hist "$n" down "$bw")"; LH[h_ul]="$(ls_hist "$n" up "$bw")"
+  K[h_dl]="rate|↓ Last 24 h download (${slice} min a bar)|${C_G}"; K[h_ul]="rate|↑ Last 24 h upload|${C_B}"
   local -a L2=(); for e in "${L[@]}"; do [ -n "$e" ] && L2+=("$e"); done
   [ "$two" = 1 ] || L=("${L2[@]}")
   local nrow=${#L2[@]}; [ "$two" = 1 ] && nrow=$(( (${#L[@]} + 1) / 2 ))
@@ -2242,10 +2282,10 @@ ls_charts(){
     [ -z "$k1" ] && { k1="$k2"; k2=""; }
     [ -z "$k1" ] && continue
     IFS='|' read -r kind title col <<<"${K[$k1]}"
-    A="$(ls_chart "$kind" "$title" "$col" "$h" "$pw" ${LSH[$k1]:-0})"
+    A="$(ls_chart "$kind" "$title" "$col" "$h" "$pw" ${LH[$k1]:-${LSH[$k1]:-0}})"
     if [ -n "$k2" ]; then
       IFS='|' read -r kind title col <<<"${K[$k2]}"
-      B="$(ls_chart "$kind" "$title" "$col" "$h" "$pw" ${LSH[$k2]:-0})"
+      B="$(ls_chart "$kind" "$title" "$col" "$h" "$pw" ${LH[$k2]:-${LSH[$k2]:-0}})"
       paste -d $'\034' <(printf '%s\n' "$A") <(printf '%s\n' "$B") | sed $'s/^/    /; s/\034/   /'
     else
       printf '%s\n' "$A" | sed 's/^/    /'
@@ -3587,6 +3627,13 @@ manage_tunnels(){
         16) apply_preset "$n"; ui_pause;;
         17) manage_ports "$n"; ui_pause;;
         18) diagnose "$n"; ui_pause;;
+        20) need_link && both_logs "$n" || ui_pause;;
+        21) if need_link; then { "$BIN" sync health -tunnel "$n"; echo; "$BIN" sync traffic -tunnel "$n"; } | sync_log_colors | sync_pager; fi; ui_pause;;
+        22) if need_link; then echo; "$BIN" sync diagnose "$n" | sync_log_colors; fi; ui_pause;;
+        23) if need_link; then "$BIN" sync recovery -tunnel "$n"
+              local rr; rr=$(ask "Clear this tunnel's recovery limits? (y/n)" "n")
+              [ "$rr" = y ] && "$BIN" sync recovery -reset "$n"
+            fi; ui_pause;;
         19) SHARE_PUB=""; show_pair_code "$n" 1; read -rp "  ▶ press ENTER to continue... " _;;
         __eof__) return;;
         0) break;;
@@ -4608,6 +4655,7 @@ WantedBy=timers.target
 EOF
   systemctl daemon-reload 2>/dev/null
   systemctl enable --now brokennode-health.timer >/dev/null 2>&1
+  sync_auto
 }
 
 # health_check is the timer's body. It must stand alone (it is copied into
@@ -4624,7 +4672,13 @@ EOF
 # links up ("· N link(s) left", N > 0) is a healthy multi-link tunnel shedding
 # one link, not an outage. A fresh start gets 3 minutes to connect first.
 health_check(){
-  local f n st now started inv last ts
+  local f n st now started inv last ts syncrec=0
+  # The link between the servers, when it runs with recovery on, restarts
+  # tunnels itself — with limits and backoff, after asking the other server:
+  # two restarters would fight. This then only cleans up.
+  if [ -f /run/brokennode/sync-recovery ] && kill -0 "$(cat /run/brokennode/sync-recovery 2>/dev/null)" 2>/dev/null; then
+    syncrec=1
+  fi
   now="$(date +%s)"
   for f in "$CFG_DIR"/*.json; do
     [ -e "$f" ] || continue
@@ -4634,10 +4688,12 @@ health_check(){
     case "$st" in
       active) : ;;
       activating|reloading|deactivating) continue ;;   # systemd is already on it
-      *) logger -t brokennode-health "restarting brokennode@$n (state: $st)" 2>/dev/null
+      *) [ "$syncrec" = 1 ] && continue
+         logger -t brokennode-health "restarting brokennode@$n (state: $st)" 2>/dev/null
          systemctl restart "brokennode@$n" 2>/dev/null
          continue ;;
     esac
+    [ "$syncrec" = 1 ] && continue
     started="$(date -d "$(systemctl show -p ActiveEnterTimestamp --value "brokennode@$n" 2>/dev/null)" +%s 2>/dev/null)"
     case "$started" in ''|*[!0-9]*) started=0 ;; esac
     [ $((now - started)) -lt 180 ] && continue
@@ -4674,7 +4730,7 @@ running_cores(){
     exe="$(readlink "$p/exe" 2>/dev/null)" || continue
     case "${exe##*/}" in brokennode|brokennode\ *|brokennode.new*|brokennode-linux-*) ;; *) continue ;; esac
     v="$("$p/exe" version 2>/dev/null | sed -n 's/.* v\{0,1\}\([0-9][0-9.]*\)$/\1/p' | head -n 1)"
-    unit="$(grep -o 'brokennode@[^/]*\.service' "$p/cgroup" 2>/dev/null | head -n 1)"
+    unit="$(grep -o 'brokennode@[^/]*\.service\|brokennode-sync\.service' "$p/cgroup" 2>/dev/null | head -n 1)"
     echo "${p#/proc/} ${v:-?} ${unit:--}"
   done
 }
@@ -4722,6 +4778,10 @@ restart_all_tunnels(){
     local st; st="$(systemctl is-active "brokennode@$n" 2>/dev/null)"
     [ "$st" = active ] && info "restarted brokennode@$n (${C_G}active${C_N})" || err "brokennode@$n -> $st"
   done
+  # The link between the servers runs the core too: onto the new one.
+  if systemctl is-active brokennode-sync >/dev/null 2>&1; then
+    systemctl restart brokennode-sync && info "restarted the link between the servers (${C_G}active${C_N})"
+  fi
   [ "$any" = 0 ] && warn "No tunnels configured yet."
 }
 
@@ -4764,7 +4824,7 @@ auto_apply_bundled(){
   [ "$(id -u)" -eq 0 ] || return 0
   auto_tune_once
   fix_stray_proxy
-  remove_node_sync
+  sync_auto
   local src; src="$(detect_bin)"
   [ -n "$src" ] && [ -f "$src" ] || return 0
   if bundled_is_older "$src"; then
@@ -5170,20 +5230,123 @@ remove_command(){
 
 sweep_temp(){ rm -f "$CFG_DIR"/.tune-*.json "$CFG_DIR"/.undo-*.json "$CFG_DIR"/.pair-*.json "$CFG_DIR"/.check-*.json 2>/dev/null; rm -rf "$CFG_DIR"/.import.* 2>/dev/null; }
 
-# remove_node_sync — node sync (2.8.24-2.8.25) is gone: on a server that had
-# it on, its service, its state and its control files go too. Nothing else
-# of BrokenNode used them; the tunnels never depended on it.
-remove_node_sync(){
-  [ "$(id -u)" -eq 0 ] || return 0
-  local svc=/etc/systemd/system/brokennode-sync.service any=0
-  if [ -f "$svc" ] || systemctl is-active brokennode-sync >/dev/null 2>&1; then
-    systemctl disable --now brokennode-sync >/dev/null 2>&1
-    rm -f "$svc"; systemctl daemon-reload >/dev/null 2>&1; any=1
-  fi
-  [ -d /var/lib/brokennode/sync ] && { rm -rf /var/lib/brokennode/sync; any=1; }
-  rm -f /run/brokennode/sync.sock /run/brokennode/sync-recovery
-  [ "$any" = 1 ] && info "Node sync is removed (its service and logs); the tunnels are untouched."
+# ============================================================================
+#  Both servers — the two servers of a tunnel share its logs and state, look
+#  into its problems from both ends and restart what should run. It is the
+#  core's own `brokennode sync` (brokennode-sync.service), a connection of its
+#  own: never on a user's packet path; the tunnels work the same without it.
+#  Nothing is set up by hand: each tunnel's token links its two servers (the
+#  foreign end connects to the Iran server on TCP 9443).
+# ============================================================================
+SYNC_SVC=/etc/systemd/system/brokennode-sync.service
+
+sync_supported(){ [ -x "$BIN" ] && "$BIN" sync version >/dev/null 2>&1; }
+sync_running(){ systemctl is-active brokennode-sync >/dev/null 2>&1; }
+
+write_sync_unit(){
+  local want
+  want="$(cat <<EOF
+[Unit]
+Description=BrokenNode: both servers of each tunnel share logs, state and diagnosis
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=$BIN sync run
+Restart=always
+RestartSec=5
+# Kept small on purpose: it must never take what the tunnels need.
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=25%
+MemoryMax=192M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target
+EOF
+)"
+  [ "$(cat "$SYNC_SVC" 2>/dev/null)" = "$want" ] && return 1
+  printf '%s\n' "$want" > "$SYNC_SVC"
+  systemctl daemon-reload 2>/dev/null
   return 0
+}
+
+# sync_auto — keep the link between the servers running while there are
+# tunnels (on every start of the menu, after a tunnel is made or imported).
+sync_auto(){
+  [ "$(id -u)" -eq 0 ] || return 0
+  sync_supported || return 0
+  local any=0 f
+  for f in "$CFG_DIR"/*.json; do [ -e "$f" ] && { any=1; break; }; done
+  if [ "$any" = 0 ]; then
+    systemctl disable --now brokennode-sync >/dev/null 2>&1
+    return 0
+  fi
+  if write_sync_unit; then
+    systemctl enable brokennode-sync >/dev/null 2>&1
+    systemctl restart brokennode-sync >/dev/null 2>&1
+  elif ! sync_running; then
+    systemctl enable --now brokennode-sync >/dev/null 2>&1
+  fi
+  return 0
+}
+
+# sync_pager — long output, page by page when it is longer than the screen.
+sync_pager(){ if [ -t 1 ] && command -v less >/dev/null 2>&1; then less -R -F -X; else cat; fi; }
+
+# sync_log_colors — the severity in colour.
+sync_log_colors(){
+  sed -e "s/\[ERROR\]/$(printf '\033[0;31m')[ERROR]$(printf '\033[0m')/" \
+      -e "s/\[WARNING\]/$(printf '\033[1;33m')[WARNING]$(printf '\033[0m')/" \
+      -e "s/(remote)/$(printf '\033[0;90m')(remote)$(printf '\033[0m')/"
+}
+
+# both_line NAME — the other end of tunnel NAME, as the other server says
+# (or why it says nothing).
+both_line(){
+  sync_supported || return 0
+  local node ok rest any=0
+  while IFS=$'\t' read -r node ok rest; do
+    [ -n "$node" ] || continue
+    any=1
+    local c="$C_G"; [ "$ok" = ok ] || c="$C_R"
+    printf '%b\n' "${C_W}$node${C_N}  ${c}${rest}${C_N}"
+  done < <("$BIN" sync health -tunnel "$1" -brief 2>/dev/null)
+  if [ "$any" = 0 ]; then
+    if sync_running; then echo -e "${C_D}the other server has not answered yet (it needs this release; the foreign one connects to the Iran one on TCP 9443)${C_N}"
+    else echo -e "${C_D}the link between the servers is not running (it starts with the menu)${C_N}"; fi
+  fi
+}
+
+# both_logs NAME — this tunnel's events on both servers.
+both_logs(){
+  local n="$1"
+  while true; do
+    banner; ui_crumb "Manage tunnels" "$n" "Logs of both servers"; echo
+    ui_item 1 "All events" "both servers, in time order"
+    ui_item 2 "Problems only" "warnings and errors"
+    ui_item 3 "Follow live" "as it happens (Ctrl+C = back)"
+    ui_item 0 "Back"
+    echo
+    case "$(menu_ask 'Choice')" in
+      1) "$BIN" sync logs -tunnel "$n" -n 400 | sync_log_colors | sync_pager; ui_pause ;;
+      2) "$BIN" sync logs -tunnel "$n" -view errors -n 400 | sync_log_colors | sync_pager; ui_pause ;;
+      3) trap ':' INT; "$BIN" sync logs -tunnel "$n" -n 30 -f | sync_log_colors; trap - INT ;;
+      0|__eof__) return ;;
+    esac
+  done
+}
+
+# need_link — the both-servers options need the link; it starts by itself.
+need_link(){
+  if ! sync_supported; then err "This core cannot do this: update BrokenNode on BOTH servers."; return 1; fi
+  sync_running || sync_auto
+  if ! sync_running; then
+    err "The link between the servers did not start: journalctl -u brokennode-sync -n 30"
+    return 1
+  fi
 }
 
 main_menu(){
@@ -5259,5 +5422,6 @@ case "${1:-}" in
   update) update_self ;;
   apply) need_root; auto_apply_bundled </dev/null; info "Core: $("$BIN" version 2>/dev/null | head -n 1)" ;;
   ""|menu) main_menu ;;
-  *) echo "usage: sudo bash $SELF [server|client|manage|import <code>|share <tunnel>|backup|transports|tune|restart-all|start-all|stop-all|doctor|update|apply|uninstall|version]"; exit 1 ;;
+  sync) shift; exec "$BIN" sync "$@" ;;
+  *) echo "usage: sudo bash $SELF [server|client|manage|import <code>|share <tunnel>|backup|sync ...|transports|tune|restart-all|start-all|stop-all|doctor|update|apply|uninstall|version]"; exit 1 ;;
 esac

@@ -3,6 +3,31 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.27
+
+### Changed
+- **Both servers is back on every tunnel's page, with nothing to set up.**
+  20 logs of both servers, 21 both ends now, 22 diagnose from both ends,
+  23 recovery history, and the tunnel's card shows the other end. There is
+  no pairing and no "Link the two servers" any more: each tunnel's token
+  links its two servers by itself. The foreign server connects to the Iran
+  server on TCP 9443; the key that signs every message and the Iran
+  server's certificate both come from the token, which never leaves either
+  server. Update **both** servers; the Iran server's TCP 9443 must accept
+  the foreign server (most servers have no firewall in the way).
+
+### Fixed
+- **Traffic totals and other numbers no longer start again from zero after a
+  restart or an update.** A gre (or other kernel or packet) tunnel counts on
+  its network device, whose counters start over with every run, and those
+  never reached the saved totals; the foreign server saved none at all. Now
+  every tunnel, on both servers, keeps: the bytes up and down over every
+  run, the most connections at once, the connections opened, the number of
+  runs and since when — shown on the tunnel's card, on the main screen and
+  in Live stats.
+- **Live stats charts the last 24 hours** (download and upload a bar for a
+  few minutes), kept across restarts and updates.
+
 ## 2.8.26
 
 ### Added

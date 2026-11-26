@@ -328,9 +328,17 @@ Both servers need 2.3.9 or newer. On point-to-point tunnels it can also test
 and the highest rate with at most 2% loss, each way (both servers 2.8.18 or
 newer).
 
-**Live stats** (→ 8) shows the speed right now, the peak, a 40-second
-history, the links that are up and the users connected, on both servers and for
-every transport. It updates in place once a second; any key goes back.
+**Live stats** (→ 8) opens on live charts: the tunnel's download and upload,
+connections, the server's CPU, RAM, network card and disk, and the last 24
+hours of traffic, with the hardware on one line. Press `c` for the exact
+numbers; any other key goes back. Traffic totals are kept across restarts and
+updates, on both servers and for every transport.
+
+**Both servers** (→ 20–23 on a tunnel's page): the logs of both servers in
+time order, both ends' state, a diagnosis from both ends and the recovery
+history. Nothing to set up: the tunnel's token links its two servers. The
+foreign server connects to the Iran server on **TCP 9443** — if the Iran
+server has a firewall, allow that port for the foreign server's IP.
 
 **Tunnel connected and speed test fine, but users get nothing?** The speed
 test does not pass through your forwarded ports, so it cannot see this. Run
