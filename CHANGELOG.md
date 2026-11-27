@@ -3,6 +3,60 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.32
+
+### Changed
+- **The two servers of a tunnel talk through the tunnel itself.** Their
+  shared logs, state, diagnosis and recovery no longer use a port of their
+  own: nothing listens on TCP 9443 any more, on either server, and there is
+  nothing to open in a firewall. The Iran server opens the link through the
+  tunnel (a stream of the tunnel for tcp, mtcp, ws, kcp, tcpnomux…; the
+  foreign end's tunnel address for gre, ipip, udp, icmp, tcptun…). With
+  several tunnels between the same two servers each one carries the link,
+  so the other server stays in view while any of them works. **Update both servers**: with one end older the
+  tunnel works as before, only the other end's logs and state do not show.
+- **The API sends instead of listening.** One setting: your bot's or site's
+  URL (menu 8). The Iran server sends every event as it happens and the
+  whole state every 10 seconds (every tunnel's users, connections, ping,
+  loss, speed, traffic this run and over every run, the last 60 minutes, the
+  other end's state; this server's CPU, load and memory), each request
+  signed. No port is opened, no key to keep, nothing can be asked or changed
+  through it; no token, password or IP address is in it. The API key and the
+  read routes of 2.8.31 are gone.
+- The path speed test (15) opens a TCP port only while it runs (9443 if it
+  is free) and closes it right after.
+
+### Fixed
+- **"health check failed: packet loss 20%" every hour or so on a good
+  path.** The check sent 5 pings, so one lost ping was 20%: enough to warn.
+  It now sends 10, and warns only when two checks in a row see the loss.
+- **"its IP may have changed" on an IPv6 server whose IP had not.** An IPv6
+  address was cut at its last colon (2a0d:…::2 read as 2a0d:…:) and
+  compared with the config. The check is gone with the old port it came from.
+- **"the two ends disagree: core release differs" again after every restart
+  of the sync service** (the API menu restarted it on each change). A
+  difference is said once, and the menu no longer restarts anything.
+- **An sctp relay could crash** when a foreign end's connection was gone
+  by the time it was accepted (a dial retried at once): the library returned
+  no address for it, and printing that took the relay down. It is now
+  named "peer-gone" and the connection is dropped like any failed one.
+
+### فارسی
+- **دو سرور یک تانل از داخل خود تانل با هم حرف می‌زنند.** لاگ مشترک، وضعیت،
+  عیب‌یابی و بازیابی دیگر پورت جداگانه ندارند: روی هیچ‌کدام از دو سرور چیزی روی
+  TCP 9443 گوش نمی‌دهد و چیزی برای باز کردن در فایروال نیست. اگر چند تانل بین همان
+  دو سرور باشد، همه ارتباط را می‌برند و تا وقتی یکی کار کند سرور دیگر دیده می‌شود. **هر دو
+  سرور را به‌روز کنید**؛ اگر یک سر قدیمی بماند تانل مثل قبل کار می‌کند و فقط لاگ و
+  وضعیت سر دیگر نمی‌آید.
+- **API به‌جای گوش دادن، می‌فرستد.** فقط یک تنظیم: آدرس ربات یا سایت (منوی ۸).
+  سرور ایران هر رویداد را همان لحظه و کل وضعیت را هر ۱۰ ثانیه، امضاشده، می‌فرستد.
+  هیچ پورتی باز نمی‌شود، کلیدی برای نگه داشتن نیست و از طریق آن نمی‌شود چیزی پرسید
+  یا تغییر داد.
+- **هشدار «packet loss 20%» روی مسیر سالم** رفع شد: با ۵ پینگ، یک پینگ گم‌شده ۲۰٪
+  حساب می‌شد. حالا ۱۰ پینگ و فقط اگر دو بررسی پشت‌سرهم گم‌شدن ببینند.
+- **هشدار اشتباه «its IP may have changed» روی سرور IPv6** رفع شد.
+- **تکرار «core release differs» بعد از هر ری‌استارت** رفع شد.
+
 ## 2.8.31
 
 ### Added

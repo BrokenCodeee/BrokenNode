@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.31"
+VERSION="2.8.32"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -5279,10 +5279,10 @@ sweep_temp(){ rm -f "$CFG_DIR"/.tune-*.json "$CFG_DIR"/.undo-*.json "$CFG_DIR"/.
 # ============================================================================
 #  Both servers — the two servers of a tunnel share its logs and state, look
 #  into its problems from both ends and restart what should run. It is the
-#  core's own `brokennode sync` (brokennode-sync.service), a connection of its
-#  own: never on a user's packet path; the tunnels work the same without it.
-#  Nothing is set up by hand: each tunnel's token links its two servers (the
-#  foreign end connects to the Iran server on TCP 9443).
+#  core's own `brokennode sync` (brokennode-sync.service): never on a user's
+#  packet path; the tunnels work the same without it. Nothing is set up by
+#  hand: each tunnel's token links its two servers, through the tunnel itself
+#  (no port of its own on either server).
 # ============================================================================
 SYNC_SVC=/etc/systemd/system/brokennode-sync.service
 
@@ -5361,7 +5361,7 @@ both_line(){
     printf '%b\n' "${C_W}$node${C_N}  ${c}${rest}${C_N}"
   done < <("$BIN" sync health -tunnel "$1" -brief 2>/dev/null)
   if [ "$any" = 0 ]; then
-    if sync_running; then echo -e "${C_D}the other server has not answered yet (it needs this release; the foreign one connects to the Iran one on TCP 9443)${C_N}"
+    if sync_running; then echo -e "${C_D}the other server has not answered yet (both need 2.8.32 or newer; the link goes through the tunnel)${C_N}"
     else echo -e "${C_D}the link between the servers is not running (it starts with the menu)${C_N}"; fi
   fi
 }
@@ -5421,89 +5421,70 @@ need_link(){
 # ============================================================================
 api_hint(){
   sync_supported || { echo "needs this release's core"; return; }
-  local st; st="$("$BIN" sync api status 2>/dev/null | sed -n 's/^api *//p' | head -1)"
-  echo "${st:-off}"
+  local u; u="$("$BIN" sync api status 2>/dev/null | sed -n 's/^api *on: sends to \([^ ]*\).*/\1/p' | head -1)"
+  if [ -n "$u" ]; then echo "on → $u"; else echo "off"; fi
 }
 
 # api_out: indent the CLI's lines; fail when it did (its "rc=N" last line).
 api_out(){ local l rc=1; while IFS= read -r l; do case "$l" in rc=*) rc="${l#rc=}" ;; *) echo "  $l" ;; esac; done; [ "$rc" = 0 ]; }
 
-api_restart(){ sync_auto; systemctl restart brokennode-sync >/dev/null 2>&1; sleep 1; }
+# The daemon reads its settings every few seconds: nothing to restart. It
+# only has to run (sync_auto starts it while there are tunnels).
+api_apply(){ sync_auto; }
 
 api_menu(){
   if ! sync_supported; then err "This core has no API: update BrokenNode first."; ui_pause; return; fi
   while true; do
     banner; ui_crumb "API"; echo
-    echo -e "  ${C_D}Read-only: tunnels, users, traffic, 24-hour history, both servers' events.${C_N}"
-    echo -e "  ${C_D}Nothing can be changed through it. Iran server only.${C_N}"
+    echo -e "  ${C_D}This server sends, to your bot's or site's URL: every event as it happens,${C_N}"
+    echo -e "  ${C_D}and the whole state (tunnels, users, traffic, speed) every 10 seconds.${C_N}"
+    echo -e "  ${C_D}No port is opened and nothing can be changed through it. Iran server only.${C_N}"
     echo
     "$BIN" sync api status 2>&1 | sed 's/^/    /'
     echo
-    ui_item 1 "Turn on" "on this server only, or open to the Internet (https)"
+    ui_item 1 "Set the URL" "turns it on (or changes where it sends)"
     ui_item 2 "Turn off" ""
-    ui_item 3 "New API key" "the old one stops working"
-    ui_item 4 "Add a callback" "a URL every event is POSTed to"
-    ui_item 5 "Remove a callback" ""
-    ui_item 6 "Callback level" "info: everything · warning · error"
-    ui_item 7 "Test the callbacks" "sends a test event to each"
-    ui_item 8 "Callback secret" "to check the signature (X-BrokenNode-Signature)"
-    ui_item 9 "How to use it" "the endpoints, with examples"
+    ui_item 3 "Send a test" "a signed test event to the URL"
+    ui_item 4 "Signing secret" "your bot checks X-BrokenNode-Signature with it"
+    ui_item 5 "How to use it" "what is sent, with an example"
     ui_item 0 "Back"
     echo
     case "$(menu_ask 'Choice')" in
-      1) echo
-         ui_item 1 "This server only" "127.0.0.1:9444, http — a bot or site on this same server"
-         ui_item 2 "Open to the Internet" "0.0.0.0:9444, https (this server's own certificate)"
-         local w addr="127.0.0.1:9444"; w="$(menu_ask 'Choice')"
-         if [ "$w" = 2 ]; then
-           local port; port=$(ask "Port" "9444"); case "$port" in ''|*[!0-9]*) port=9444 ;; esac
-           addr="0.0.0.0:$port"
-           echo -e "  ${C_Y}Open TCP $port in this server's firewall for the bot's or the site's address only.${C_N}"
-         fi
-         { "$BIN" sync api enable "$addr" 2>&1; echo "rc=$?"; } | api_out && api_restart
+      1) local u; u=$(ask "Your bot's or site's URL (https://...)" "")
+         [ -n "$u" ] && { "$BIN" sync api url "$u" 2>&1; echo "rc=$?"; } | api_out && api_apply
          ui_pause ;;
-      2) "$BIN" sync api disable && api_restart && info "API off."; ui_pause ;;
-      3) "$BIN" sync api key 2>&1 | sed 's/^/  /'; api_restart; ui_pause ;;
-      4) local u; u=$(ask "Callback URL (https://...)" "")
-         [ -n "$u" ] && { "$BIN" sync api callback-add "$u" 2>&1; echo "rc=$?"; } | api_out && api_restart && info "Added."
-         ui_pause ;;
-      5) local u; u=$(ask "Callback URL to remove" "")
-         [ -n "$u" ] && { "$BIN" sync api callback-remove "$u" 2>&1; echo "rc=$?"; } | api_out && api_restart && info "Removed."
-         ui_pause ;;
-      6) local l; l=$(ask "Level (info, warning, error)" "info")
-         { "$BIN" sync api callback-level "$l" 2>&1; echo "rc=$?"; } | api_out && api_restart; ui_pause ;;
-      7) "$BIN" sync api test 2>&1 | sed 's/^/  /'; ui_pause ;;
-      8) echo; echo -e "  ${C_Y}Keep it secret: it proves a callback came from this server.${C_N}"
+      2) "$BIN" sync api off && info "API off."; ui_pause ;;
+      3) "$BIN" sync api test 2>&1 | sed 's/^/  /'; ui_pause ;;
+      4) echo; echo -e "  ${C_Y}Keep it secret: it proves a request came from this server.${C_N}"
          "$BIN" sync api secret 2>&1 | sed 's/^/  /'; ui_pause ;;
-      9) api_help; ui_pause ;;
+      5) api_help; ui_pause ;;
       0|__eof__) return ;;
     esac
   done
 }
 
 api_help(){
-  local a; a="$("$BIN" sync settings 2>/dev/null | sed -n 's/.*"api_listen": "\(.*\)".*/\1/p')"; a="${a:-127.0.0.1:9444}"
-  local sch=https; case "$a" in 127.*|localhost*) sch=http ;; esac
-  local k=""; [ "$sch" = https ] && k=" -k"
-  cat <<HELP
+  cat <<'HELP'
 
-  Every request carries the key:  Authorization: Bearer <key>   (or X-API-Key: <key>)
-  Only GET; anything else is refused. JSON.
+  Every request is a POST with a JSON body; X-BrokenNode-Kind says which:
 
-    GET /api/v1/ping                       no key: is it up
-    GET /api/v1/server                     this server: tunnels up/down, speed, load, memory
-    GET /api/v1/tunnels                    every tunnel: state, users, connections, speed,
-                                           ping, loss, this run and all-time traffic,
-                                           the other end's state
-    GET /api/v1/tunnels/NAME               one tunnel, with its last events
-    GET /api/v1/tunnels/NAME/history       the last 24 hours, a point a minute
-    GET /api/v1/events?limit=&since=&tunnel=&severity=   both servers' events
-    GET /api/v1/peers                      the other servers
+    event    as it happens: {"version":2,"kind":"event","server":"iran","time":...,
+             "event":{"type","severity","tunnel_name","transport","message","origin_name",...}}
+             severity: info · warning · error — alert on warning and error only.
+    status   every 10 s: {"version":2,"kind":"status","server":...,"system":{cpus, load,
+             cpu_percent, memory, uptime},"summary":{tunnels, up, down, users, connections,
+             rx_bps, tx_bps},"tunnels":[{name, transport, state, connected, healthy,
+             users, connections, ping_ms, loss_pct, rx_bps, tx_bps, rx_bytes, tx_bytes,
+             lifetime, other_end, history_60m, ...}],"other_servers":[...]}
 
-  e.g.  curl -s ${sch}://${a/0.0.0.0/THIS-SERVER-IP}/api/v1/tunnels -H "Authorization: Bearer \$KEY"${k}
+  Check each one: X-BrokenNode-Signature = "sha256=" +
+     HMAC-SHA256(secret, X-BrokenNode-Timestamp + "." + body), and the timestamp is recent.
 
-  Callbacks: each event is POSTed as {"version":1,"server":...,"event":{...}}.
-  X-BrokenNode-Signature = "sha256=" + HMAC-SHA256(secret, X-BrokenNode-Timestamp + "." + body)
+  Python:
+    mac = hmac.new(secret.encode(), ts.encode() + b"." + body, hashlib.sha256).hexdigest()
+    ok  = hmac.compare_digest("sha256=" + mac, sig) and abs(time.time() - int(ts)) < 300
+
+  Answer with 2xx. No token, password or IP address is ever in what is sent.
 HELP
 }
 
@@ -5528,7 +5509,7 @@ main_menu(){
     ui_section TOOLS
     ui_item 4 "Health check" "BBR, ports, path MTU, versions, running cores"
     ui_item 6 "Share codes" "set up the other server, or move every tunnel, with one paste"
-    ui_item 8 "API" "read-only, for a Telegram bot or a web site · $(api_hint)"
+    ui_item 8 "API" "for a Telegram bot or a web site · $(api_hint)"
     echo
     ui_section SYSTEM
     ui_item 5 "Update BrokenNode" "download the latest into this folder"
