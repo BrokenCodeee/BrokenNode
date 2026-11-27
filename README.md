@@ -394,6 +394,74 @@ already half a second late is dropped instead of delivered: measured with the
 same load, loss under 1% and ping 250 ms on tcp, 140 ms on mtcp, 97 ms on
 udp (80 ms path).
 
+## Read-only API (for a bot or a website)
+
+The Iran server can answer a small HTTP API, so a Telegram bot or a web page
+can show your tunnels and be told when something happens. It **only reads**:
+no request can create, delete, change, start, stop or restart anything —
+every method but GET and HEAD is refused (405), and there is no route that
+writes. It runs on the Iran server only: on a server that is the foreign end
+of any tunnel it does not start, and if such a tunnel is added later it stops
+answering (403). Off by default.
+
+Menu **8) API**, or the command line:
+
+```
+brokennode sync api enable              # 127.0.0.1:9444; prints the key once
+brokennode sync api enable 0.0.0.0:9444 # reachable from outside: HTTPS
+brokennode sync api status              # address, key date, callbacks, TLS pin
+brokennode sync api key                 # a new key (the old one stops working)
+brokennode sync api disable
+```
+
+**The key** is 32 random bytes (`bnk_…`), shown once when it is made. Only
+its SHA-256 is kept (`/var/lib/brokennode/sync/api.json`, mode 600); it is
+not in any config, log or response. Send it as `Authorization: Bearer KEY`
+or `X-API-Key: KEY`. Repeated wrong keys from one address are held off
+(429). On an address other than 127.0.0.1 the API is HTTPS with the server's
+own certificate: pin it with the SHA-256 `api status` prints.
+
+| GET | What |
+|---|---|
+| `/api/v1/ping` | `{"ok":true}`, no key (for a health check) |
+| `/api/v1/server` | this server: name, core version, CPU count, load, memory, uptime, tunnels up/down, total speed |
+| `/api/v1/tunnels` | every tunnel: transport, encryption, ports, service state, connected, healthy, links, ping, users, connections, speed (average of the last 5 s), this run's traffic, lifetime traffic, the other end's state |
+| `/api/v1/tunnels/NAME` | one tunnel (name or id), with its recent events |
+| `/api/v1/tunnels/NAME/history` | traffic per minute, last 24 h |
+| `/api/v1/events` | both servers' events; `?limit=`, `?since=UNIX_SECONDS`, `?tunnel=`, `?severity=warning` |
+| `/api/v1/peers` | the other servers linked to this one: name, version, online, last seen |
+
+Traffic, users and connections are read when the request comes; speed is
+the average over the monitor's last 5 seconds. No token, password or key is
+ever in a response.
+
+**Callbacks.** Each event (tunnel connected or disconnected, health failing
+or back, recovery, traffic started or stopped, the other server unreachable,
+a config change…) is POSTed as it happens to the URLs you add:
+
+```
+brokennode sync api callback-add https://bot.example.com/hook
+brokennode sync api callback-level warning   # info (default), warning, error
+brokennode sync api test                     # sends a signed test event
+brokennode sync api secret                   # the signing secret
+```
+
+Body: `{"version":1,"server":"iran","event":{"id","ts","type","severity","tunnel_name","transport","message",…}}`.
+Headers: `X-BrokenNode-Event`, `X-BrokenNode-Delivery` (the event id),
+`X-BrokenNode-Timestamp`, and `X-BrokenNode-Signature: sha256=HEX` —
+HMAC-SHA256 of `TIMESTAMP.BODY` with the secret. Check it, and reject an old
+timestamp. Python:
+
+```python
+import hmac, hashlib, time
+def valid(secret, ts, body, sig):
+    mac = hmac.new(secret.encode(), ts.encode() + b"." + body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest("sha256=" + mac, sig) and abs(time.time() - int(ts)) < 300
+```
+
+Sent from a queue, one at a time and in order, three tries (now, 5 s,
+30 s): a slow or dead URL never slows the tunnels.
+
 ## Security
 
 - The **token** is the pre-shared key. It authenticates the tunnel and derives
@@ -874,6 +942,64 @@ reality هر گواهی را می‌پذیرد)؛ همهٔ نسخه‌هایی �
 
 سوکت‌های UDP فورواردشده با DSCP EF و اولویت تعاملی علامت می‌خورند، پس یک دانلود
 از همان رله نمی‌تواند جلوی بازی در صف بایستد.
+
+## API فقط‌خواندنی (برای ربات یا وب‌سایت)
+
+سرور ایران می‌تواند یک API کوچک HTTP داشته باشد تا ربات تلگرام یا یک صفحهٔ
+وب تانل‌ها را نشان دهد و از رویدادها باخبر شود. **فقط می‌خواند**: هیچ
+درخواستی نمی‌تواند چیزی بسازد، حذف کند، تغییر دهد، روشن، خاموش یا ری‌استارت
+کند — هر متدی جز GET و HEAD رد می‌شود (405) و مسیری برای نوشتن وجود ندارد.
+فقط روی سرور ایران اجرا می‌شود: روی سروری که سرِ خارجِ هر تانلی باشد بالا
+نمی‌آید و اگر چنین تانلی بعداً اضافه شود جواب نمی‌دهد (403). پیش‌فرض خاموش.
+
+منوی **8) API** یا خط فرمان:
+
+```
+brokennode sync api enable              # 127.0.0.1:9444؛ کلید یک بار نشان داده می‌شود
+brokennode sync api enable 0.0.0.0:9444 # از بیرون: HTTPS
+brokennode sync api status              # آدرس، تاریخ کلید، callbackها، پین TLS
+brokennode sync api key                 # کلید تازه (قبلی دیگر کار نمی‌کند)
+brokennode sync api disable
+```
+
+**کلید** ۳۲ بایت تصادفی است (`bnk_…`) و فقط هنگام ساخت نشان داده می‌شود.
+فقط SHA-256 آن نگه داشته می‌شود (`/var/lib/brokennode/sync/api.json`، مجوز
+600)؛ در هیچ کانفیگ، لاگ یا پاسخی نیست. آن را با `Authorization: Bearer KEY`
+یا `X-API-Key: KEY` بفرستید. کلیدهای اشتباهِ پشت‌سرهم از یک آدرس متوقف
+می‌شوند (429). روی آدرسی غیر از 127.0.0.1، API با گواهی خود سرور HTTPS است:
+آن را با SHA-256ای که `api status` چاپ می‌کند پین کنید.
+
+| GET | چه چیزی |
+|---|---|
+| `/api/v1/ping` | `{"ok":true}`، بدون کلید (برای بررسی سلامت) |
+| `/api/v1/server` | این سرور: نام، نسخه، تعداد CPU، بار، حافظه، uptime، تانل‌های وصل/قطع، سرعت کل |
+| `/api/v1/tunnels` | همهٔ تانل‌ها: ترنسپورت، رمزنگاری، پورت‌ها، وضعیت سرویس، اتصال، سلامت، لینک‌ها، پینگ، کاربران، اتصال‌ها، سرعت (میانگین ۵ ثانیهٔ آخر)، ترافیک این اجرا، ترافیک کل، وضعیت سر دیگر |
+| `/api/v1/tunnels/NAME` | یک تانل (نام یا id) با رویدادهای اخیرش |
+| `/api/v1/tunnels/NAME/history` | ترافیک دقیقه‌به‌دقیقه، ۲۴ ساعت اخیر |
+| `/api/v1/events` | رویدادهای هر دو سرور؛ `?limit=`، `?since=UNIX_SECONDS`، `?tunnel=`، `?severity=warning` |
+| `/api/v1/peers` | سرورهای دیگرِ وصل به این سرور: نام، نسخه، آنلاین، آخرین دیده‌شدن |
+
+ترافیک، کاربران و اتصال‌ها همان لحظهٔ درخواست خوانده می‌شوند؛ سرعت میانگین
+۵ ثانیهٔ آخر است. هیچ توکن، رمز یا کلیدی در پاسخ‌ها نیست.
+
+**Callback.** هر رویداد (اتصال یا قطع تانل، خرابی یا برگشت سلامت، بازیابی،
+شروع یا توقف ترافیک، در دسترس نبودن سرور دیگر، تغییر کانفیگ…) همان لحظه به
+URLهایی که اضافه می‌کنید POST می‌شود:
+
+```
+brokennode sync api callback-add https://bot.example.com/hook
+brokennode sync api callback-level warning   # info (پیش‌فرض)، warning، error
+brokennode sync api test                     # یک رویداد آزمایشی امضاشده
+brokennode sync api secret                   # کلید امضا
+```
+
+بدنه: `{"version":1,"server":"iran","event":{"id","ts","type","severity","tunnel_name","transport","message",…}}`.
+هدرها: `X-BrokenNode-Event`، `X-BrokenNode-Delivery` (id رویداد)،
+`X-BrokenNode-Timestamp` و `X-BrokenNode-Signature: sha256=HEX` — یعنی
+HMAC-SHA256 از `TIMESTAMP.BODY` با کلید امضا. آن را بررسی کنید و timestamp
+قدیمی را رد کنید (نمونهٔ پایتون در بخش انگلیسی). ارسال از یک صف، یکی‌یکی و
+به ترتیب، با سه تلاش (فوراً، ۵ ثانیه، ۳۰ ثانیه): URL کند یا خاموش هیچ‌وقت
+تانل‌ها را کند نمی‌کند.
 
 ## امنیت
 

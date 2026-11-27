@@ -3,6 +3,35 @@
 Newest first. **Update both servers** of a tunnel to the same release: the
 two ends now check each other's version and the menu warns when they differ.
 
+## 2.8.31
+
+### Added
+- **A read-only API for a Telegram bot or a website (menu 8, `brokennode
+  sync api`).** On the Iran server only, off until you turn it on. It reads
+  every tunnel (state, links, ping, users, connections, speed, this run's
+  and lifetime traffic, 24 h of per-minute history, the other end's state),
+  this server (load, memory, uptime) and both servers' events. Nothing can
+  be changed through it: only GET, and no route that writes. A random key,
+  shown once and kept only as a hash; wrong keys are held off; HTTPS when it
+  listens beyond 127.0.0.1. It does not start on a server that is the
+  foreign end of a tunnel, and stops answering if such a tunnel is added.
+- **Callbacks:** each event is POSTed as it happens to the URLs you add,
+  signed (HMAC-SHA256) so the receiver can check it came from your server.
+  Sent from a queue in the background: a slow URL never touches a tunnel.
+  See "Read-only API" in the README.
+
+## 2.8.30
+
+### Changed
+- **udp and icmp tunnels: less CPU, more speed.** The packets that arrive
+  from the other server are now taken several at a time (one `recvmmsg`
+  system call for all those waiting) instead of one call each. Measured
+  against 2.8.29 on the same machine: CPU per GiB −7% (udp) and −10%
+  (icmp), one connection's speed +6% and +10%, the same latency and no more
+  packet loss. Nothing changes on the wire: either server may still run an
+  older release. Every other transport is untouched. If it ever misbehaves,
+  `BN_NO_BATCH=1` in the tunnel's environment restores the old way.
+
 ## 2.8.29
 
 ### Fixed

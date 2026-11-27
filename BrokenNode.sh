@@ -7,7 +7,7 @@
 # ============================================================================
 set -uo pipefail
 
-VERSION="2.8.29"
+VERSION="2.8.31"
 # Bump when the sysctl tuning changes: hosts tuned by an older release pick
 # the new values up automatically (see auto_tune_once).
 TUNE_VERSION=3
@@ -5412,6 +5412,101 @@ need_link(){
   fi
 }
 
+# ============================================================================
+#  API — read-only, for a Telegram bot or a web site (Iran server only). It is
+#  the link daemon's (brokennode-sync) own state read out: the tunnels, their
+#  traffic and history, the events of both servers, and callbacks that POST
+#  each event as it happens. `brokennode sync api ...` does the work; the
+#  daemon takes a change when it restarts.
+# ============================================================================
+api_hint(){
+  sync_supported || { echo "needs this release's core"; return; }
+  local st; st="$("$BIN" sync api status 2>/dev/null | sed -n 's/^api *//p' | head -1)"
+  echo "${st:-off}"
+}
+
+# api_out: indent the CLI's lines; fail when it did (its "rc=N" last line).
+api_out(){ local l rc=1; while IFS= read -r l; do case "$l" in rc=*) rc="${l#rc=}" ;; *) echo "  $l" ;; esac; done; [ "$rc" = 0 ]; }
+
+api_restart(){ sync_auto; systemctl restart brokennode-sync >/dev/null 2>&1; sleep 1; }
+
+api_menu(){
+  if ! sync_supported; then err "This core has no API: update BrokenNode first."; ui_pause; return; fi
+  while true; do
+    banner; ui_crumb "API"; echo
+    echo -e "  ${C_D}Read-only: tunnels, users, traffic, 24-hour history, both servers' events.${C_N}"
+    echo -e "  ${C_D}Nothing can be changed through it. Iran server only.${C_N}"
+    echo
+    "$BIN" sync api status 2>&1 | sed 's/^/    /'
+    echo
+    ui_item 1 "Turn on" "on this server only, or open to the Internet (https)"
+    ui_item 2 "Turn off" ""
+    ui_item 3 "New API key" "the old one stops working"
+    ui_item 4 "Add a callback" "a URL every event is POSTed to"
+    ui_item 5 "Remove a callback" ""
+    ui_item 6 "Callback level" "info: everything · warning · error"
+    ui_item 7 "Test the callbacks" "sends a test event to each"
+    ui_item 8 "Callback secret" "to check the signature (X-BrokenNode-Signature)"
+    ui_item 9 "How to use it" "the endpoints, with examples"
+    ui_item 0 "Back"
+    echo
+    case "$(menu_ask 'Choice')" in
+      1) echo
+         ui_item 1 "This server only" "127.0.0.1:9444, http — a bot or site on this same server"
+         ui_item 2 "Open to the Internet" "0.0.0.0:9444, https (this server's own certificate)"
+         local w addr="127.0.0.1:9444"; w="$(menu_ask 'Choice')"
+         if [ "$w" = 2 ]; then
+           local port; port=$(ask "Port" "9444"); case "$port" in ''|*[!0-9]*) port=9444 ;; esac
+           addr="0.0.0.0:$port"
+           echo -e "  ${C_Y}Open TCP $port in this server's firewall for the bot's or the site's address only.${C_N}"
+         fi
+         { "$BIN" sync api enable "$addr" 2>&1; echo "rc=$?"; } | api_out && api_restart
+         ui_pause ;;
+      2) "$BIN" sync api disable && api_restart && info "API off."; ui_pause ;;
+      3) "$BIN" sync api key 2>&1 | sed 's/^/  /'; api_restart; ui_pause ;;
+      4) local u; u=$(ask "Callback URL (https://...)" "")
+         [ -n "$u" ] && { "$BIN" sync api callback-add "$u" 2>&1; echo "rc=$?"; } | api_out && api_restart && info "Added."
+         ui_pause ;;
+      5) local u; u=$(ask "Callback URL to remove" "")
+         [ -n "$u" ] && { "$BIN" sync api callback-remove "$u" 2>&1; echo "rc=$?"; } | api_out && api_restart && info "Removed."
+         ui_pause ;;
+      6) local l; l=$(ask "Level (info, warning, error)" "info")
+         { "$BIN" sync api callback-level "$l" 2>&1; echo "rc=$?"; } | api_out && api_restart; ui_pause ;;
+      7) "$BIN" sync api test 2>&1 | sed 's/^/  /'; ui_pause ;;
+      8) echo; echo -e "  ${C_Y}Keep it secret: it proves a callback came from this server.${C_N}"
+         "$BIN" sync api secret 2>&1 | sed 's/^/  /'; ui_pause ;;
+      9) api_help; ui_pause ;;
+      0|__eof__) return ;;
+    esac
+  done
+}
+
+api_help(){
+  local a; a="$("$BIN" sync settings 2>/dev/null | sed -n 's/.*"api_listen": "\(.*\)".*/\1/p')"; a="${a:-127.0.0.1:9444}"
+  local sch=https; case "$a" in 127.*|localhost*) sch=http ;; esac
+  local k=""; [ "$sch" = https ] && k=" -k"
+  cat <<HELP
+
+  Every request carries the key:  Authorization: Bearer <key>   (or X-API-Key: <key>)
+  Only GET; anything else is refused. JSON.
+
+    GET /api/v1/ping                       no key: is it up
+    GET /api/v1/server                     this server: tunnels up/down, speed, load, memory
+    GET /api/v1/tunnels                    every tunnel: state, users, connections, speed,
+                                           ping, loss, this run and all-time traffic,
+                                           the other end's state
+    GET /api/v1/tunnels/NAME               one tunnel, with its last events
+    GET /api/v1/tunnels/NAME/history       the last 24 hours, a point a minute
+    GET /api/v1/events?limit=&since=&tunnel=&severity=   both servers' events
+    GET /api/v1/peers                      the other servers
+
+  e.g.  curl -s ${sch}://${a/0.0.0.0/THIS-SERVER-IP}/api/v1/tunnels -H "Authorization: Bearer \$KEY"${k}
+
+  Callbacks: each event is POSTed as {"version":1,"server":...,"event":{...}}.
+  X-BrokenNode-Signature = "sha256=" + HMAC-SHA256(secret, X-BrokenNode-Timestamp + "." + body)
+HELP
+}
+
 main_menu(){
   auto_apply_bundled
   install_command
@@ -5433,6 +5528,7 @@ main_menu(){
     ui_section TOOLS
     ui_item 4 "Health check" "BBR, ports, path MTU, versions, running cores"
     ui_item 6 "Share codes" "set up the other server, or move every tunnel, with one paste"
+    ui_item 8 "API" "read-only, for a Telegram bot or a web site · $(api_hint)"
     echo
     ui_section SYSTEM
     ui_item 5 "Update BrokenNode" "download the latest into this folder"
@@ -5447,6 +5543,7 @@ main_menu(){
       4) doctor; read -t 30 -rp "  ▶ press ENTER to continue... " _ ;;
       5) update_self ;;
       6) share_menu ;;
+      8) api_menu ;;
       0|__eof__) echo; exit 0 ;;
       *) warn "Invalid." ;;
     esac
